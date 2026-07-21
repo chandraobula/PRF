@@ -1,0 +1,8 @@
+# Local-only secrets for `npm run dev` (Cloudflare Pages Functions auto-load .dev.vars).
+# Copy this file to `.dev.vars` and fill in your key. `.dev.vars` is gitignored.
+
+# Google Gemini API key — enables "Scan with AI" in the Pantry.
+GEMINI_API_KEY=your-gemini-api-key-here
+
+# Optional: override the vision/document model (default: gemini-flash-latest).
+# GEMINI_MODEL=gemini-flash-latest
