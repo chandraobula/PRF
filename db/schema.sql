@@ -4,6 +4,7 @@ CREATE TABLE IF NOT EXISTS users (
   id TEXT PRIMARY KEY,
   email TEXT UNIQUE,
   display_name TEXT,
+  role TEXT NOT NULL DEFAULT 'user' CHECK (role IN ('owner', 'admin', 'user', 'suspended')),
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
@@ -449,3 +450,50 @@ CREATE INDEX IF NOT EXISTS idx_important_dates_user ON important_dates (user_id,
 CREATE INDEX IF NOT EXISTS idx_notes_user_status ON notes (user_id, status, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_vehicles_user_status ON vehicles (user_id, status);
 CREATE INDEX IF NOT EXISTS idx_vehicle_maintenance_user_status ON vehicle_maintenance_items (user_id, status, due_date);
+
+-- ── Admin Tables ─────────────────────────────────────────────────────────────
+
+CREATE TABLE IF NOT EXISTS admin_audit_log (
+  id TEXT PRIMARY KEY,
+  actor_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  action TEXT NOT NULL,
+  target_type TEXT,
+  target_id TEXT,
+  details_json TEXT NOT NULL DEFAULT '{}',
+  ip_address TEXT,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS admin_config (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL,
+  updated_by TEXT REFERENCES users(id) ON DELETE SET NULL,
+  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS admin_feature_limits (
+  id TEXT PRIMARY KEY,
+  role TEXT NOT NULL DEFAULT 'user',
+  feature_key TEXT NOT NULL,
+  limit_value INTEGER NOT NULL,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE(role, feature_key)
+);
+
+CREATE TABLE IF NOT EXISTS admin_announcements (
+  id TEXT PRIMARY KEY,
+  author_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  title TEXT NOT NULL,
+  body TEXT NOT NULL,
+  severity TEXT NOT NULL DEFAULT 'info'
+    CHECK (severity IN ('info', 'warning', 'critical')),
+  is_active INTEGER NOT NULL DEFAULT 1,
+  starts_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  ends_at TEXT,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_users_role ON users(role);
+CREATE INDEX IF NOT EXISTS idx_admin_audit_log_actor ON admin_audit_log(actor_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_admin_audit_log_target ON admin_audit_log(target_type, target_id);
+CREATE INDEX IF NOT EXISTS idx_admin_announcements_active ON admin_announcements(is_active, starts_at);

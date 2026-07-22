@@ -3,13 +3,13 @@ import { Outlet, Link, useLocation, useNavigate } from 'react-router-dom';
 import {
   Home, Settings, Sparkles, DollarSign, Car, Briefcase, BookOpen,
   Coffee, FileText, Link2, Search, Bell, MoreHorizontal, X, ChevronRight,
-  CalendarDays, RefreshCw, CalendarClock, StickyNote,
+  CalendarDays, RefreshCw, CalendarClock, StickyNote, ShieldCheck, LogOut,
 } from 'lucide-react';
 import { cn } from '../lib/utils';
 import ThemeToggle from '../components/ThemeToggle';
 import ContextBar from '../components/ContextBar';
-import { getCurrentAccount } from '../services/authApi';
-import { notifyUnauthorized } from '../lib/session';
+import { getCurrentAccount, logoutAccount } from '../services/authApi';
+import { notifyUnauthorized, isAdmin } from '../lib/session';
 
 const navItems = [
   { icon: Home, label: 'Dashboard', path: '/dashboard' },
@@ -37,13 +37,14 @@ const pageNames = {
   '/dashboard': 'Today', '/finance': 'Money', '/car': 'My car', '/work': 'Work',
   '/learning': 'Learning', '/pantry': 'Pantry', '/meal-plan': 'Meal Planner',
   '/subscriptions': 'Subscriptions', '/dates': 'Important Dates', '/notes': 'Notes', '/documents': 'Documents',
-  '/services': 'Services', '/ai-assistant': 'LifeOS AI', '/settings': 'Settings',
+  '/services': 'Services', '/ai-assistant': 'LifeOS AI', '/settings': 'Settings', '/admin': 'Admin Panel',
 };
 
 export default function MainLayout() {
   const location = useLocation();
   const navigate = useNavigate();
   const [moreOpen, setMoreOpen] = useState(false);
+  const [currentUser, setCurrentUser] = useState(null);
   const pageName = pageNames[location.pathname] || 'LifeOS';
 
   useEffect(() => setMoreOpen(false), [location.pathname]);
@@ -54,11 +55,23 @@ export default function MainLayout() {
       const result = await getCurrentAccount();
       if (result && result.authenticated === false) {
         notifyUnauthorized();
+      } else if (result && result.user) {
+        setCurrentUser(result.user);
       }
     };
+    ping(); // Run once on mount to load user role immediately
     const timer = setInterval(ping, 10 * 60 * 1000);
     return () => clearInterval(timer);
   }, []);
+
+  const handleLogout = async () => {
+    try {
+      await logoutAccount();
+      navigate('/auth');
+    } catch {
+      // ignore
+    }
+  };
 
   return (
     <div className="app-shell flex h-dvh bg-background overflow-hidden">
@@ -74,13 +87,29 @@ export default function MainLayout() {
               const active = location.pathname === path;
               return <Link key={path} to={path} className={cn('min-h-12 flex items-center gap-3 px-3 rounded-xl text-sm font-semibold transition-all focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-secondary', active ? 'bg-primary text-white shadow-sm' : 'text-on-surface-variant hover:bg-surface-container-low')} aria-current={active ? 'page' : undefined}><Icon className="w-5 h-5" /><span>{label}</span></Link>;
             })}
+            {isAdmin(currentUser) && (
+              <Link to="/admin" className={cn('min-h-12 flex items-center gap-3 px-3 rounded-xl text-sm font-semibold transition-all focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-secondary', location.pathname === '/admin' ? 'bg-primary text-white shadow-sm' : 'text-on-surface-variant hover:bg-surface-container-low')} aria-current={location.pathname === '/admin' ? 'page' : undefined}><ShieldCheck className="w-5 h-5" /><span>Admin</span></Link>
+            )}
           </div>
         </nav>
-        <div className="p-3 border-t border-border-subtle">
-          <Link to="/settings" className="min-h-12 flex items-center gap-3 px-3 rounded-xl text-sm font-semibold text-on-surface-variant hover:bg-surface-container-low">
-            <div className="w-9 h-9 rounded-full bg-secondary-fixed text-on-secondary-fixed flex items-center justify-center font-bold text-xs">JD</div>
-            <div className="flex-1 min-w-0"><p className="text-on-surface truncate">John Doe</p><p className="text-xs font-normal text-text-muted">View profile</p></div><Settings className="w-4 h-4" />
+        <div className="p-3 border-t border-border-subtle flex items-center gap-1">
+          <Link to="/settings" className="min-h-12 flex-1 flex items-center gap-3 px-3 rounded-xl text-sm font-semibold text-on-surface-variant hover:bg-surface-container-low">
+            <div className="w-9 h-9 rounded-full bg-secondary-fixed text-on-secondary-fixed flex items-center justify-center font-bold text-xs uppercase">
+              {currentUser?.displayName?.[0] || currentUser?.email?.[0] || 'U'}
+            </div>
+            <div className="flex-1 min-w-0">
+              <p className="text-on-surface truncate">{currentUser?.displayName || 'User'}</p>
+              <p className="text-xs font-normal text-text-muted">Settings</p>
+            </div>
           </Link>
+          <button 
+            type="button" 
+            className="w-10 h-10 flex shrink-0 items-center justify-center rounded-xl text-text-muted hover:text-error hover:bg-error/10 transition-colors" 
+            onClick={handleLogout}
+            title="Log out"
+          >
+            <LogOut className="w-4 h-4" />
+          </button>
         </div>
       </aside>
 
@@ -113,6 +142,7 @@ export default function MainLayout() {
           <div className="px-3 pb-2">
             {navItems.slice(3).map(({ icon: Icon, label, path }) => <Link key={path} to={path} className="flex items-center min-h-14 px-3 rounded-xl hover:bg-surface-container-low active:bg-surface-container"><span className="w-10 h-10 rounded-xl bg-surface-container-low flex items-center justify-center mr-3"><Icon className="w-5 h-5" /></span><span className="font-semibold flex-1">{label}</span><ChevronRight className="w-5 h-5 text-text-muted" /></Link>)}
             <Link to="/settings" className="flex items-center min-h-14 px-3 rounded-xl hover:bg-surface-container-low"><span className="w-10 h-10 rounded-xl bg-surface-container-low flex items-center justify-center mr-3"><Settings className="w-5 h-5" /></span><span className="font-semibold flex-1">Settings</span><ChevronRight className="w-5 h-5 text-text-muted" /></Link>
+            <button type="button" onClick={handleLogout} className="w-full flex items-center min-h-14 px-3 rounded-xl hover:bg-error/10 text-error"><span className="w-10 h-10 rounded-xl bg-error/10 flex items-center justify-center mr-3"><LogOut className="w-5 h-5" /></span><span className="font-semibold flex-1 text-left">Log out</span></button>
           </div>
         </section>
       </div>}

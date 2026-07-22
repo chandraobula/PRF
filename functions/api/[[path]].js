@@ -99,6 +99,10 @@ export async function onRequest(context) {
       return await handleNotesRoute({ db: env.DB, request, route: route.slice(1), user: auth, env });
     }
 
+    if (route[0] === 'admin') {
+      return await handleAdminRoute({ db: env.DB, request, url, route: route.slice(1), user: auth });
+    }
+
     return sendJson({ error: 'Not found' }, 404);
   } catch (error) {
     if (error instanceof HttpError) {
@@ -428,9 +432,19 @@ async function handleAuthRoute({ db, request, route, env }) {
     const passwordHash = await hashPassword(password, salt);
     const displayName = payload.displayName || email.split('@')[0];
 
+    // Check registration_open config
+    const regConfig = await db.prepare("SELECT value FROM admin_config WHERE key = 'registration_open'").first();
+    if (regConfig && regConfig.value === 'false') {
+      throw new HttpError(403, 'Registration is currently closed.');
+    }
+
+    // First user ever registered becomes the owner
+    const userCount = await db.prepare('SELECT COUNT(*) AS cnt FROM users').first();
+    const role = (userCount && Number(userCount.cnt) === 0) ? 'owner' : 'user';
+
     await db
-      .prepare('INSERT INTO users (id, email, display_name) VALUES (?, ?, ?)')
-      .bind(userId, email, displayName)
+      .prepare('INSERT INTO users (id, email, display_name, role) VALUES (?, ?, ?, ?)')
+      .bind(userId, email, displayName, role)
       .run();
 
     await db
@@ -445,7 +459,7 @@ async function handleAuthRoute({ db, request, route, env }) {
 
     await ensureUser(db, { userId, email, displayName });
 
-    return createLoginResponse(db, request, { userId, email, displayName }, env);
+    return createLoginResponse(db, request, { userId, email, displayName, role }, env);
   }
 
   if (resource === 'login' && request.method === 'POST') {
@@ -455,7 +469,7 @@ async function handleAuthRoute({ db, request, route, env }) {
     const row = await db
       .prepare(
         `
-        SELECT u.id, u.email, u.display_name, c.password_hash, c.password_salt
+        SELECT u.id, u.email, u.display_name, u.role, c.password_hash, c.password_salt
         FROM auth_credentials c
         JOIN users u ON u.id = c.user_id
         WHERE LOWER(c.email) = LOWER(?)
@@ -475,10 +489,15 @@ async function handleAuthRoute({ db, request, route, env }) {
       throw new HttpError(401, 'Invalid email or password.');
     }
 
+    if (row.role === 'suspended') {
+      throw new HttpError(403, 'Your account has been suspended. Contact the administrator.');
+    }
+
     return createLoginResponse(db, request, {
       userId: row.id,
       email: row.email,
       displayName: row.display_name || row.email.split('@')[0],
+      role: row.role || 'user',
     }, env);
   }
 
@@ -496,6 +515,7 @@ async function handleAuthRoute({ db, request, route, env }) {
         email: auth.email,
         displayName: auth.displayName,
         mode: auth.mode,
+        role: auth.role || 'user',
       },
     });
   }
@@ -3070,6 +3090,571 @@ function normalizeRoute(pathname) {
 }
 
 // ---------------------------------------------------------------------------
+// Admin — platform management (owner / admin only)
+// ---------------------------------------------------------------------------
+
+function requireAdmin(user) {
+  if (user.role !== 'owner' && user.role !== 'admin') {
+    throw new HttpError(403, 'Admin access required.');
+  }
+}
+
+function requireOwner(user) {
+  if (user.role !== 'owner') {
+    throw new HttpError(403, 'Owner access required.');
+  }
+}
+
+async function auditLog(db, actorId, action, targetType, targetId, details, ip) {
+  await db
+    .prepare(
+      `INSERT INTO admin_audit_log (id, actor_id, action, target_type, target_id, details_json, ip_address)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    )
+    .bind(
+      crypto.randomUUID(),
+      actorId,
+      action,
+      targetType || null,
+      targetId || null,
+      JSON.stringify(details || {}),
+      ip || null,
+    )
+    .run();
+}
+
+function clientIp(request) {
+  return request.headers.get('cf-connecting-ip') || request.headers.get('x-forwarded-for') || null;
+}
+
+async function handleAdminRoute({ db, request, url, route, user }) {
+  requireAdmin(user);
+
+  const [resource, id, action] = route;
+
+  // GET /api/admin/dashboard — platform stats
+  if (!resource || resource === 'dashboard') {
+    assertMethod(request, 'GET');
+    return sendJson(await getAdminDashboard(db));
+  }
+
+  // /api/admin/users — user management
+  if (resource === 'users') {
+    if (!id && request.method === 'GET') {
+      return sendJson({ users: await listAllUsers(db, url) });
+    }
+
+    if (id && request.method === 'GET') {
+      return sendJson({ user: await getAdminUserDetail(db, id) });
+    }
+
+    if (id && request.method === 'PATCH') {
+      const payload = await readJson(request);
+      const result = await updateUserRole(db, user, id, payload);
+      await auditLog(db, user.userId, 'user.update', 'user', id, payload, clientIp(request));
+      return sendJson({ user: result });
+    }
+
+    if (id && request.method === 'DELETE') {
+      requireOwner(user);
+      if (id === user.userId) {
+        throw new HttpError(400, 'You cannot delete your own account.');
+      }
+      await deleteUserCascade(db, id);
+      await auditLog(db, user.userId, 'user.delete', 'user', id, {}, clientIp(request));
+      return sendJson({ ok: true });
+    }
+  }
+
+  // /api/admin/audit-log
+  if (resource === 'audit-log') {
+    assertMethod(request, 'GET');
+    return sendJson({ entries: await listAuditLog(db, url) });
+  }
+
+  // /api/admin/config
+  if (resource === 'config') {
+    if (request.method === 'GET') {
+      return sendJson({ config: await listAdminConfig(db) });
+    }
+
+    if (request.method === 'PATCH') {
+      requireOwner(user);
+      const payload = await readJson(request);
+      await updateAdminConfig(db, user.userId, payload);
+      await auditLog(db, user.userId, 'config.update', 'config', null, payload, clientIp(request));
+      return sendJson({ ok: true });
+    }
+  }
+
+  // /api/admin/announcements
+  if (resource === 'announcements') {
+    if (!id && request.method === 'GET') {
+      return sendJson({ announcements: await listAnnouncements(db) });
+    }
+
+    if (!id && request.method === 'POST') {
+      const payload = await readJson(request);
+      const announcement = await createAnnouncement(db, user.userId, payload);
+      await auditLog(db, user.userId, 'announcement.create', 'announcement', announcement.id, payload, clientIp(request));
+      return sendJson({ announcement }, 201);
+    }
+
+    if (id && request.method === 'PATCH') {
+      const payload = await readJson(request);
+      const announcement = await updateAnnouncement(db, id, payload);
+      await auditLog(db, user.userId, 'announcement.update', 'announcement', id, payload, clientIp(request));
+      return sendJson({ announcement });
+    }
+
+    if (id && request.method === 'DELETE') {
+      await deleteAnnouncement(db, id);
+      await auditLog(db, user.userId, 'announcement.delete', 'announcement', id, {}, clientIp(request));
+      return sendJson({ ok: true });
+    }
+  }
+
+  return sendJson({ error: 'Not found' }, 404);
+}
+
+// --- Admin: platform dashboard ---
+
+async function getAdminDashboard(db) {
+  const totalUsers = await db.prepare('SELECT COUNT(*) AS cnt FROM users').first();
+  const roleBreakdown = await db
+    .prepare('SELECT role, COUNT(*) AS cnt FROM users GROUP BY role')
+    .all();
+
+  const activeSessions = await db
+    .prepare("SELECT COUNT(*) AS cnt FROM auth_sessions WHERE expires_at > CURRENT_TIMESTAMP")
+    .first();
+
+  const recentUsers = await db
+    .prepare('SELECT COUNT(*) AS cnt FROM users WHERE created_at >= date(CURRENT_TIMESTAMP, \'-7 days\')')
+    .first();
+
+  const totalTransactions = await db
+    .prepare("SELECT COUNT(*) AS cnt FROM finance_transactions WHERE status != 'deleted'")
+    .first();
+
+  const totalPantryItems = await db
+    .prepare("SELECT COUNT(*) AS cnt FROM pantry_items WHERE status = 'active'")
+    .first();
+
+  const totalVehicles = await db
+    .prepare("SELECT COUNT(*) AS cnt FROM vehicles WHERE status != 'deleted'")
+    .first();
+
+  const totalSubscriptions = await db
+    .prepare("SELECT COUNT(*) AS cnt FROM subscriptions WHERE status = 'active'")
+    .first();
+
+  const totalNotes = await db
+    .prepare("SELECT COUNT(*) AS cnt FROM notes WHERE status = 'active'")
+    .first();
+
+  const recentAuditEntries = await db
+    .prepare(
+      `SELECT a.*, u.email AS actor_email, u.display_name AS actor_name
+       FROM admin_audit_log a
+       LEFT JOIN users u ON u.id = a.actor_id
+       ORDER BY a.created_at DESC LIMIT 10`,
+    )
+    .all();
+
+  return {
+    stats: {
+      totalUsers: Number(totalUsers?.cnt || 0),
+      roleBreakdown: (roleBreakdown.results || []).reduce((acc, row) => {
+        acc[row.role] = Number(row.cnt);
+        return acc;
+      }, {}),
+      activeSessions: Number(activeSessions?.cnt || 0),
+      newUsersLast7Days: Number(recentUsers?.cnt || 0),
+      totalTransactions: Number(totalTransactions?.cnt || 0),
+      totalPantryItems: Number(totalPantryItems?.cnt || 0),
+      totalVehicles: Number(totalVehicles?.cnt || 0),
+      totalSubscriptions: Number(totalSubscriptions?.cnt || 0),
+      totalNotes: Number(totalNotes?.cnt || 0),
+    },
+    recentAuditLog: (recentAuditEntries.results || []).map(mapAuditEntry),
+  };
+}
+
+// --- Admin: user management ---
+
+async function listAllUsers(db, url) {
+  const search = url.searchParams.get('search');
+  const role = url.searchParams.get('role');
+  const sort = url.searchParams.get('sort') || 'created_at';
+  const order = (url.searchParams.get('order') || 'desc').toUpperCase() === 'ASC' ? 'ASC' : 'DESC';
+  const limit = Math.min(Math.max(Number(url.searchParams.get('limit') || 50), 1), 200);
+  const offset = Math.max(Number(url.searchParams.get('offset') || 0), 0);
+
+  const where = [];
+  const values = [];
+
+  if (search) {
+    where.push('(LOWER(u.email) LIKE ? OR LOWER(u.display_name) LIKE ?)');
+    const searchTerm = `%${search.toLowerCase()}%`;
+    values.push(searchTerm, searchTerm);
+  }
+
+  if (role) {
+    where.push('u.role = ?');
+    values.push(role);
+  }
+
+  const allowedSorts = new Set(['created_at', 'email', 'display_name', 'role']);
+  const sortCol = allowedSorts.has(sort) ? `u.${sort}` : 'u.created_at';
+
+  const whereClause = where.length > 0 ? `WHERE ${where.join(' AND ')}` : '';
+
+  const result = await db
+    .prepare(
+      `SELECT u.id, u.email, u.display_name, u.role, u.created_at, u.updated_at,
+              (SELECT COUNT(*) FROM auth_sessions s WHERE s.user_id = u.id AND s.expires_at > CURRENT_TIMESTAMP) AS active_sessions,
+              (SELECT COUNT(*) FROM finance_transactions t WHERE t.user_id = u.id AND t.status != 'deleted') AS transaction_count
+       FROM users u
+       ${whereClause}
+       ORDER BY ${sortCol} ${order}
+       LIMIT ? OFFSET ?`,
+    )
+    .bind(...values, limit, offset)
+    .all();
+
+  const countResult = await db
+    .prepare(`SELECT COUNT(*) AS cnt FROM users u ${whereClause}`)
+    .bind(...values)
+    .first();
+
+  return {
+    items: (result.results || []).map((row) => ({
+      id: row.id,
+      email: row.email,
+      displayName: row.display_name,
+      role: row.role,
+      activeSessions: Number(row.active_sessions || 0),
+      transactionCount: Number(row.transaction_count || 0),
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
+    })),
+    total: Number(countResult?.cnt || 0),
+  };
+}
+
+async function getAdminUserDetail(db, userId) {
+  const user = await db
+    .prepare('SELECT id, email, display_name, role, created_at, updated_at FROM users WHERE id = ?')
+    .bind(userId)
+    .first();
+
+  if (!user) {
+    throw new HttpError(404, 'User not found.');
+  }
+
+  const sessions = await db
+    .prepare("SELECT COUNT(*) AS cnt FROM auth_sessions WHERE user_id = ? AND expires_at > CURRENT_TIMESTAMP")
+    .bind(userId)
+    .first();
+
+  const transactions = await db
+    .prepare("SELECT COUNT(*) AS cnt FROM finance_transactions WHERE user_id = ? AND status != 'deleted'")
+    .bind(userId)
+    .first();
+
+  const pantryItems = await db
+    .prepare("SELECT COUNT(*) AS cnt FROM pantry_items WHERE user_id = ? AND status = 'active'")
+    .bind(userId)
+    .first();
+
+  const vehicles = await db
+    .prepare("SELECT COUNT(*) AS cnt FROM vehicles WHERE user_id = ? AND status != 'deleted'")
+    .bind(userId)
+    .first();
+
+  const subscriptions = await db
+    .prepare("SELECT COUNT(*) AS cnt FROM subscriptions WHERE user_id = ? AND status = 'active'")
+    .bind(userId)
+    .first();
+
+  const notes = await db
+    .prepare("SELECT COUNT(*) AS cnt FROM notes WHERE user_id = ? AND status = 'active'")
+    .bind(userId)
+    .first();
+
+  const lastSession = await db
+    .prepare('SELECT last_seen_at FROM auth_sessions WHERE user_id = ? ORDER BY last_seen_at DESC LIMIT 1')
+    .bind(userId)
+    .first();
+
+  return {
+    id: user.id,
+    email: user.email,
+    displayName: user.display_name,
+    role: user.role,
+    createdAt: user.created_at,
+    updatedAt: user.updated_at,
+    lastSeenAt: lastSession?.last_seen_at || null,
+    activeSessions: Number(sessions?.cnt || 0),
+    stats: {
+      transactions: Number(transactions?.cnt || 0),
+      pantryItems: Number(pantryItems?.cnt || 0),
+      vehicles: Number(vehicles?.cnt || 0),
+      subscriptions: Number(subscriptions?.cnt || 0),
+      notes: Number(notes?.cnt || 0),
+    },
+  };
+}
+
+async function updateUserRole(db, actor, targetId, payload) {
+  if (targetId === actor.userId) {
+    throw new HttpError(400, 'You cannot change your own role.');
+  }
+
+  const target = await db.prepare('SELECT id, role FROM users WHERE id = ?').bind(targetId).first();
+
+  if (!target) {
+    throw new HttpError(404, 'User not found.');
+  }
+
+  // Only the owner can promote/demote admins or change the owner
+  if (target.role === 'owner') {
+    throw new HttpError(403, 'The owner account cannot be modified by another user.');
+  }
+
+  if (payload.role) {
+    const newRole = normalizeEnum(payload.role, ['admin', 'user', 'suspended'], 'Invalid role. Must be admin, user, or suspended.');
+
+    // Only owner can set admin role
+    if (newRole === 'admin' && actor.role !== 'owner') {
+      throw new HttpError(403, 'Only the owner can promote users to admin.');
+    }
+
+    // If target is admin, only owner can change
+    if (target.role === 'admin' && actor.role !== 'owner') {
+      throw new HttpError(403, 'Only the owner can modify admin accounts.');
+    }
+
+    await db.prepare('UPDATE users SET role = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?')
+      .bind(newRole, targetId)
+      .run();
+
+    // If suspending, kill all their sessions
+    if (newRole === 'suspended') {
+      await db.prepare('DELETE FROM auth_sessions WHERE user_id = ?').bind(targetId).run();
+    }
+  }
+
+  return getAdminUserDetail(db, targetId);
+}
+
+async function deleteUserCascade(db, userId) {
+  const user = await db.prepare('SELECT id, role FROM users WHERE id = ?').bind(userId).first();
+
+  if (!user) {
+    throw new HttpError(404, 'User not found.');
+  }
+
+  if (user.role === 'owner') {
+    throw new HttpError(403, 'The owner account cannot be deleted.');
+  }
+
+  // The ON DELETE CASCADE in the schema handles most tables.
+  // Delete sessions first, then the user row cascades everything else.
+  await db.prepare('DELETE FROM auth_sessions WHERE user_id = ?').bind(userId).run();
+  await db.prepare('DELETE FROM auth_credentials WHERE user_id = ?').bind(userId).run();
+  await db.prepare('DELETE FROM users WHERE id = ?').bind(userId).run();
+}
+
+// --- Admin: audit log ---
+
+async function listAuditLog(db, url) {
+  const limit = Math.min(Math.max(Number(url.searchParams.get('limit') || 50), 1), 200);
+  const offset = Math.max(Number(url.searchParams.get('offset') || 0), 0);
+  const actionFilter = url.searchParams.get('action');
+
+  const where = [];
+  const values = [];
+
+  if (actionFilter) {
+    where.push('a.action LIKE ?');
+    values.push(`${actionFilter}%`);
+  }
+
+  const whereClause = where.length > 0 ? `WHERE ${where.join(' AND ')}` : '';
+
+  const result = await db
+    .prepare(
+      `SELECT a.*, u.email AS actor_email, u.display_name AS actor_name
+       FROM admin_audit_log a
+       LEFT JOIN users u ON u.id = a.actor_id
+       ${whereClause}
+       ORDER BY a.created_at DESC
+       LIMIT ? OFFSET ?`,
+    )
+    .bind(...values, limit, offset)
+    .all();
+
+  const countResult = await db
+    .prepare(`SELECT COUNT(*) AS cnt FROM admin_audit_log a ${whereClause}`)
+    .bind(...values)
+    .first();
+
+  return {
+    items: (result.results || []).map(mapAuditEntry),
+    total: Number(countResult?.cnt || 0),
+  };
+}
+
+function mapAuditEntry(row) {
+  return {
+    id: row.id,
+    actorId: row.actor_id,
+    actorEmail: row.actor_email || null,
+    actorName: row.actor_name || null,
+    action: row.action,
+    targetType: row.target_type,
+    targetId: row.target_id,
+    details: parseJson(row.details_json, {}),
+    ipAddress: row.ip_address,
+    createdAt: row.created_at,
+  };
+}
+
+// --- Admin: config ---
+
+async function listAdminConfig(db) {
+  const result = await db
+    .prepare('SELECT key, value, updated_by, updated_at FROM admin_config ORDER BY key')
+    .all();
+
+  return (result.results || []).map((row) => ({
+    key: row.key,
+    value: row.value,
+    updatedBy: row.updated_by,
+    updatedAt: row.updated_at,
+  }));
+}
+
+async function updateAdminConfig(db, actorId, payload) {
+  const entries = Object.entries(payload);
+
+  for (const [key, value] of entries) {
+    await db
+      .prepare(
+        `INSERT INTO admin_config (key, value, updated_by, updated_at)
+         VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_by = excluded.updated_by, updated_at = excluded.updated_at`,
+      )
+      .bind(key, String(value), actorId)
+      .run();
+  }
+}
+
+// --- Admin: announcements ---
+
+async function listAnnouncements(db) {
+  const result = await db
+    .prepare(
+      `SELECT a.*, u.email AS author_email, u.display_name AS author_name
+       FROM admin_announcements a
+       LEFT JOIN users u ON u.id = a.author_id
+       ORDER BY a.created_at DESC`,
+    )
+    .all();
+
+  return (result.results || []).map(mapAnnouncement);
+}
+
+async function createAnnouncement(db, authorId, payload) {
+  const id = crypto.randomUUID();
+  const title = requiredText(payload.title, 'Announcement title is required.');
+  const body = requiredText(payload.body, 'Announcement body is required.');
+  const severity = normalizeEnum(
+    payload.severity || 'info',
+    ['info', 'warning', 'critical'],
+    'Severity must be info, warning, or critical.',
+  );
+
+  await db
+    .prepare(
+      `INSERT INTO admin_announcements (id, author_id, title, body, severity, is_active, starts_at, ends_at)
+       VALUES (?, ?, ?, ?, ?, 1, CURRENT_TIMESTAMP, ?)`,
+    )
+    .bind(id, authorId, title, body, severity, payload.endsAt || null)
+    .run();
+
+  return getAnnouncement(db, id);
+}
+
+async function updateAnnouncement(db, id, payload) {
+  const existing = await getAnnouncement(db, id);
+
+  if (!existing) {
+    throw new HttpError(404, 'Announcement not found.');
+  }
+
+  const fields = {};
+
+  if (payload.title !== undefined) fields.title = payload.title;
+  if (payload.body !== undefined) fields.body = payload.body;
+  if (payload.severity !== undefined) {
+    fields.severity = normalizeEnum(payload.severity, ['info', 'warning', 'critical'], 'Invalid severity.');
+  }
+  if (payload.isActive !== undefined) fields.is_active = payload.isActive ? 1 : 0;
+  if (payload.endsAt !== undefined) fields.ends_at = payload.endsAt;
+
+  const updates = Object.entries(fields).filter(([, v]) => v !== undefined);
+
+  if (updates.length > 0) {
+    const assignments = updates.map(([key]) => `${key} = ?`).join(', ');
+    const values = updates.map(([, value]) => value);
+
+    await db
+      .prepare(`UPDATE admin_announcements SET ${assignments} WHERE id = ?`)
+      .bind(...values, id)
+      .run();
+  }
+
+  return getAnnouncement(db, id);
+}
+
+async function deleteAnnouncement(db, id) {
+  await db.prepare('DELETE FROM admin_announcements WHERE id = ?').bind(id).run();
+}
+
+async function getAnnouncement(db, id) {
+  const row = await db
+    .prepare(
+      `SELECT a.*, u.email AS author_email, u.display_name AS author_name
+       FROM admin_announcements a
+       LEFT JOIN users u ON u.id = a.author_id
+       WHERE a.id = ?`,
+    )
+    .bind(id)
+    .first();
+
+  return row ? mapAnnouncement(row) : null;
+}
+
+function mapAnnouncement(row) {
+  return {
+    id: row.id,
+    authorId: row.author_id,
+    authorEmail: row.author_email || null,
+    authorName: row.author_name || null,
+    title: row.title,
+    body: row.body,
+    severity: row.severity,
+    isActive: Boolean(row.is_active),
+    startsAt: row.starts_at,
+    endsAt: row.ends_at,
+    createdAt: row.created_at,
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Subscriptions & bill radar
 // ---------------------------------------------------------------------------
 
@@ -3618,7 +4203,7 @@ async function authenticateRequest(request, db, env, options = {}) {
     const row = await db
       .prepare(
         `
-        SELECT u.id, u.email, u.display_name
+        SELECT u.id, u.email, u.display_name, u.role
         FROM auth_sessions s
         JOIN users u ON u.id = s.user_id
         WHERE s.session_hash = ?
@@ -3630,6 +4215,12 @@ async function authenticateRequest(request, db, env, options = {}) {
       .first();
 
     if (row) {
+      // Suspended users cannot continue even with a valid session
+      if (row.role === 'suspended') {
+        await db.prepare('DELETE FROM auth_sessions WHERE session_hash = ?').bind(sessionHash).run();
+        return { error: 'Your account has been suspended. Contact the administrator.' };
+      }
+
       // Sliding expiration: every authenticated request pushes the expiry out,
       // so a continuously-active session never times out. Idle sessions still expire.
       const days = Number(env.SESSION_DAYS || 30);
@@ -3643,6 +4234,7 @@ async function authenticateRequest(request, db, env, options = {}) {
         userId: row.id,
         email: row.email,
         displayName: row.display_name || row.email.split('@')[0],
+        role: row.role || 'user',
         mode: 'public',
       };
     }
@@ -3688,6 +4280,7 @@ async function createLoginResponse(db, request, user, env) {
       id: user.userId,
       email: user.email,
       displayName: user.displayName,
+      role: user.role || 'user',
       mode: 'public',
     },
   }, 200, {

@@ -1,6 +1,8 @@
 import { useState } from 'react';
+import { useNavigate } from 'react-router-dom';
 import { Bell, ChevronRight, Globe, Key, LogOut, Moon, Shield, User } from 'lucide-react';
 import { cn } from '../lib/utils';
+import { logoutAccount } from '../services/authApi';
 
 const sections = [
   { id: 'profile', icon: User, label: 'Profile', description: 'Name, photo and email' },
@@ -25,6 +27,16 @@ export default function ProfileSettings() {
   const [active, setActive] = useState('profile');
   const [notifications, setNotifications] = useState({ daily: true, bills: true, focus: false });
   const current = sections.find(section => section.id === active);
+  const navigate = useNavigate();
+
+  const handleLogout = async () => {
+    try {
+      await logoutAccount();
+      navigate('/auth');
+    } catch {
+      // ignore
+    }
+  };
 
   const content = {
     profile: <>
@@ -41,6 +53,18 @@ export default function ProfileSettings() {
             <label className="settings-field sm:col-span-2"><span>Email address</span><input type="email" defaultValue="john.doe@example.com" /><small>Used for account recovery and important updates.</small></label>
           </div>
           <div className="mt-6 pt-5 border-t border-border-subtle flex justify-end"><button className="min-h-11 w-full sm:w-auto px-5 rounded-xl bg-primary text-white text-sm font-bold hover:bg-primary/90">Save changes</button></div>
+        </div>
+      </section>
+      <section className="settings-card">
+        <div className="settings-card-header">
+          <h2>Sign out</h2>
+          <p>Sign out of your LifeOS account on this device.</p>
+        </div>
+        <div className="p-4 sm:p-6 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+          <p className="max-w-xl text-sm leading-6 text-text-muted">You will need to sign back in to access your data.</p>
+          <button type="button" onClick={handleLogout} className="min-h-11 px-4 inline-flex items-center justify-center gap-2 rounded-xl bg-surface-container-low text-on-surface text-sm font-bold hover:bg-surface-container-highest">
+            <LogOut className="w-4 h-4" /> Sign out
+          </button>
         </div>
       </section>
       <section className="settings-card border-error/20"><div className="settings-card-header"><h2 className="text-error">Delete account</h2><p>Permanently remove your account and all LifeOS data.</p></div><div className="p-4 sm:p-6 flex flex-col sm:flex-row sm:items-center justify-between gap-4"><p className="max-w-xl text-sm leading-6 text-text-muted">This cannot be undone. Export anything you want to keep before continuing.</p><button className="min-h-11 px-4 inline-flex items-center justify-center gap-2 rounded-xl bg-error/10 text-error text-sm font-bold hover:bg-error/15"><LogOut className="w-4 h-4" /> Delete account</button></div></section>

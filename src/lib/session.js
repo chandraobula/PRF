@@ -22,3 +22,11 @@ export function notifyUnauthorized() {
   }
   window.location.assign('/auth?expired=1');
 }
+
+export function isAdmin(user) {
+  return user?.role === 'owner' || user?.role === 'admin';
+}
+
+export function isOwner(user) {
+  return user?.role === 'owner';
+}

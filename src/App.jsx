@@ -16,6 +16,7 @@ import DocumentViewer from './pages/DocumentViewer';
 import ConnectServices from './pages/ConnectServices';
 import AIAssistant from './pages/AIAssistant';
 import ProfileSettings from './pages/ProfileSettings';
+import AdminDashboard from './pages/AdminDashboard';
 import MainLayout from './layouts/MainLayout';
 
 function App() {
@@ -40,6 +41,7 @@ function App() {
           <Route path="/services" element={<ConnectServices />} />
           <Route path="/ai-assistant" element={<AIAssistant />} />
           <Route path="/settings" element={<ProfileSettings />} />
+          <Route path="/admin" element={<AdminDashboard />} />
         </Route>
       </Routes>
     </BrowserRouter>
