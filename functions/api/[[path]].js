@@ -64,7 +64,7 @@ export async function onRequest(context) {
     }
 
     if (route[0] === 'auth') {
-      return handleAuthRoute({ db: env.DB, request, route: route.slice(1), env });
+      return await handleAuthRoute({ db: env.DB, request, route: route.slice(1), env });
     }
 
     const auth = await authenticateRequest(request, env.DB, env);
