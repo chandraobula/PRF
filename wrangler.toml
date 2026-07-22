@@ -4,6 +4,6 @@ pages_build_output_dir = "dist"
 
 [[d1_databases]]
 binding = "DB"
-database_name = "lifeos-local"
-database_id = "00000000-0000-0000-0000-000000000000"
-preview_database_id = "00000000-0000-0000-0000-000000000000"
+database_name = "lifeos-prod"
+database_id = "a79f7649-050d-49ad-af02-853ed6deec0e"
+preview_database_id = "a79f7649-050d-49ad-af02-853ed6deec0e"
