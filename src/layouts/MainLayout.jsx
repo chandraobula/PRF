@@ -7,7 +7,6 @@ import {
 } from 'lucide-react';
 import { cn } from '../lib/utils';
 import ThemeToggle from '../components/ThemeToggle';
-import ContextBar from '../components/ContextBar';
 import { getCurrentAccount, logoutAccount } from '../services/authApi';
 import { notifyUnauthorized, isAdmin } from '../lib/session';
 
@@ -19,11 +18,13 @@ const navItems = [
   { icon: BookOpen, label: 'Learning Hub', path: '/learning' },
   { icon: Coffee, label: 'Pantry', path: '/pantry' },
   { icon: CalendarDays, label: 'Meal Planner', path: '/meal-plan' },
+  /* 
   { icon: RefreshCw, label: 'Subscriptions', path: '/subscriptions' },
   { icon: CalendarClock, label: 'Important Dates', path: '/dates' },
   { icon: StickyNote, label: 'Notes', path: '/notes' },
   { icon: FileText, label: 'Documents', path: '/documents' },
   { icon: Link2, label: 'Connected Services', path: '/services' },
+  */
 ];
 
 const mobileTabs = [
@@ -115,7 +116,7 @@ export default function MainLayout() {
 
       <main className="flex-1 min-w-0 flex flex-col overflow-hidden">
         <header className="mobile-app-bar lg:h-20 lg:px-8 lg:border-b lg:border-border-subtle lg:bg-surface-card/90 lg:backdrop-blur-xl flex items-center justify-between shrink-0">
-          <div className="min-w-0"><ContextBar /><h1 className="font-display text-[22px] lg:text-xl font-bold tracking-tight">{pageName}</h1></div>
+          <div className="min-w-0"><h1 className="font-display text-[22px] lg:text-xl font-bold tracking-tight">{pageName}</h1></div>
           <div className="flex items-center gap-2">
             <button type="button" onClick={() => navigate('/documents')} className="icon-button" aria-label="Search"><Search className="w-5 h-5" /></button>
             <ThemeToggle />
