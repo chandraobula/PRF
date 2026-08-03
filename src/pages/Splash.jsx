@@ -1,14 +1,31 @@
 import { useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
+import { getCurrentAccount } from '../services/authApi';
 
 export default function Splash() {
   const navigate = useNavigate();
 
   useEffect(() => {
-    // Navigate to onboarding after 2.5 seconds
-    const timer = setTimeout(() => {
-      navigate('/onboarding');
-    }, 2500);
+    const redirect = async () => {
+      try {
+        const auth = await getCurrentAccount();
+        if (auth.authenticated) {
+          // User is logged in. If they completed onboarding, go to dashboard.
+          // Otherwise, send them to onboarding (though this is rare—new accounts
+          // skip it automatically, and old accounts get shown it once).
+          const destination = auth.user?.hasCompletedOnboarding ? '/dashboard' : '/onboarding';
+          navigate(destination);
+        } else {
+          // Not authenticated. Show the onboarding intro.
+          navigate('/onboarding');
+        }
+      } catch {
+        // On error checking auth, assume not authenticated — show onboarding.
+        navigate('/onboarding');
+      }
+    };
+
+    const timer = setTimeout(redirect, 2500);
     return () => clearTimeout(timer);
   }, [navigate]);
 

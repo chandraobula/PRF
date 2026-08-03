@@ -23,13 +23,17 @@ export default function Auth() {
     setError('');
 
     try {
-      if (mode === 'register') {
-        await registerAccount(form);
-      } else {
-        await loginAccount(form);
-      }
+      const response = mode === 'register'
+        ? await registerAccount(form)
+        : await loginAccount(form);
 
-      navigate('/dashboard');
+      // Check if user has completed onboarding. Newly registered users skip
+      // onboarding (hasCompletedOnboarding is true), so they go straight to dashboard.
+      // Existing users with an old account (flag not in DB) default to false,
+      // showing onboarding once on next login.
+      const hasCompleted = response.user?.hasCompletedOnboarding ?? false;
+      const destination = hasCompleted ? '/dashboard' : '/onboarding';
+      navigate(destination);
     } catch (authError) {
       setError(authError.message);
     } finally {

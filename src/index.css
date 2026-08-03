@@ -1,4 +1,4 @@
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Manrope:wght@600;700&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Manrope:wght@600;700&family=Caveat:wght@500;600;700&family=Patrick+Hand&display=swap');
 
 @tailwind base;
 @tailwind components;
@@ -26,6 +26,15 @@
     --color-border-subtle: 226 232 240;
     --color-text-muted: 100 116 139;
     --color-primary: 0 0 0;
+
+    /* Data-viz tokens. Validated for CVD separation and contrast against the
+       card surface in this mode — see the finance charts. Do not hand-tune. */
+    --viz-income: #2a78d6;
+    --viz-expense: #eb6834;
+    --viz-up: #d03b3b;
+    --viz-down: #2a78d6;
+    --viz-neutral: #94a3b8;
+    --viz-grid: #e2e8f0;
   }
 
   [data-theme="dark"] {
@@ -49,6 +58,14 @@
     --color-border-subtle: 42 48 57;
     --color-text-muted: 141 149 161;
     --color-primary: 37 99 235;
+
+    /* Same eight hues re-stepped for the dark surface, not an automatic flip. */
+    --viz-income: #3987e5;
+    --viz-expense: #d95926;
+    --viz-up: #e66767;
+    --viz-down: #3987e5;
+    --viz-neutral: #64748b;
+    --viz-grid: #2a3039;
   }
 
   * {
@@ -129,10 +146,28 @@
   }
 
   .more-sheet {
-    padding-bottom: calc(12px + env(safe-area-inset-bottom));
-    max-height: min(82vh, 620px);
-    overflow-y: auto;
+    @apply flex flex-col;
+    max-height: min(88dvh, 760px);
     animation: sheet-in 220ms cubic-bezier(.2,.8,.2,1);
+  }
+
+  .more-sheet-body {
+    @apply min-h-0 flex-1 overflow-y-auto;
+    overscroll-behavior: contain;
+    -webkit-overflow-scrolling: touch;
+    padding-bottom: calc(12px + env(safe-area-inset-bottom));
+  }
+
+  .more-sheet-label {
+    @apply px-3 pt-3 pb-1 text-[11px] font-bold tracking-[0.12em] uppercase text-text-muted;
+  }
+
+  .more-sheet-item {
+    @apply flex items-center min-h-14 px-3 rounded-xl hover:bg-surface-container-low active:bg-surface-container;
+  }
+
+  .more-sheet-icon {
+    @apply w-10 h-10 rounded-xl bg-surface-container-low flex items-center justify-center mr-3 shrink-0;
   }
 
   .section-title {
@@ -177,8 +212,46 @@
     background-image: linear-gradient(to bottom right, rgb(139 92 246 / 0.10), rgb(59 130 246 / 0.10));
   }
 
+  /* -- Ask Life OS chat ---------------------------------------------------- */
+
+  .ai-chat-shell {
+    @apply flex h-full min-h-0 flex-col bg-surface-card;
+  }
+
+  .chat-topbar {
+    @apply flex h-12 shrink-0 items-center justify-between gap-3 border-b border-border-subtle px-4 sm:px-6;
+  }
+
+  .chat-ghost-button {
+    @apply flex min-h-9 items-center gap-1.5 rounded-xl border border-border-subtle px-3 text-[13px] font-semibold text-on-surface-variant transition-colors hover:bg-surface-container-low hover:text-on-surface;
+  }
+
+  .chat-scroll {
+    @apply min-h-0 flex-1 overflow-y-auto overscroll-contain;
+    scrollbar-width: thin;
+    scrollbar-color: rgb(var(--color-outline-variant)) transparent;
+  }
+
+  .chat-scroll::-webkit-scrollbar {
+    width: 6px;
+  }
+
+  .chat-scroll::-webkit-scrollbar-thumb {
+    background-color: rgb(var(--color-outline-variant));
+    border-radius: 10px;
+  }
+
+  .chat-footer {
+    @apply relative shrink-0 pb-3 pt-2;
+    background: linear-gradient(to top, rgb(var(--color-surface-card)) 55%, rgb(var(--color-surface-card) / 0));
+  }
+
   .chat-turn {
     @apply grid grid-cols-[32px_1fr] sm:grid-cols-[36px_1fr] gap-3 sm:gap-4;
+  }
+
+  .chat-turn-enter {
+    animation: chat-turn-in 260ms cubic-bezier(.2, .8, .2, 1);
   }
 
   .chat-avatar {
@@ -190,19 +263,50 @@
   }
 
   .chat-copy {
-    @apply max-w-[68ch] text-[15px] sm:text-[16px] leading-[1.65] text-on-surface-variant space-y-3;
+    @apply max-w-[68ch] text-[15px] sm:text-[16px] leading-[1.65] text-on-surface-variant;
   }
 
   .chat-copy strong {
     @apply font-semibold text-on-surface;
   }
 
+  /* Blinking caret trailing the last block while tokens are still arriving. */
+  .chat-copy-live .chat-prose > *:last-child::after {
+    content: '';
+    display: inline-block;
+    width: 0.45rem;
+    height: 1.05em;
+    margin-left: 3px;
+    vertical-align: -0.18em;
+    border-radius: 2px;
+    background-color: rgb(var(--color-primary));
+    animation: chat-caret 1.05s steps(2, start) infinite;
+  }
+
+  .chat-dots {
+    @apply inline-flex items-center gap-1;
+  }
+
+  .chat-dots i {
+    @apply block h-1.5 w-1.5 rounded-full bg-text-muted;
+    animation: chat-dot 1.15s ease-in-out infinite;
+  }
+
+  .chat-dots i:nth-child(2) {
+    animation-delay: 0.15s;
+  }
+
+  .chat-dots i:nth-child(3) {
+    animation-delay: 0.3s;
+  }
+
   .chat-actions {
     @apply flex items-center gap-0.5 mt-3 -ml-2;
   }
 
+  /* 44px touch target on phones, tightened up on pointer-first screens. */
   .chat-actions button {
-    @apply w-9 h-9 rounded-lg flex items-center justify-center text-text-muted hover:text-on-surface hover:bg-surface-container-low;
+    @apply w-11 h-11 sm:w-9 sm:h-9 rounded-lg flex items-center justify-center text-text-muted transition-colors hover:text-on-surface hover:bg-surface-container-low;
   }
 
   .chat-actions svg {
@@ -226,7 +330,208 @@
   }
 
   .chat-composer {
-    @apply p-2 rounded-[22px] border border-outline-variant bg-surface-card shadow-[0_8px_30px_rgba(15,23,42,.10)] focus-within:border-secondary focus-within:ring-2 focus-within:ring-secondary/10;
+    @apply flex flex-col gap-1 p-2 rounded-[22px] border border-outline-variant bg-surface-card shadow-[0_8px_30px_rgba(15,23,42,.10)] transition-shadow focus-within:border-secondary focus-within:ring-2 focus-within:ring-secondary/10;
+  }
+
+  .chat-composer-input {
+    @apply min-h-12 max-h-[200px] w-full resize-none bg-transparent px-2.5 py-3 text-[16px] leading-6 text-on-surface outline-none placeholder:text-text-muted;
+    scrollbar-width: thin;
+  }
+
+  .chat-send-button {
+    @apply flex h-11 w-11 sm:h-10 sm:w-10 shrink-0 items-center justify-center rounded-full transition-all active:scale-95 disabled:cursor-not-allowed disabled:active:scale-100;
+  }
+
+  .chat-kbd {
+    @apply rounded border border-border-subtle bg-surface-container-low px-1 py-px font-sans text-[10px] font-semibold text-on-surface-variant;
+  }
+
+  /* -- Work Hub sticky board ----------------------------------------------
+     Paper colours are supplied per note as inline custom properties from
+     StickyBoard.jsx. They deliberately are NOT modifier classes: Tailwind
+     tree-shakes @layer rules it can't find in the source, and a class built as
+     `sticky-note--${color}` is invisible to the scanner, so those rules were
+     being stripped from the build and the notes rendered transparent. */
+
+  .sticky-board-shell {
+    @apply rounded-[20px] border border-border-subtle p-4 sm:p-6;
+    background-color: rgb(var(--color-surface-container-lowest));
+    background-image:
+      radial-gradient(rgb(var(--color-outline-variant) / 0.55) 1px, transparent 1px),
+      radial-gradient(rgb(var(--color-outline-variant) / 0.35) 1px, transparent 1px);
+    background-size: 22px 22px, 22px 22px;
+    background-position: 0 0, 11px 11px;
+  }
+
+  .sticky-board {
+    @apply grid gap-5;
+    grid-template-columns: repeat(auto-fill, minmax(224px, 1fr));
+  }
+
+  .sticky-note {
+    @apply relative flex flex-col rounded-[3px] px-3.5 pb-3 pt-2;
+    /* Paper is very slightly lighter at the top, as if catching the light. */
+    background-image: linear-gradient(163deg, var(--sticky-paper) 0%, var(--sticky-paper) 62%, var(--sticky-fold) 100%);
+    color: var(--sticky-ink);
+    transform: rotate(var(--sticky-tilt, 0deg));
+    transition: transform 180ms cubic-bezier(.2, .8, .2, 1), box-shadow 180ms ease;
+    box-shadow:
+      0 1px 1px rgb(15 23 42 / 0.10),
+      0 7px 16px -5px rgb(15 23 42 / 0.24);
+  }
+
+  .sticky-note:hover,
+  .sticky-note:focus-within {
+    transform: rotate(0deg) translateY(-4px) scale(1.02);
+    box-shadow:
+      0 2px 3px rgb(15 23 42 / 0.12),
+      0 18px 34px -8px rgb(15 23 42 / 0.32);
+    z-index: 3;
+  }
+
+  /* Curled corner. */
+  .sticky-note::after {
+    content: '';
+    @apply pointer-events-none absolute bottom-0 right-0;
+    border-width: 0 0 20px 20px;
+    border-style: solid;
+    border-color: transparent transparent rgb(15 23 42 / 0.13) transparent;
+    border-bottom-right-radius: 3px;
+  }
+
+  .sticky-note--dropzone {
+    outline: 2px dashed rgb(var(--color-primary));
+    outline-offset: 4px;
+  }
+
+  .sticky-note__pin {
+    @apply absolute left-1/2 top-2 h-3.5 w-3.5 -translate-x-1/2 rounded-full;
+    background: radial-gradient(circle at 34% 28%, #fb7185, #be123c 68%);
+    box-shadow: 0 2px 4px rgb(15 23 42 / 0.45), inset 0 -1px 2px rgb(0 0 0 / 0.25);
+  }
+
+  .sticky-note__toolbar {
+    @apply flex items-center gap-1.5 opacity-0 transition-opacity;
+    color: color-mix(in srgb, var(--sticky-ink) 55%, transparent);
+  }
+
+  .sticky-note:hover .sticky-note__toolbar,
+  .sticky-note:focus-within .sticky-note__toolbar {
+    @apply opacity-100;
+  }
+
+  .sticky-note__grip {
+    @apply cursor-grab active:cursor-grabbing;
+  }
+
+  .sticky-note__status {
+    @apply flex items-center gap-1 text-[10px] font-semibold;
+    font-family: 'Inter', sans-serif;
+  }
+
+  .sticky-note__actions {
+    @apply ml-auto flex items-center gap-0.5;
+  }
+
+  .sticky-note__actions button,
+  .sticky-note__format button {
+    @apply flex h-7 w-7 items-center justify-center rounded-md transition-colors;
+    color: color-mix(in srgb, var(--sticky-ink) 62%, transparent);
+  }
+
+  .sticky-note__actions button:hover,
+  .sticky-note__format button:hover {
+    background-color: rgb(15 23 42 / 0.09);
+    color: var(--sticky-ink);
+  }
+
+  .sticky-note__format {
+    @apply mt-1 flex items-center gap-0.5 border-t pt-1.5;
+    border-color: color-mix(in srgb, var(--sticky-ink) 15%, transparent);
+  }
+
+  .sticky-note__format button[aria-pressed='true'] {
+    background-color: rgb(15 23 42 / 0.13);
+    color: var(--sticky-ink);
+  }
+
+  /* -- the writing surface -- */
+
+  .sticky-note__body {
+    @apply min-h-[104px] w-full flex-1 py-1 outline-none;
+    color: inherit;
+    word-break: break-word;
+    overflow-wrap: anywhere;
+  }
+
+  .sticky-note__body:empty::before,
+  .sticky-note__body[data-empty='true']::before {
+    content: attr(data-placeholder);
+    color: color-mix(in srgb, var(--sticky-ink) 42%, transparent);
+    pointer-events: none;
+  }
+
+  /* Typography per note. Each face gets its own size and leading — a
+     handwriting face set at a UI size reads as a mistake. */
+  .sticky-font-hand .sticky-note__body {
+    font-family: 'Caveat', 'Segoe Script', cursive;
+    @apply text-[21px] leading-[1.32] font-medium;
+    letter-spacing: 0.008em;
+  }
+
+  .sticky-font-print .sticky-note__body {
+    font-family: 'Patrick Hand', 'Comic Sans MS', cursive;
+    @apply text-[16px] leading-[1.5];
+    letter-spacing: 0.004em;
+  }
+
+  .sticky-font-clean .sticky-note__body {
+    font-family: 'Inter', sans-serif;
+    @apply text-[14px] leading-[1.55];
+    letter-spacing: -0.003em;
+  }
+
+  .sticky-note__body b,
+  .sticky-note__body strong {
+    @apply font-bold;
+  }
+
+  .sticky-note__body u {
+    text-decoration-thickness: 1.5px;
+    text-underline-offset: 3px;
+  }
+
+  .sticky-note__body ul,
+  .sticky-note__body ol {
+    @apply my-1 pl-5;
+  }
+
+  .sticky-note__body ul { @apply list-disc; }
+  .sticky-note__body ol { @apply list-decimal; }
+  .sticky-note__body li { @apply mb-0.5; }
+
+  /* Highlighter: a hand-drawn marker sweep rather than a flat block. */
+  .sticky-note__body mark {
+    background: linear-gradient(
+      104deg,
+      transparent 0.4%,
+      rgb(255 255 255 / 0.55) 2.2%,
+      rgb(255 255 255 / 0.65) 96%,
+      transparent 99%
+    );
+    background-color: rgb(255 246 143 / 0.75);
+    color: inherit;
+    padding: 0 0.18em;
+    margin: 0 -0.05em;
+    border-radius: 2px;
+    box-decoration-break: clone;
+    -webkit-box-decoration-break: clone;
+  }
+
+  .sticky-note__meta {
+    @apply mt-1 flex items-center gap-1 text-[10px] font-medium;
+    font-family: 'Inter', sans-serif;
+    color: color-mix(in srgb, var(--sticky-ink) 48%, transparent);
   }
 
   .settings-card {
@@ -282,9 +587,29 @@
   }
 }
 
+/* The chat page owns its own scrolling and gutters, so the app shell's padding
+   and scroll container are handed over to it. */
+.app-content:has(> .ai-chat-shell) {
+  @apply p-0 overflow-hidden;
+}
+
 @keyframes sheet-in {
   from { transform: translateY(100%); }
   to { transform: translateY(0); }
+}
+
+@keyframes chat-turn-in {
+  from { opacity: 0; transform: translateY(6px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes chat-caret {
+  to { opacity: 0; }
+}
+
+@keyframes chat-dot {
+  0%, 60%, 100% { opacity: 0.25; transform: translateY(0); }
+  30% { opacity: 1; transform: translateY(-3px); }
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -317,8 +642,17 @@
     min-height: 44px;
   }
 
-  .ai-chat-shell {
-    margin: -1rem;
-    min-height: calc(100dvh - 148px);
+  /* Lift the composer and the empty-state hero clear of the fixed bottom nav. */
+  .chat-footer {
+    padding-bottom: calc(12px + 72px + env(safe-area-inset-bottom));
+  }
+
+  .chat-empty {
+    padding-bottom: calc(24px + 72px + env(safe-area-inset-bottom));
+  }
+
+  /* The chat owns its own hit-target sizing; don't stretch its icon buttons. */
+  .ai-chat-shell button {
+    min-height: 0;
   }
 }

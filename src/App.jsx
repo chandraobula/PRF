@@ -17,6 +17,17 @@ import ConnectServices from './pages/ConnectServices';
 import AIAssistant from './pages/AIAssistant';
 import ProfileSettings from './pages/ProfileSettings';
 import AdminDashboard from './pages/AdminDashboard';
+import PlannerBoard from './pages/admin/PlannerBoard';
+import ImportNotes from './pages/admin/ImportNotes';
+import TaskDetail from './pages/admin/TaskDetail';
+import Standup from './pages/admin/Standup';
+import WorkosDashboard from './pages/admin/WorkosDashboard';
+import ProjectsList from './pages/admin/ProjectsList';
+import ProjectDetail from './pages/admin/ProjectDetail';
+import AiWorkspace from './pages/admin/AiWorkspace';
+import KnowledgeBase from './pages/admin/KnowledgeBase';
+import Analytics from './pages/admin/Analytics';
+import RequireAdmin from './components/RequireAdmin';
 import MainLayout from './layouts/MainLayout';
 
 function App() {
@@ -41,7 +52,19 @@ function App() {
           <Route path="/services" element={<ConnectServices />} />
           <Route path="/ai-assistant" element={<AIAssistant />} />
           <Route path="/settings" element={<ProfileSettings />} />
-          <Route path="/admin" element={<AdminDashboard />} />
+          <Route element={<RequireAdmin />}>
+            <Route path="/admin" element={<AdminDashboard />} />
+            <Route path="/admin/planner" element={<PlannerBoard />} />
+            <Route path="/admin/planner/dashboard" element={<WorkosDashboard />} />
+            <Route path="/admin/planner/import" element={<ImportNotes />} />
+            <Route path="/admin/planner/standup" element={<Standup />} />
+            <Route path="/admin/planner/projects" element={<ProjectsList />} />
+            <Route path="/admin/planner/projects/:projectId" element={<ProjectDetail />} />
+            <Route path="/admin/planner/knowledge" element={<KnowledgeBase />} />
+            <Route path="/admin/planner/analytics" element={<Analytics />} />
+            <Route path="/admin/planner/tasks/:taskId" element={<TaskDetail />} />
+            <Route path="/admin/planner/tasks/:taskId/workspace" element={<AiWorkspace />} />
+          </Route>
         </Route>
       </Routes>
     </BrowserRouter>

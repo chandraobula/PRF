@@ -6,3 +6,12 @@ GEMINI_API_KEY=your-gemini-api-key-here
 
 # Optional: override the vision/document model (default: gemini-flash-latest).
 # GEMINI_MODEL=gemini-flash-latest
+
+# OpenRouter API key — powers "Ask Life OS" (/api/chat). Get one at
+# https://openrouter.ai/keys. The key must be able to reach tool-calling models.
+OPENROUTER_API_KEY=
+
+# Optional: override the model chain used by Ask Life OS. Accepts a single slug
+# or a comma-separated fallback list; the first model that accepts the request
+# wins. Every model MUST support tool calling. Defaults to a free-tier chain.
+# OPENROUTER_MODEL=nvidia/nemotron-3-super-120b-a12b:free,inclusionai/ling-3.0-flash:free

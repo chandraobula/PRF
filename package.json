@@ -6,7 +6,7 @@
   "scripts": {
     "dev": "npm run dev:local",
     "dev:frontend": "vite",
-    "dev:local": "npm run build && npm run dev:cloudflare",
+    "dev:local": "concurrently \"npm run dev:cloudflare\" \"npm run dev:frontend\"",
     "dev:cloudflare": "node scripts/wrangler-local.mjs pages dev dist --binding AUTH_MODE=public --binding SESSION_DAYS=30 --persist-to .wrangler/state --ip 127.0.0.1 --port 8788 --live-reload --show-interactive-dev-session=false",
     "db:local:setup": "node scripts/setup-local-db.mjs",
     "db:local:seed:demo": "node scripts/wrangler-local.mjs d1 execute DB --local --persist-to .wrangler/state --file=db/seed.sql --yes",
@@ -28,6 +28,7 @@
     "@types/react-dom": "^19.2.3",
     "@vitejs/plugin-react": "^6.0.3",
     "autoprefixer": "^10.5.2",
+    "concurrently": "^10.0.4",
     "oxlint": "^1.71.0",
     "postcss": "^8.5.16",
     "tailwindcss": "^3.4.19",

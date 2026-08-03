@@ -1,13 +1,56 @@
-import { CheckCircle2, CheckSquare, Pause, ShieldCheck, TimerReset } from 'lucide-react';
+import { useState } from 'react';
+import { CheckCircle2, CheckSquare, LayoutDashboard, Pause, ShieldCheck, StickyNote, TimerReset } from 'lucide-react';
+import { cn } from '../lib/utils';
+import StickyBoard from '../components/Work/StickyBoard';
+
+const TABS = [
+  { id: 'overview', label: 'Overview', icon: LayoutDashboard },
+  { id: 'notes', label: 'Sticky notes', icon: StickyNote },
+];
 
 export default function WorkHub() {
+  const [activeTab, setActiveTab] = useState('overview');
+
   return (
-    <div className="space-y-8 max-w-container-max mx-auto">
-      <section>
-        <h1 className="font-display text-4xl font-bold text-on-surface tracking-tight mb-2">Work Hub</h1>
-        <p className="font-body text-on-surface-variant text-lg">Focus block active. 42 minutes remaining.</p>
+    <div className="space-y-6 max-w-container-max mx-auto pb-8">
+      <section className="space-y-4">
+        <div>
+          <h1 className="font-display text-3xl sm:text-4xl font-bold text-on-surface tracking-tight">Work Hub</h1>
+          <p className="hidden sm:block font-body text-on-surface-variant">Focus, tasks, and everything you scribbled down.</p>
+        </div>
+
+        <div className="-mx-4 flex gap-1 overflow-x-auto border-b border-border-subtle px-4 sm:mx-0 sm:px-0" role="tablist" aria-label="Work sections">
+          {TABS.map((tab) => (
+            <button
+              key={tab.id}
+              type="button"
+              role="tab"
+              aria-selected={activeTab === tab.id}
+              aria-controls={`work-panel-${tab.id}`}
+              onClick={() => setActiveTab(tab.id)}
+              className={cn(
+                'relative min-h-11 shrink-0 flex items-center gap-1.5 px-3 pb-2.5 pt-1 text-sm font-semibold transition-colors',
+                activeTab === tab.id ? 'text-on-surface' : 'text-text-muted hover:text-on-surface',
+              )}
+            >
+              <tab.icon className={cn('h-4 w-4 shrink-0', activeTab === tab.id ? 'text-secondary' : 'text-text-muted')} />
+              <span>{tab.label}</span>
+              {activeTab === tab.id && <span className="absolute inset-x-2 -bottom-px h-0.5 rounded-full bg-secondary" />}
+            </button>
+          ))}
+        </div>
       </section>
 
+      <div id={`work-panel-${activeTab}`} role="tabpanel">
+        {activeTab === 'notes' ? <StickyBoard /> : <WorkOverview />}
+      </div>
+    </div>
+  );
+}
+
+function WorkOverview() {
+  return (
+    <div className="space-y-6">
       <section className="grid grid-cols-1 md:grid-cols-3 gap-4 lg:gap-6">
         <div className="work-focus-banner col-span-1 md:col-span-2 bg-primary rounded-[24px] p-5 sm:p-7 text-on-primary shadow-[0_16px_40px_rgba(15,23,42,.14)] relative overflow-hidden">
           <div className="absolute -top-24 -right-20 w-72 h-72 bg-blue-500/20 rounded-full blur-3xl" />

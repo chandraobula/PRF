@@ -32,7 +32,17 @@ const defaultIncomeCategories = [
   ['cat-income-interest', 'Interest', '#0EA5E9', 'Percent', 30],
   ['cat-income-gifts', 'Gifts', '#EC4899', 'Gift', 40],
   ['cat-income-rental', 'Rental', '#8B5CF6', 'Home', 50],
+  // Credits picked up from imported statements land here so they never inflate
+  // the salary/freelance figures the user actually earns.
+  ['cat-income-misc', 'Miscellaneous income', '#94A3B8', 'ArrowDownLeft', 90],
 ];
+
+// Income categories that represent genuine earnings, as opposed to transfers,
+// repayments and reimbursements that merely arrive as credits. Matched by name
+// because category ids are namespaced per user.
+const PRIMARY_INCOME_CATEGORY_NAMES = ['Salary', 'Freelance'];
+
+export const MISC_INCOME_CATEGORY = 'Miscellaneous income';
 
 export async function onRequest(context) {
   const { request, env } = context;
@@ -99,8 +109,16 @@ export async function onRequest(context) {
       return await handleNotesRoute({ db: env.DB, request, route: route.slice(1), user: auth, env });
     }
 
+    if (route[0] === 'sticky-notes') {
+      return await handleStickyNotesRoute({ db: env.DB, request, url, route: route.slice(1), user: auth });
+    }
+
     if (route[0] === 'admin') {
       return await handleAdminRoute({ db: env.DB, request, url, route: route.slice(1), user: auth });
+    }
+
+    if (route[0] === 'planner') {
+      return await handlePlannerRoute({ db: env.DB, request, url, route: route.slice(1), user: auth, env });
     }
 
     return sendJson({ error: 'Not found' }, 404);
@@ -117,6 +135,232 @@ export async function onRequest(context) {
       500,
     );
   }
+}
+
+// ---------------------------------------------------------------------------
+// Sticky notes — the Work Hub board
+// ---------------------------------------------------------------------------
+
+const STICKY_COLORS = ['yellow', 'pink', 'blue', 'green', 'purple', 'orange'];
+const STICKY_FONTS = ['hand', 'print', 'clean'];
+const STICKY_MAX_BODY = 8000;
+
+// Sticky note bodies are rich text, so they are stored as HTML. Only these tags
+// survive, and every attribute is dropped — see sanitizeStickyHtml.
+const STICKY_ALLOWED_TAGS = new Set([
+  'b', 'strong', 'i', 'em', 'u', 's', 'strike', 'del', 'mark',
+  'br', 'div', 'p', 'ul', 'ol', 'li',
+]);
+
+/**
+ * Allowlist sanitiser for sticky-note HTML.
+ *
+ * Rather than trying to scrub dangerous attributes, every tag is re-emitted from
+ * scratch with no attributes at all — so there is nowhere for `onerror`,
+ * `href="javascript:"` or a style expression to live. Disallowed tags are
+ * dropped but their text content is kept.
+ */
+function sanitizeStickyHtml(value) {
+  let html = String(value == null ? '' : value).slice(0, STICKY_MAX_BODY);
+
+  // Elements whose *content* must go too, not just their tags.
+  html = html.replace(/<(script|style|iframe|object|embed|noscript|template)\b[\s\S]*?<\/\1\s*>/gi, '');
+  html = html.replace(/<(script|style|iframe|object|embed|noscript|template)\b[^>]*>/gi, '');
+
+  // Comments can hide conditional markup.
+  html = html.replace(/<!--[\s\S]*?-->/g, '');
+
+  html = html.replace(/<\/?([a-zA-Z][a-zA-Z0-9-]*)\b[^>]*>/g, (match, rawTag) => {
+    const tag = rawTag.toLowerCase();
+    if (!STICKY_ALLOWED_TAGS.has(tag)) return '';
+    if (match.startsWith('</')) return `</${tag}>`;
+    return tag === 'br' ? '<br>' : `<${tag}>`;
+  });
+
+  // Anything left that looks like a stray angle bracket is literal text.
+  html = html.replace(/<(?![/a-zA-Z])/g, '&lt;');
+
+  return html.slice(0, STICKY_MAX_BODY);
+}
+
+async function handleStickyNotesRoute({ db, request, url, route, user }) {
+  const [id] = route;
+  const board = (url.searchParams.get('board') || 'work').slice(0, 40);
+
+  if (!id) {
+    if (request.method === 'GET') {
+      return sendJson({ notes: await listStickyNotes(db, user.userId, board) });
+    }
+
+    if (request.method === 'POST') {
+      const payload = await readJson(request);
+      return sendJson({ note: await createStickyNote(db, user.userId, payload) }, 201);
+    }
+  }
+
+  if (id === 'reorder' && request.method === 'POST') {
+    const payload = await readJson(request);
+    await reorderStickyNotes(db, user.userId, payload.order || []);
+    return sendJson({ ok: true });
+  }
+
+  if (id && request.method === 'PATCH') {
+    const payload = await readJson(request);
+    return sendJson({ note: await updateStickyNote(db, user.userId, id, payload) });
+  }
+
+  if (id && request.method === 'DELETE') {
+    await deleteStickyNote(db, user.userId, id);
+    return sendJson({ ok: true });
+  }
+
+  throw new HttpError(405, 'Method not allowed');
+}
+
+async function listStickyNotes(db, userId, board = 'work') {
+  const result = await db
+    .prepare(
+      `
+      SELECT * FROM sticky_notes
+      WHERE user_id = ? AND board = ? AND status = 'active'
+      ORDER BY is_pinned DESC, sort_order ASC, created_at ASC
+    `,
+    )
+    .bind(userId, board)
+    .all();
+
+  return (result.results || []).map(mapStickyNote);
+}
+
+async function createStickyNote(db, userId, payload) {
+  const id = payload.id || crypto.randomUUID();
+  const board = (payload.board || 'work').slice(0, 40);
+
+  // New notes go to the end of the board.
+  const row = await db
+    .prepare('SELECT COALESCE(MAX(sort_order), -1) AS max_order FROM sticky_notes WHERE user_id = ? AND board = ?')
+    .bind(userId, board)
+    .first();
+
+  await db
+    .prepare(
+      `
+      INSERT INTO sticky_notes (id, user_id, board, body, color, font, rotation, sort_order)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `,
+    )
+    .bind(
+      id,
+      userId,
+      board,
+      sanitizeStickyHtml(payload.body),
+      normalizeStickyColor(payload.color),
+      normalizeStickyFont(payload.font),
+      normalizeStickyRotation(payload.rotation),
+      Number(row?.max_order ?? -1) + 1,
+    )
+    .run();
+
+  return getStickyNote(db, userId, id);
+}
+
+async function updateStickyNote(db, userId, id, payload) {
+  const allowed = {
+    body: payload.body === undefined ? undefined : sanitizeStickyHtml(payload.body),
+    color: payload.color === undefined ? undefined : normalizeStickyColor(payload.color),
+    font: payload.font === undefined ? undefined : normalizeStickyFont(payload.font),
+    rotation: payload.rotation === undefined ? undefined : normalizeStickyRotation(payload.rotation),
+    is_pinned: payload.isPinned === undefined ? undefined : (payload.isPinned ? 1 : 0),
+    status: payload.status === undefined ? undefined : (payload.status === 'archived' ? 'archived' : 'active'),
+  };
+
+  const updates = Object.entries(allowed).filter(([, value]) => value !== undefined);
+
+  if (updates.length) {
+    const result = await db
+      .prepare(
+        `
+        UPDATE sticky_notes
+        SET ${updates.map(([key]) => `${key} = ?`).join(', ')}, updated_at = CURRENT_TIMESTAMP
+        WHERE id = ? AND user_id = ?
+      `,
+      )
+      .bind(...updates.map(([, value]) => value), id, userId)
+      .run();
+
+    if (result.meta && result.meta.changes === 0) {
+      throw new HttpError(404, 'Note not found');
+    }
+  }
+
+  return getStickyNote(db, userId, id);
+}
+
+async function deleteStickyNote(db, userId, id) {
+  const result = await db
+    .prepare('DELETE FROM sticky_notes WHERE id = ? AND user_id = ?')
+    .bind(id, userId)
+    .run();
+
+  if (result.meta && result.meta.changes === 0) {
+    throw new HttpError(404, 'Note not found');
+  }
+}
+
+/** Persist a drag-and-drop rearrangement: ids in their new visual order. */
+async function reorderStickyNotes(db, userId, order) {
+  if (!Array.isArray(order) || !order.length) return;
+
+  const statements = order.slice(0, 200).map((id, index) => db
+    .prepare('UPDATE sticky_notes SET sort_order = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND user_id = ?')
+    .bind(index, id, userId));
+
+  await db.batch(statements);
+}
+
+async function getStickyNote(db, userId, id) {
+  const row = await db
+    .prepare('SELECT * FROM sticky_notes WHERE id = ? AND user_id = ?')
+    .bind(id, userId)
+    .first();
+
+  if (!row) {
+    throw new HttpError(404, 'Note not found');
+  }
+
+  return mapStickyNote(row);
+}
+
+function mapStickyNote(row) {
+  return {
+    id: row.id,
+    board: row.board,
+    body: row.body || '',
+    color: row.color || 'yellow',
+    font: row.font || 'hand',
+    rotation: Number(row.rotation || 0),
+    sortOrder: Number(row.sort_order || 0),
+    isPinned: Number(row.is_pinned || 0) === 1,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
+function normalizeStickyColor(value) {
+  const text = String(value || '').toLowerCase();
+  return STICKY_COLORS.includes(text) ? text : 'yellow';
+}
+
+function normalizeStickyFont(value) {
+  const text = String(value || '').toLowerCase();
+  return STICKY_FONTS.includes(text) ? text : 'hand';
+}
+
+function normalizeStickyRotation(value) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return 0;
+  // Clamp the tilt so a note can never end up unreadable.
+  return Math.max(-4, Math.min(4, Math.round(numeric * 100) / 100));
 }
 
 async function handleFinanceRoute({ db, request, url, route, user, env }) {
@@ -169,11 +413,27 @@ async function handleFinanceRoute({ db, request, url, route, user, env }) {
       const payload = await readJson(request);
       return sendJson({ budget: await createBudget(db, user.userId, payload) }, 201);
     }
+
+    if (id && request.method === 'PATCH') {
+      const payload = await readJson(request);
+      return sendJson({ budget: await updateBudget(db, user.userId, id, payload) });
+    }
+
+    if (id && request.method === 'DELETE') {
+      await deleteBudget(db, user.userId, id);
+      return sendJson({ ok: true });
+    }
   }
 
   if (resource === 'goals') {
     if (request.method === 'GET') {
       return sendJson({ goals: await listGoals(db, user.userId, url.searchParams.get('currency')) });
+    }
+
+    // Must be checked before the bare POST below, otherwise createGoal claims it.
+    if (id && route[2] === 'contribute' && request.method === 'POST') {
+      const payload = await readJson(request);
+      return sendJson({ goal: await contributeToGoal(db, user.userId, id, payload) });
     }
 
     if (request.method === 'POST') {
@@ -185,11 +445,27 @@ async function handleFinanceRoute({ db, request, url, route, user, env }) {
       const payload = await readJson(request);
       return sendJson({ goal: await updateGoal(db, user.userId, id, payload) });
     }
+
+    if (id && request.method === 'DELETE') {
+      await deleteGoal(db, user.userId, id);
+      return sendJson({ ok: true });
+    }
   }
 
   if (resource === 'insights') {
     assertMethod(request, 'GET');
     return sendJson({ insights: await listInsights(db, user.userId) });
+  }
+
+  if (resource === 'analytics') {
+    assertMethod(request, 'GET');
+    return sendJson(await getFinanceAnalytics(db, user.userId, url));
+  }
+
+  if (resource === 'import') {
+    assertMethod(request, 'POST');
+    const payload = await readJson(request);
+    return sendJson(await importTransactions(db, user.userId, payload));
   }
 
   if (resource === 'reports') {
@@ -443,8 +719,8 @@ async function handleAuthRoute({ db, request, route, env }) {
     const role = (userCount && Number(userCount.cnt) === 0) ? 'owner' : 'user';
 
     await db
-      .prepare('INSERT INTO users (id, email, display_name, role) VALUES (?, ?, ?, ?)')
-      .bind(userId, email, displayName, role)
+      .prepare('INSERT INTO users (id, email, display_name, role, has_completed_onboarding) VALUES (?, ?, ?, ?, ?)')
+      .bind(userId, email, displayName, role, 1)
       .run();
 
     await db
@@ -459,7 +735,7 @@ async function handleAuthRoute({ db, request, route, env }) {
 
     await ensureUser(db, { userId, email, displayName });
 
-    return createLoginResponse(db, request, { userId, email, displayName, role }, env);
+    return createLoginResponse(db, request, { userId, email, displayName, role, hasCompletedOnboarding: true }, env);
   }
 
   if (resource === 'login' && request.method === 'POST') {
@@ -469,7 +745,7 @@ async function handleAuthRoute({ db, request, route, env }) {
     const row = await db
       .prepare(
         `
-        SELECT u.id, u.email, u.display_name, u.role, c.password_hash, c.password_salt
+        SELECT u.id, u.email, u.display_name, u.role, u.has_completed_onboarding, c.password_hash, c.password_salt
         FROM auth_credentials c
         JOIN users u ON u.id = c.user_id
         WHERE LOWER(c.email) = LOWER(?)
@@ -498,6 +774,7 @@ async function handleAuthRoute({ db, request, route, env }) {
       email: row.email,
       displayName: row.display_name || row.email.split('@')[0],
       role: row.role || 'user',
+      hasCompletedOnboarding: Boolean(row.has_completed_onboarding),
     }, env);
   }
 
@@ -508,6 +785,11 @@ async function handleAuthRoute({ db, request, route, env }) {
       return sendJson({ authenticated: false });
     }
 
+    const userRow = await db
+      .prepare('SELECT has_completed_onboarding FROM users WHERE id = ?')
+      .bind(auth.userId)
+      .first();
+
     return sendJson({
       authenticated: true,
       user: {
@@ -516,6 +798,7 @@ async function handleAuthRoute({ db, request, route, env }) {
         displayName: auth.displayName,
         mode: auth.mode,
         role: auth.role || 'user',
+        hasCompletedOnboarding: Boolean(userRow?.has_completed_onboarding),
       },
     });
   }
@@ -1023,7 +1306,7 @@ async function listBudgets(db, userId, url, selectedCurrency) {
     .bind(userId, currency, nextStart, start)
     .all();
 
-  return (result.results || []).map(mapBudget);
+  return (result.results || []).map((row) => mapBudget(row, asOf));
 }
 
 async function createBudget(db, userId, payload) {
@@ -1068,13 +1351,100 @@ async function createBudget(db, userId, payload) {
     )
     .run();
 
-  return getBudget(db, userId, id, normalizeCurrency(payload.currency || 'USD'));
+  return getBudget(db, userId, id);
 }
 
-async function getBudget(db, userId, id, currency = 'USD') {
-  const url = new URL('https://lifeos.local/api/finance/budgets');
-  const budgets = await listBudgets(db, userId, url, currency);
-  return budgets.find((item) => item.id === id) || null;
+async function updateBudget(db, userId, id, payload) {
+  const existing = await db
+    .prepare('SELECT * FROM finance_budgets WHERE id = ? AND user_id = ?')
+    .bind(id, userId)
+    .first();
+
+  if (!existing) {
+    throw new HttpError(404, 'Budget not found');
+  }
+
+  const categoryId = payload.categoryId !== undefined
+    ? payload.categoryId || null
+    : (payload.category ? await resolveCategoryId(db, userId, 'expense', null, payload.category) : undefined);
+
+  const allowed = {
+    name: payload.name,
+    category_id: categoryId,
+    period: payload.period,
+    period_start: payload.periodStart ? normalizeDate(payload.periodStart) : undefined,
+    period_end: payload.periodEnd ? normalizeDate(payload.periodEnd) : undefined,
+    limit_minor: payload.limitMinor !== undefined || payload.limit !== undefined
+      ? normalizeMoney(payload.limitMinor, payload.limit)
+      : undefined,
+    carry_forward_minor: payload.carryForwardMinor !== undefined || payload.carryForward !== undefined
+      ? normalizeMoney(payload.carryForwardMinor, payload.carryForward)
+      : undefined,
+    alert_threshold_percent: payload.alertThresholdPercent,
+    is_flexible: payload.isFlexible === undefined ? undefined : (payload.isFlexible ? 1 : 0),
+  };
+
+  const updates = Object.entries(allowed).filter(([, value]) => value !== undefined);
+
+  if (updates.length) {
+    await db
+      .prepare(
+        `
+        UPDATE finance_budgets
+        SET ${updates.map(([key]) => `${key} = ?`).join(', ')}, updated_at = CURRENT_TIMESTAMP
+        WHERE id = ? AND user_id = ?
+      `,
+      )
+      .bind(...updates.map(([, value]) => value), id, userId)
+      .run();
+  }
+
+  return getBudget(db, userId, id);
+}
+
+async function deleteBudget(db, userId, id) {
+  const result = await db
+    .prepare('DELETE FROM finance_budgets WHERE id = ? AND user_id = ?')
+    .bind(id, userId)
+    .run();
+
+  if (result.meta && result.meta.changes === 0) {
+    throw new HttpError(404, 'Budget not found');
+  }
+}
+
+/**
+ * Fetch one budget with its spend rolled up. Deliberately does NOT go through
+ * listBudgets — that filters to periods overlapping the current month, so a
+ * budget with a custom period would come back null right after being saved.
+ */
+async function getBudget(db, userId, id) {
+  const row = await db
+    .prepare(
+      `
+      SELECT
+        b.*,
+        c.name AS category_name,
+        c.color AS category_color,
+        COALESCE((
+          SELECT SUM(CASE WHEN t.type = 'refund' THEN -t.amount_minor ELSE t.amount_minor END)
+          FROM finance_transactions t
+          WHERE t.user_id = b.user_id
+            AND t.status != 'deleted'
+            AND t.type IN ('expense', 'refund')
+            AND t.currency = b.currency
+            AND (b.category_id IS NULL OR t.category_id = b.category_id)
+            AND t.occurred_on BETWEEN b.period_start AND b.period_end
+        ), 0) AS spent_minor
+      FROM finance_budgets b
+      LEFT JOIN finance_categories c ON c.id = b.category_id
+      WHERE b.id = ? AND b.user_id = ?
+    `,
+    )
+    .bind(id, userId)
+    .first();
+
+  return row ? mapBudget(row) : null;
 }
 
 async function listGoals(db, userId, selectedCurrency) {
@@ -1099,7 +1469,8 @@ async function listGoals(db, userId, selectedCurrency) {
     .bind(...values)
     .all();
 
-  return (result.results || []).map(mapGoal);
+  const asOf = today();
+  return (result.results || []).map((row) => mapGoal(row, asOf));
 }
 
 async function createGoal(db, userId, payload) {
@@ -1137,7 +1508,12 @@ async function createGoal(db, userId, payload) {
     )
     .run();
 
-  return (await listGoals(db, userId)).find((item) => item.id === id);
+  const row = await db
+    .prepare('SELECT * FROM finance_goals WHERE id = ? AND user_id = ?')
+    .bind(id, userId)
+    .first();
+
+  return row ? mapGoal(row) : null;
 }
 
 async function updateGoal(db, userId, id, payload) {
@@ -1170,7 +1546,81 @@ async function updateGoal(db, userId, id, payload) {
       .run();
   }
 
-  return (await listGoals(db, userId)).find((item) => item.id === id);
+  // Read the row back directly — listGoals hides archived goals, so archiving
+  // one through this endpoint would otherwise return undefined.
+  const row = await db
+    .prepare('SELECT * FROM finance_goals WHERE id = ? AND user_id = ?')
+    .bind(id, userId)
+    .first();
+
+  if (!row) {
+    throw new HttpError(404, 'Goal not found');
+  }
+
+  return mapGoal(row);
+}
+
+async function deleteGoal(db, userId, id) {
+  const result = await db
+    .prepare('DELETE FROM finance_goals WHERE id = ? AND user_id = ?')
+    .bind(id, userId)
+    .run();
+
+  if (result.meta && result.meta.changes === 0) {
+    throw new HttpError(404, 'Goal not found');
+  }
+}
+
+/**
+ * Move money into (or, with a negative amount, back out of) a goal.
+ * Reads and writes in one statement so two quick taps can't both read the same
+ * starting balance and lose one of the contributions.
+ */
+async function contributeToGoal(db, userId, id, payload) {
+  const existing = await db
+    .prepare('SELECT * FROM finance_goals WHERE id = ? AND user_id = ?')
+    .bind(id, userId)
+    .first();
+
+  if (!existing) {
+    throw new HttpError(404, 'Goal not found');
+  }
+
+  const rawAmount = payload.amountMinor !== undefined && payload.amountMinor !== null && payload.amountMinor !== ''
+    ? normalizeAmount(payload.amountMinor, true)
+    : normalizeAmount(payload.amount, false);
+
+  if (!rawAmount) {
+    throw new HttpError(400, 'Enter an amount to add.');
+  }
+
+  const direction = payload.direction === 'withdraw' ? -1 : 1;
+  const delta = rawAmount * direction;
+  const target = Number(existing.target_amount_minor || 0);
+
+  await db
+    .prepare(
+      `
+      UPDATE finance_goals
+      SET saved_amount_minor = MAX(0, MIN(?, saved_amount_minor + ?)),
+          status = CASE
+            WHEN MAX(0, MIN(?, saved_amount_minor + ?)) >= ? AND ? > 0 THEN 'completed'
+            WHEN status = 'completed' THEN 'active'
+            ELSE status
+          END,
+          updated_at = CURRENT_TIMESTAMP
+      WHERE id = ? AND user_id = ?
+    `,
+    )
+    .bind(target, delta, target, delta, target, target, id, userId)
+    .run();
+
+  const row = await db
+    .prepare('SELECT * FROM finance_goals WHERE id = ? AND user_id = ?')
+    .bind(id, userId)
+    .first();
+
+  return row ? mapGoal(row) : null;
 }
 
 async function listInsights(db, userId) {
@@ -1284,6 +1734,473 @@ async function spendingByCategory(db, userId, start, nextStart, currency) {
     amountMinor: Number(row.amount_minor || 0),
     transactionCount: Number(row.transaction_count || 0),
   }));
+}
+
+// ---------------------------------------------------------------------------
+// Spending analytics — trend, movers, merchants, pace and recurring detection.
+// Everything is derived from finance_transactions so it needs no new tables.
+// ---------------------------------------------------------------------------
+
+const TREND_MONTHS = 6;
+
+async function getFinanceAnalytics(db, userId, url) {
+  const asOf = url.searchParams.get('asOf') || today();
+  const currency = normalizeCurrency(url.searchParams.get('currency') || 'USD');
+  const { start, nextStart, previousStart } = monthBounds(asOf);
+
+  const [trend, current, previous, topMerchants, largest, weekday, recurring, incomeBreakdown] = await Promise.all([
+    monthlyTrend(db, userId, currency, asOf),
+    spendingByCategory(db, userId, start, nextStart, currency),
+    spendingByCategory(db, userId, previousStart, start, currency),
+    topMerchantsFor(db, userId, start, nextStart, currency),
+    largestExpenses(db, userId, start, nextStart, currency),
+    weekdaySplit(db, userId, start, nextStart, currency),
+    detectRecurring(db, userId, currency, asOf),
+    incomeByCategory(db, userId, start, nextStart, currency),
+  ]);
+
+  return {
+    currency,
+    monthStart: start,
+    monthEnd: addDays(nextStart, -1),
+    trend,
+    categoryDeltas: buildCategoryDeltas(current, previous),
+    topMerchants,
+    largest,
+    weekday,
+    recurring,
+    incomeBreakdown,
+    pace: spendingPace(trend, asOf, start, nextStart),
+  };
+}
+
+/**
+ * Split income into what the user actually earns (salary, freelance) and
+ * everything else — repayments, gifts and the credits picked up from imported
+ * statements. Lumping them together makes earnings look bigger than they are.
+ */
+async function incomeByCategory(db, userId, start, nextStart, currency) {
+  const result = await db
+    .prepare(
+      `
+      SELECT
+        COALESCE(c.name, 'Uncategorized') AS name,
+        COALESCE(c.color, '#94A3B8') AS color,
+        SUM(t.amount_minor) AS amount_minor,
+        COUNT(t.id) AS transaction_count
+      FROM finance_transactions t
+      LEFT JOIN finance_categories c ON c.id = t.category_id
+      WHERE t.user_id = ?
+        AND t.status != 'deleted'
+        AND t.type = 'income'
+        AND t.occurred_on >= ?
+        AND t.occurred_on < ?
+        AND t.currency = ?
+      GROUP BY c.id, c.name, c.color
+      ORDER BY amount_minor DESC
+    `,
+    )
+    .bind(userId, start, nextStart, currency)
+    .all();
+
+  const byCategory = (result.results || []).map((row) => ({
+    name: row.name,
+    color: row.color,
+    amountMinor: Number(row.amount_minor || 0),
+    transactionCount: Number(row.transaction_count || 0),
+    isPrimary: PRIMARY_INCOME_CATEGORY_NAMES.includes(row.name),
+  }));
+
+  const primaryMinor = byCategory
+    .filter((row) => row.isPrimary)
+    .reduce((sum, row) => sum + row.amountMinor, 0);
+  const otherMinor = byCategory
+    .filter((row) => !row.isPrimary)
+    .reduce((sum, row) => sum + row.amountMinor, 0);
+
+  return {
+    primaryMinor,
+    otherMinor,
+    totalMinor: primaryMinor + otherMinor,
+    byCategory,
+  };
+}
+
+/** Income/expense per month for the trailing TREND_MONTHS window, oldest first. */
+async function monthlyTrend(db, userId, currency, asOf) {
+  const months = [];
+  let cursor = monthBounds(asOf).start;
+
+  for (let i = 0; i < TREND_MONTHS; i += 1) {
+    months.unshift(cursor);
+    cursor = monthBounds(addDays(cursor, -1)).start;
+  }
+
+  const windowStart = months[0];
+  const windowEnd = monthBounds(asOf).nextStart;
+
+  const result = await db
+    .prepare(
+      `
+      SELECT
+        substr(occurred_on, 1, 7) AS month,
+        COALESCE(SUM(CASE WHEN type = 'income' THEN amount_minor ELSE 0 END), 0) AS income_minor,
+        COALESCE(SUM(CASE WHEN type = 'expense' THEN amount_minor ELSE 0 END), 0) AS expense_minor,
+        COALESCE(SUM(CASE WHEN type = 'refund' THEN amount_minor ELSE 0 END), 0) AS refund_minor,
+        COUNT(*) AS transaction_count
+      FROM finance_transactions
+      WHERE user_id = ?
+        AND status != 'deleted'
+        AND currency = ?
+        AND occurred_on >= ?
+        AND occurred_on < ?
+      GROUP BY month
+    `,
+    )
+    .bind(userId, currency, windowStart, windowEnd)
+    .all();
+
+  const byMonth = new Map((result.results || []).map((row) => [row.month, row]));
+
+  return months.map((monthStart) => {
+    const key = monthStart.slice(0, 7);
+    const row = byMonth.get(key);
+    const incomeMinor = Number(row?.income_minor || 0);
+    const expenseMinor = Math.max(0, Number(row?.expense_minor || 0) - Number(row?.refund_minor || 0));
+
+    return {
+      month: key,
+      monthStart,
+      incomeMinor,
+      expenseMinor,
+      netMinor: incomeMinor - expenseMinor,
+      transactionCount: Number(row?.transaction_count || 0),
+    };
+  });
+}
+
+/** Category spend this month vs last, sorted by the size of the swing. */
+function buildCategoryDeltas(current, previous) {
+  const previousByName = new Map(previous.map((row) => [row.name, row.amountMinor]));
+  const names = new Set([...current.map((row) => row.name), ...previous.map((row) => row.name)]);
+
+  return [...names]
+    .map((name) => {
+      const currentRow = current.find((row) => row.name === name);
+      const previousRow = previous.find((row) => row.name === name);
+      const currentMinor = currentRow?.amountMinor || 0;
+      const previousMinor = previousByName.get(name) || 0;
+      const deltaMinor = currentMinor - previousMinor;
+
+      return {
+        id: currentRow?.id || previousRow?.id || name,
+        name,
+        color: currentRow?.color || previousRow?.color || '#64748B',
+        currentMinor,
+        previousMinor,
+        deltaMinor,
+        // Percent is meaningless against a zero base — the UI shows "new" instead.
+        deltaPercent: previousMinor > 0 ? Math.round((deltaMinor / previousMinor) * 100) : null,
+        transactionCount: currentRow?.transactionCount || 0,
+      };
+    })
+    .filter((row) => row.currentMinor > 0 || row.previousMinor > 0)
+    .sort((a, b) => Math.abs(b.deltaMinor) - Math.abs(a.deltaMinor));
+}
+
+async function topMerchantsFor(db, userId, start, nextStart, currency) {
+  const result = await db
+    .prepare(
+      `
+      SELECT
+        COALESCE(NULLIF(TRIM(merchant), ''), NULLIF(TRIM(payee), ''), 'Unknown') AS name,
+        SUM(amount_minor) AS amount_minor,
+        COUNT(*) AS transaction_count
+      FROM finance_transactions
+      WHERE user_id = ?
+        AND status != 'deleted'
+        AND type = 'expense'
+        AND occurred_on >= ?
+        AND occurred_on < ?
+        AND currency = ?
+      GROUP BY LOWER(name)
+      ORDER BY amount_minor DESC
+      LIMIT 8
+    `,
+    )
+    .bind(userId, start, nextStart, currency)
+    .all();
+
+  return (result.results || []).map((row) => ({
+    name: row.name,
+    amountMinor: Number(row.amount_minor || 0),
+    transactionCount: Number(row.transaction_count || 0),
+  }));
+}
+
+async function largestExpenses(db, userId, start, nextStart, currency) {
+  const result = await db
+    .prepare(
+      `
+      SELECT t.id, t.occurred_on, t.amount_minor, t.merchant, t.payee, c.name AS category_name
+      FROM finance_transactions t
+      LEFT JOIN finance_categories c ON c.id = t.category_id
+      WHERE t.user_id = ?
+        AND t.status != 'deleted'
+        AND t.type = 'expense'
+        AND t.occurred_on >= ?
+        AND t.occurred_on < ?
+        AND t.currency = ?
+      ORDER BY t.amount_minor DESC
+      LIMIT 5
+    `,
+    )
+    .bind(userId, start, nextStart, currency)
+    .all();
+
+  return (result.results || []).map((row) => ({
+    id: row.id,
+    occurredOn: row.occurred_on,
+    amountMinor: Number(row.amount_minor || 0),
+    merchant: row.merchant || row.payee || 'Transaction',
+    categoryName: row.category_name || 'Uncategorized',
+  }));
+}
+
+/** SQLite strftime('%w'): 0 = Sunday, 6 = Saturday. */
+async function weekdaySplit(db, userId, start, nextStart, currency) {
+  const result = await db
+    .prepare(
+      `
+      SELECT
+        COALESCE(SUM(CASE WHEN CAST(strftime('%w', occurred_on) AS INTEGER) IN (0, 6) THEN amount_minor ELSE 0 END), 0) AS weekend_minor,
+        COALESCE(SUM(CASE WHEN CAST(strftime('%w', occurred_on) AS INTEGER) BETWEEN 1 AND 5 THEN amount_minor ELSE 0 END), 0) AS weekday_minor
+      FROM finance_transactions
+      WHERE user_id = ?
+        AND status != 'deleted'
+        AND type = 'expense'
+        AND occurred_on >= ?
+        AND occurred_on < ?
+        AND currency = ?
+    `,
+    )
+    .bind(userId, start, nextStart, currency)
+    .first();
+
+  return {
+    weekdayMinor: Number(result?.weekday_minor || 0),
+    weekendMinor: Number(result?.weekend_minor || 0),
+  };
+}
+
+/**
+ * Flag merchants billing a near-constant amount on a regular cadence over the
+ * trailing 4 months — the charges people forget they signed up for.
+ */
+async function detectRecurring(db, userId, currency, asOf) {
+  const { nextStart } = monthBounds(asOf);
+  let windowStart = monthBounds(asOf).start;
+  for (let i = 0; i < 3; i += 1) {
+    windowStart = monthBounds(addDays(windowStart, -1)).start;
+  }
+
+  const result = await db
+    .prepare(
+      `
+      SELECT
+        COALESCE(NULLIF(TRIM(merchant), ''), NULLIF(TRIM(payee), '')) AS name,
+        amount_minor,
+        occurred_on
+      FROM finance_transactions
+      WHERE user_id = ?
+        AND status != 'deleted'
+        AND type = 'expense'
+        AND occurred_on >= ?
+        AND occurred_on < ?
+        AND currency = ?
+        AND COALESCE(NULLIF(TRIM(merchant), ''), NULLIF(TRIM(payee), '')) IS NOT NULL
+      ORDER BY occurred_on ASC
+    `,
+    )
+    .bind(userId, windowStart, nextStart, currency)
+    .all();
+
+  const groups = new Map();
+  for (const row of result.results || []) {
+    const key = String(row.name).toLowerCase();
+    if (!groups.has(key)) groups.set(key, { name: row.name, entries: [] });
+    groups.get(key).entries.push({
+      amountMinor: Number(row.amount_minor || 0),
+      occurredOn: row.occurred_on,
+    });
+  }
+
+  const recurring = [];
+
+  for (const group of groups.values()) {
+    if (group.entries.length < 3) continue;
+
+    const amounts = group.entries.map((entry) => entry.amountMinor);
+    const average = amounts.reduce((sum, value) => sum + value, 0) / amounts.length;
+    if (average <= 0) continue;
+
+    // Charges must be within 15% of the average to count as "the same" bill.
+    const isStable = amounts.every((value) => Math.abs(value - average) / average <= 0.15);
+    if (!isStable) continue;
+
+    const gaps = [];
+    for (let i = 1; i < group.entries.length; i += 1) {
+      gaps.push(daysBetweenDates(group.entries[i - 1].occurredOn, group.entries[i].occurredOn));
+    }
+    const averageGap = gaps.reduce((sum, value) => sum + value, 0) / gaps.length;
+    const cadence = classifyCadence(averageGap);
+    if (!cadence) continue;
+
+    const last = group.entries[group.entries.length - 1];
+    recurring.push({
+      name: group.name,
+      amountMinor: Math.round(average),
+      cadence,
+      occurrences: group.entries.length,
+      lastSeen: last.occurredOn,
+      nextExpected: addDays(last.occurredOn, Math.round(averageGap)),
+      monthlyEquivalentMinor: Math.round(average * (30.44 / Math.max(averageGap, 1))),
+    });
+  }
+
+  return recurring.sort((a, b) => b.monthlyEquivalentMinor - a.monthlyEquivalentMinor).slice(0, 8);
+}
+
+function classifyCadence(averageGap) {
+  if (averageGap >= 5 && averageGap <= 9) return 'weekly';
+  if (averageGap >= 12 && averageGap <= 18) return 'fortnightly';
+  if (averageGap >= 26 && averageGap <= 35) return 'monthly';
+  if (averageGap >= 85 && averageGap <= 95) return 'quarterly';
+  return null;
+}
+
+function daysBetweenDates(from, to) {
+  const fromDate = new Date(`${from}T00:00:00Z`);
+  const toDate = new Date(`${to}T00:00:00Z`);
+  return Math.round((toDate.getTime() - fromDate.getTime()) / 86400000);
+}
+
+/** Burn rate so far and a straight-line projection to month end. */
+function spendingPace(trend, asOf, start, nextStart) {
+  const currentMonth = trend[trend.length - 1] || { expenseMinor: 0 };
+  const previousMonth = trend[trend.length - 2] || { expenseMinor: 0 };
+  const daysInMonth = daysBetweenDates(start, nextStart);
+  const elapsed = Math.min(Math.max(daysBetweenDates(start, asOf) + 1, 1), daysInMonth);
+  const dailyBurnMinor = Math.round(currentMonth.expenseMinor / elapsed);
+
+  // Averaging the trailing window gives a steadier bar than last month alone.
+  const history = trend.slice(0, -1).filter((month) => month.expenseMinor > 0);
+  const averageExpenseMinor = history.length
+    ? Math.round(history.reduce((sum, month) => sum + month.expenseMinor, 0) / history.length)
+    : 0;
+
+  // Extrapolating from one or two days turns a single rent payment into an
+  // absurd month-end figure, so the projection only unlocks once there's a
+  // meaningful sample.
+  const MIN_DAYS_FOR_PROJECTION = 5;
+  const projectionReliable = elapsed >= MIN_DAYS_FOR_PROJECTION;
+
+  return {
+    daysInMonth,
+    daysElapsed: elapsed,
+    dailyBurnMinor,
+    projectionReliable,
+    projectedExpenseMinor: projectionReliable ? dailyBurnMinor * daysInMonth : null,
+    previousExpenseMinor: previousMonth.expenseMinor,
+    averageExpenseMinor,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Bulk import — takes rows already parsed and column-mapped by the client.
+// ---------------------------------------------------------------------------
+
+const IMPORT_MAX_ROWS = 2000;
+
+async function importTransactions(db, userId, payload) {
+  const rows = Array.isArray(payload?.transactions) ? payload.transactions : [];
+
+  if (!rows.length) {
+    throw new HttpError(400, 'No rows to import.');
+  }
+
+  if (rows.length > IMPORT_MAX_ROWS) {
+    throw new HttpError(413, `Too many rows — import at most ${IMPORT_MAX_ROWS} at a time.`);
+  }
+
+  const currency = normalizeCurrency(payload.currency || 'USD');
+  const skipDuplicates = payload.skipDuplicates !== false;
+
+  // One read of the existing keys beats a per-row SELECT inside the loop.
+  const existing = new Set();
+  if (skipDuplicates) {
+    const known = await db
+      .prepare(
+        `
+        SELECT occurred_on, amount_minor, type,
+               LOWER(COALESCE(NULLIF(TRIM(merchant), ''), NULLIF(TRIM(payee), ''), '')) AS name
+        FROM finance_transactions
+        WHERE user_id = ? AND status != 'deleted' AND currency = ?
+      `,
+      )
+      .bind(userId, currency)
+      .all();
+
+    for (const row of known.results || []) {
+      existing.add(`${row.occurred_on}|${row.amount_minor}|${row.type}|${row.name}`);
+    }
+  }
+
+  let imported = 0;
+  let skipped = 0;
+  const errors = [];
+
+  for (let index = 0; index < rows.length; index += 1) {
+    const row = rows[index];
+
+    try {
+      const type = normalizeTransactionType(row.type);
+      const amountMinor = normalizeMoney(row.amountMinor, row.amount);
+      const occurredOn = normalizeDate(row.occurredOn || row.date);
+      const name = String(row.merchant || row.payee || '').trim();
+
+      if (!amountMinor || amountMinor <= 0) {
+        throw new Error('Amount must be greater than zero');
+      }
+
+      const key = `${occurredOn}|${amountMinor}|${type}|${name.toLowerCase()}`;
+      if (skipDuplicates && existing.has(key)) {
+        skipped += 1;
+        continue;
+      }
+
+      await createTransaction(db, userId, {
+        type,
+        amountMinor,
+        occurredOn,
+        currency,
+        merchant: name || null,
+        category: row.category || null,
+        notes: row.notes || null,
+        source: 'import',
+      });
+
+      existing.add(key);
+      imported += 1;
+    } catch (error) {
+      // Report the row number the user sees in their spreadsheet (1-based + header).
+      if (errors.length < 25) {
+        errors.push({ row: index + 2, message: error.message || 'Could not import this row' });
+      }
+    }
+  }
+
+  return { imported, skipped, failed: errors.length, errors };
 }
 
 async function buildMonthlyReport(db, userId, url) {
@@ -1925,6 +2842,16 @@ async function scanDocument(env, payload) {
     `receipt.category (best expense category, one of: ${EXPENSE_SCAN_CATEGORIES.join(', ')}),`,
     'and receipt.lineItems (array of { description, amount } for each charge line).',
     'If there is no bill/total in the file, set receipt.total to 0 and leave merchant empty.',
+    '',
+    '3) "transactions": if the file is a PAYMENT-APP or BANK STATEMENT listing many separate',
+    'transactions (PhonePe, Google Pay, Paytm, UPI history, a bank passbook or card statement),',
+    'return EVERY transaction as its own entry. Do NOT total them up and do NOT merge them.',
+    'For each: date (YYYY-MM-DD, take the year from the statement), description (the counterparty —',
+    'the name after "Paid to" or "Received from"), direction ("debit" when money left the account,',
+    '"credit" when money came in), amount (a positive number, no currency symbol),',
+    `and category (best guess, one of: ${EXPENSE_SCAN_CATEGORIES.join(', ')}) for debits only.`,
+    'Read every page and include transactions from all of them.',
+    'If the file is a single receipt or bill rather than a statement, return an empty transactions array.',
   ].join(' ');
 
   const requestBody = {
@@ -1973,6 +2900,20 @@ async function scanDocument(env, payload) {
                   },
                 },
               },
+            },
+          },
+          transactions: {
+            type: 'ARRAY',
+            items: {
+              type: 'OBJECT',
+              properties: {
+                date: { type: 'STRING' },
+                description: { type: 'STRING' },
+                direction: { type: 'STRING' },
+                amount: { type: 'NUMBER' },
+                category: { type: 'STRING' },
+              },
+              required: ['date', 'description', 'direction', 'amount'],
             },
           },
         },
@@ -2026,8 +2967,61 @@ async function scanDocument(env, payload) {
     }));
 
   const receipt = normalizeScanReceipt(parsed.receipt);
+  const transactions = normalizeScanTransactions(parsed.transactions);
 
-  return { items, receipt };
+  return { items, receipt, transactions };
+}
+
+/**
+ * Statement rows stay as individual entries — one per payment — so the user sees
+ * who they paid and when, rather than a single meaningless total. Credits are
+ * kept separate so they can land in miscellaneous income instead of salary.
+ */
+function normalizeScanTransactions(raw) {
+  if (!Array.isArray(raw)) {
+    return [];
+  }
+
+  return raw
+    .map((entry) => {
+      if (!entry || typeof entry !== 'object') return null;
+
+      const amountMinor = toMinor(entry.amount);
+      const description = String(entry.description || '').trim().slice(0, 160);
+      const occurredOn = normalizeStatementDate(entry.date);
+
+      if (!amountMinor || amountMinor <= 0 || !occurredOn) return null;
+
+      const isCredit = String(entry.direction || '').toLowerCase().startsWith('cr');
+
+      return {
+        occurredOn,
+        description: description || (isCredit ? 'Received' : 'Payment'),
+        direction: isCredit ? 'credit' : 'debit',
+        amountMinor,
+        category: isCredit ? MISC_INCOME_CATEGORY : normalizeScanExpenseCategory(entry.category),
+      };
+    })
+    .filter(Boolean)
+    .sort((a, b) => (a.occurredOn < b.occurredOn ? 1 : -1))
+    .slice(0, 500);
+}
+
+/**
+ * Strict statement-row date. Unlike normalizeScanDate this returns null instead
+ * of falling back to today — a row whose date we cannot read must be dropped,
+ * not silently filed under the wrong day.
+ */
+function normalizeStatementDate(value) {
+  const text = String(value || '').trim();
+  const match = text.match(/^(\d{4})-(\d{1,2})-(\d{1,2})/);
+
+  if (!match) return null;
+
+  const iso = `${match[1]}-${match[2].padStart(2, '0')}-${match[3].padStart(2, '0')}`;
+  const date = new Date(`${iso}T00:00:00Z`);
+
+  return Number.isNaN(date.getTime()) ? null : iso;
 }
 
 function normalizeScanReceipt(raw) {
@@ -2875,10 +3869,44 @@ function mapTransaction(row) {
   };
 }
 
-function mapBudget(row) {
-  const spentMinor = Number(row.spent_minor || 0);
+function mapBudget(row, asOf = today()) {
+  const spentMinor = Math.max(0, Number(row.spent_minor || 0));
   const limitMinor = Number(row.limit_minor || 0);
-  const usagePercent = limitMinor > 0 ? Math.round((spentMinor / limitMinor) * 1000) / 10 : 0;
+  const carryForwardMinor = Number(row.carry_forward_minor || 0);
+
+  // Carry-forward is spendable money, so it belongs in the denominator too.
+  // Previously usage was measured against the bare limit while "remaining"
+  // included the carry-forward, so the two numbers disagreed with each other.
+  const effectiveLimitMinor = limitMinor + carryForwardMinor;
+  const usagePercent = effectiveLimitMinor > 0
+    ? Math.round((spentMinor / effectiveLimitMinor) * 1000) / 10
+    : 0;
+
+  // Signed: negative means overspent. The UI needs the real number, not a clamp.
+  const remainingMinor = effectiveLimitMinor - spentMinor;
+
+  const totalDays = Math.max(1, daysInclusive(row.period_start, row.period_end));
+  const elapsedDays = Math.min(
+    Math.max(1, daysInclusive(row.period_start, clampDate(asOf, row.period_start, row.period_end))),
+    totalDays,
+  );
+  const daysRemaining = Math.max(0, totalDays - elapsedDays);
+
+  // Straight-line projection of where this budget lands if the current daily
+  // rate holds. Suppressed early in the period: on day 1 a single rent payment
+  // would extrapolate to an absurd month-end figure and trip a false alarm.
+  const projectionReliable = elapsedDays >= Math.min(5, totalDays);
+  const projectedSpendMinor = projectionReliable
+    ? Math.round((spentMinor / elapsedDays) * totalDays)
+    : null;
+  const alertThresholdPercent = Number(row.alert_threshold_percent || 80);
+
+  let status = 'on_track';
+  if (remainingMinor < 0) status = 'over';
+  else if (usagePercent >= alertThresholdPercent) status = 'warning';
+  else if (projectionReliable && effectiveLimitMinor > 0 && projectedSpendMinor > effectiveLimitMinor) {
+    status = 'projected_over';
+  }
 
   return {
     id: row.id,
@@ -2892,20 +3920,62 @@ function mapBudget(row) {
     currency: row.currency || 'USD',
     limitMinor,
     spentMinor,
-    carryForwardMinor: Number(row.carry_forward_minor || 0),
-    alertThresholdPercent: Number(row.alert_threshold_percent || 80),
+    carryForwardMinor,
+    effectiveLimitMinor,
+    alertThresholdPercent,
     isFlexible: Boolean(row.is_flexible),
     usagePercent,
-    remainingMinor: Math.max(0, limitMinor + Number(row.carry_forward_minor || 0) - spentMinor),
+    remainingMinor,
+    overspentMinor: Math.max(0, -remainingMinor),
+    totalDays,
+    elapsedDays,
+    daysRemaining,
+    projectionReliable,
+    projectedSpendMinor,
+    // What's left per remaining day if they want to finish inside the limit.
+    dailyAllowanceMinor: daysRemaining > 0 && remainingMinor > 0
+      ? Math.floor(remainingMinor / daysRemaining)
+      : 0,
+    status,
   };
 }
 
-function mapGoal(row) {
+/** Inclusive day count between two ISO dates (same day === 1). */
+function daysInclusive(start, end) {
+  const from = new Date(`${start}T00:00:00Z`).getTime();
+  const to = new Date(`${end}T00:00:00Z`).getTime();
+  if (Number.isNaN(from) || Number.isNaN(to)) return 1;
+  return Math.floor((to - from) / 86400000) + 1;
+}
+
+function clampDate(value, min, max) {
+  if (value < min) return min;
+  if (value > max) return max;
+  return value;
+}
+
+function mapGoal(row, asOf = today()) {
   const targetAmountMinor = Number(row.target_amount_minor || 0);
   const savedAmountMinor = Number(row.saved_amount_minor || 0);
   const progressPercent = targetAmountMinor > 0
     ? Math.min(100, Math.round((savedAmountMinor / targetAmountMinor) * 1000) / 10)
     : 0;
+  const remainingMinor = Math.max(0, targetAmountMinor - savedAmountMinor);
+
+  // Months left, rounded up — a target 10 days out still needs one payment.
+  const monthsRemaining = row.target_date
+    ? Math.max(0, monthsBetween(asOf, row.target_date))
+    : null;
+
+  let requiredMonthlyMinor = null;
+  if (remainingMinor > 0 && monthsRemaining !== null) {
+    requiredMonthlyMinor = monthsRemaining > 0
+      ? Math.ceil(remainingMinor / monthsRemaining)
+      : remainingMinor; // Due this month (or overdue) — the whole rest is needed now.
+  }
+
+  const isComplete = remainingMinor === 0 && targetAmountMinor > 0;
+  const isOverdue = Boolean(row.target_date) && !isComplete && row.target_date < asOf;
 
   return {
     id: row.id,
@@ -2913,13 +3983,32 @@ function mapGoal(row) {
     goalType: row.goal_type,
     targetAmountMinor,
     savedAmountMinor,
+    remainingMinor,
     currency: row.currency || 'USD',
     targetDate: row.target_date,
     priority: Number(row.priority || 3),
     status: row.status,
     recommendation: row.recommendation,
     progressPercent,
+    monthsRemaining,
+    requiredMonthlyMinor,
+    isComplete,
+    isOverdue,
   };
+}
+
+/** Whole months from `from` to `to`, rounded up, floored at 0. */
+function monthsBetween(from, to) {
+  const start = new Date(`${from}T00:00:00Z`);
+  const end = new Date(`${to}T00:00:00Z`);
+  if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime())) return 0;
+  if (end <= start) return 0;
+
+  let months = (end.getUTCFullYear() - start.getUTCFullYear()) * 12
+    + (end.getUTCMonth() - start.getUTCMonth());
+  if (end.getUTCDate() > start.getUTCDate()) months += 1;
+
+  return Math.max(months, 1);
 }
 
 function mapLiability(row) {
@@ -4281,6 +5370,7 @@ async function createLoginResponse(db, request, user, env) {
       email: user.email,
       displayName: user.displayName,
       role: user.role || 'user',
+      hasCompletedOnboarding: user.hasCompletedOnboarding || false,
       mode: 'public',
     },
   }, 200, {
@@ -4669,4 +5759,2097 @@ class HttpError extends Error {
     super(message);
     this.status = status;
   }
+}
+
+// ---------------------------------------------------------------------------
+// AI Dev Planner & Comprehension Tool (admin only)
+// Notes -> structured tasks -> prompts -> estimates -> status -> comprehension
+// summary -> standup digest. Reuses the existing Gemini integration.
+// ---------------------------------------------------------------------------
+
+const PLANNER_STATUSES = ['planned', 'in_progress', 'done', 'blocked'];
+const PLANNER_PRIORITIES = ['critical', 'high', 'medium', 'low'];
+const PLANNER_VALIDATION_STATUSES = ['pending', 'confirmed', 'edited', 'rejected', 'merged', 'split'];
+const PLANNER_MAX_NOTES = 40000;
+
+async function handlePlannerRoute({ db, request, url, route, user, env }) {
+  requireAdmin(user);
+
+  const [resource, second, third] = route;
+
+  // --- WorkOS dashboard (aggregate landing page) ---
+  if (resource === 'dashboard' && request.method === 'GET') {
+    return sendJson(await getPlannerDashboard(db, user.userId, url));
+  }
+
+  // --- Projects (D4) ---
+  if (resource === 'projects') {
+    if (!second && request.method === 'GET') {
+      return sendJson({ projects: await listPlannerProjects(db, user.userId) });
+    }
+
+    if (!second && request.method === 'POST') {
+      const project = await createPlannerProject(db, user.userId, await readJson(request));
+      await auditLog(db, user.userId, 'planner.project.create', 'planner_project', project.id, { name: project.name }, clientIp(request));
+      return sendJson({ project }, 201);
+    }
+
+    if (second && !third && request.method === 'GET') {
+      return sendJson(await getPlannerProjectDetail(db, user.userId, second));
+    }
+
+    if (second && request.method === 'PATCH') {
+      return sendJson({ project: await updatePlannerProject(db, user.userId, second, await readJson(request)) });
+    }
+
+    if (second && request.method === 'DELETE') {
+      await db.prepare('DELETE FROM planner_projects WHERE id = ? AND created_by = ?').bind(second, user.userId).run();
+      await auditLog(db, user.userId, 'planner.project.delete', 'planner_project', second, {}, clientIp(request));
+      return sendJson({ ok: true });
+    }
+  }
+
+  // --- Prompt library ---
+  if (resource === 'prompt-templates') {
+    if (!second && request.method === 'GET') {
+      return sendJson({ templates: await listPlannerPromptTemplates(db, user.userId, url) });
+    }
+
+    if (!second && request.method === 'POST') {
+      return sendJson({ template: await createPlannerPromptTemplate(db, user.userId, await readJson(request)) }, 201);
+    }
+
+    if (second && request.method === 'PUT') {
+      return sendJson({ template: await updatePlannerPromptTemplate(db, user.userId, second, await readJson(request)) });
+    }
+
+    if (second && request.method === 'DELETE') {
+      await db.prepare('DELETE FROM planner_prompt_templates WHERE id = ? AND created_by = ?').bind(second, user.userId).run();
+      return sendJson({ ok: true });
+    }
+  }
+
+  // --- Module A: structure free-text notes into task drafts (not persisted) ---
+  if (resource === 'structure' && request.method === 'POST') {
+    const payload = await readJson(request);
+    return sendJson(await structurePlannerNotes(env, payload));
+  }
+
+  // --- MOM import: meeting -> deliverables -> tasks ---
+  if (resource === 'meetings') {
+    // Extract a meeting summary + deliverables + task proposals (nothing persisted yet).
+    if (second === 'extract' && request.method === 'POST') {
+      return sendJson(await extractPlannerMeeting(env, await readJson(request)));
+    }
+
+    // Commit the reviewed tree (meeting + deliverables + accepted tasks).
+    if (second === 'commit' && request.method === 'POST') {
+      const result = await commitPlannerMeeting(db, user.userId, await readJson(request));
+      await auditLog(db, user.userId, 'planner.meeting.commit', 'planner_meeting', result.meeting.id, { tasks: result.tasks.length }, clientIp(request));
+      return sendJson(result, 201);
+    }
+
+    if (second && request.method === 'GET') {
+      return sendJson(await getPlannerMeeting(db, user.userId, second));
+    }
+  }
+
+  // --- Tasks ---
+  if (resource === 'tasks') {
+    // A4-A6: bulk-accept edited drafts
+    if (second === 'accept' && request.method === 'POST') {
+      const result = await acceptPlannerTasks(db, user.userId, await readJson(request));
+      await auditLog(db, user.userId, 'planner.tasks.accept', 'planner_task', null, { count: result.tasks.length }, clientIp(request));
+      return sendJson(result, 201);
+    }
+
+    if (!second && request.method === 'GET') {
+      return sendJson(await listPlannerTasks(db, user.userId, url));
+    }
+
+    if (!second && request.method === 'POST') {
+      return sendJson({ task: await createPlannerTask(db, user.userId, await readJson(request)) }, 201);
+    }
+
+    // Sub-resources on a single task
+    if (second && third === 'prompt' && request.method === 'POST') {
+      return sendJson({ task: await generatePlannerPrompt(db, env, user.userId, second) });
+    }
+
+    if (second && third === 'prompt-used' && request.method === 'PATCH') {
+      const payload = await readJson(request);
+      return sendJson({ task: await setPlannerPromptUsed(db, user.userId, second, payload) });
+    }
+
+    if (second && third === 'estimate' && request.method === 'POST') {
+      return sendJson({ task: await generatePlannerEstimate(db, env, user.userId, second) });
+    }
+
+    if (second && third === 'comprehension' && request.method === 'POST') {
+      const payload = await readJson(request);
+      return sendJson({ task: await generatePlannerComprehension(db, env, user.userId, second, payload) });
+    }
+
+    if (second && third === 'comprehension' && request.method === 'PATCH') {
+      const payload = await readJson(request);
+      return sendJson({ task: await updatePlannerComprehension(db, user.userId, second, payload) });
+    }
+
+    // Task-to-task dependencies (blocks / blocked-by)
+    if (second && third === 'dependencies' && request.method === 'PUT') {
+      const payload = await readJson(request);
+      return sendJson({ dependencies: await setPlannerTaskDependencies(db, user.userId, second, payload.dependsOn) });
+    }
+
+    // Validation actions: confirm / reject / merge / split
+    if (second && third === 'validate' && request.method === 'POST') {
+      const payload = await readJson(request);
+      const result = await validatePlannerTask(db, user, second, payload);
+      await auditLog(db, user.userId, `planner.task.${result.action}`, 'planner_task', second, {}, clientIp(request));
+      return sendJson(result);
+    }
+
+    // Read-only AI Workspace brief (assembles execution context; prompt-only, no code gen)
+    if (second && third === 'workspace' && request.method === 'GET') {
+      return sendJson(await getPlannerTaskWorkspace(db, user.userId, second));
+    }
+
+    if (second && !third && request.method === 'GET') {
+      return sendJson(await getPlannerTaskDetail(db, user.userId, second));
+    }
+
+    if (second && !third && request.method === 'PUT') {
+      return sendJson({ task: await updatePlannerTask(db, user.userId, second, await readJson(request)) });
+    }
+
+    if (second && !third && request.method === 'DELETE') {
+      await db.prepare('DELETE FROM planner_tasks WHERE id = ? AND created_by = ?').bind(second, user.userId).run();
+      return sendJson({ ok: true });
+    }
+  }
+
+  // --- Module F: standup digest ---
+  if (resource === 'standup' && request.method === 'GET') {
+    return sendJson(await getPlannerStandup(db, user.userId, url));
+  }
+
+  // --- Data export (NFR: no lock-in) ---
+  if (resource === 'export' && request.method === 'GET') {
+    return await exportPlannerTasks(db, user.userId, url);
+  }
+
+  // --- Knowledge base: cross-entity search ---
+  if (resource === 'knowledge' && second === 'search' && request.method === 'GET') {
+    return sendJson(await searchPlannerKnowledge(db, user.userId, url));
+  }
+
+  // --- Analytics: delivery efficiency ---
+  if (resource === 'analytics' && request.method === 'GET') {
+    return sendJson(await getPlannerAnalytics(db, user.userId, url));
+  }
+
+  return sendJson({ error: 'Not found' }, 404);
+}
+
+// --- Planner: projects ---
+
+const PLANNER_PROJECT_STATUSES = ['active', 'paused', 'archived'];
+
+// Per-project rollups reused by the list and dashboard.
+const PLANNER_PROJECT_STATS_SQL = `
+  (SELECT COUNT(*) FROM planner_tasks t WHERE t.project_id = p.id) AS task_count,
+  (SELECT COUNT(*) FROM planner_tasks t WHERE t.project_id = p.id AND t.status NOT IN ('done')) AS open_task_count,
+  (SELECT COUNT(*) FROM planner_tasks t WHERE t.project_id = p.id AND t.validation_status = 'pending') AS pending_validation,
+  (SELECT COUNT(*) FROM planner_meetings m WHERE m.project_id = p.id) AS meeting_count,
+  (SELECT COUNT(*) FROM planner_deliverables d WHERE d.project_id = p.id) AS deliverable_count,
+  (SELECT MAX(m.meeting_date) FROM planner_meetings m WHERE m.project_id = p.id) AS last_meeting_date`;
+
+async function listPlannerProjects(db, userId) {
+  const rows = await db
+    .prepare(
+      `SELECT p.*, ${PLANNER_PROJECT_STATS_SQL}
+       FROM planner_projects p
+       WHERE p.created_by = ?
+       ORDER BY p.status = 'archived', p.updated_at DESC`,
+    )
+    .bind(userId)
+    .all();
+
+  return (rows.results || []).map(mapPlannerProject);
+}
+
+function plannerProjectFields(payload, { partial }) {
+  const fields = {};
+
+  if (payload.name !== undefined || !partial) {
+    fields.name = requiredText(payload.name, 'A project name is required.').slice(0, 200);
+  }
+
+  const setText = (key, column, max = 8000) => {
+    if (payload[key] !== undefined) {
+      fields[column] = payload[key] === null ? null : String(payload[key]).trim().slice(0, max) || null;
+    }
+  };
+
+  setText('description', 'description', 2000);
+  setText('code', 'code', 40);
+  setText('repoUrl', 'repo_url', 500);
+  setText('architecture', 'architecture');
+  setText('codingStandards', 'coding_standards');
+  setText('folderStructure', 'folder_structure');
+
+  if (payload.status !== undefined) {
+    fields.status = normalizeEnum(payload.status, PLANNER_PROJECT_STATUSES, 'Invalid project status.');
+  }
+
+  if (payload.techStack !== undefined) {
+    const stack = Array.isArray(payload.techStack) ? payload.techStack : String(payload.techStack || '').split(',');
+    fields.tech_stack_json = JSON.stringify(stack.map((item) => String(item).trim()).filter(Boolean).slice(0, 40));
+  }
+
+  return fields;
+}
+
+async function createPlannerProject(db, userId, payload) {
+  const fields = plannerProjectFields(payload, { partial: false });
+  const id = `pproj-${crypto.randomUUID()}`;
+  const row = { id, created_by: userId, ...fields };
+  const columns = Object.keys(row);
+
+  await db
+    .prepare(`INSERT INTO planner_projects (${columns.join(', ')}) VALUES (${columns.map(() => '?').join(', ')})`)
+    .bind(...Object.values(row))
+    .run();
+
+  return getPlannerProject(db, userId, id);
+}
+
+async function updatePlannerProject(db, userId, id, payload) {
+  const fields = plannerProjectFields(payload, { partial: true });
+
+  if (!Object.keys(fields).length) {
+    throw new HttpError(400, 'Nothing to update.');
+  }
+
+  const assignments = Object.keys(fields).map((column) => `${column} = ?`);
+  const result = await db
+    .prepare(`UPDATE planner_projects SET ${assignments.join(', ')}, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND created_by = ?`)
+    .bind(...Object.values(fields), id, userId)
+    .run();
+
+  if (!result.meta || result.meta.changes === 0) {
+    throw new HttpError(404, 'Project not found.');
+  }
+
+  return getPlannerProject(db, userId, id);
+}
+
+async function getPlannerProject(db, userId, id) {
+  const row = await db
+    .prepare(
+      `SELECT p.*, ${PLANNER_PROJECT_STATS_SQL} FROM planner_projects p WHERE p.id = ? AND p.created_by = ?`,
+    )
+    .bind(id, userId)
+    .first();
+
+  if (!row) {
+    throw new HttpError(404, 'Project not found.');
+  }
+
+  return mapPlannerProject(row);
+}
+
+async function getPlannerProjectDetail(db, userId, id) {
+  const project = await getPlannerProject(db, userId, id);
+
+  const meetings = await db
+    .prepare(
+      `SELECT m.*,
+              (SELECT COUNT(*) FROM planner_deliverables d WHERE d.meeting_id = m.id) AS deliverable_count,
+              (SELECT COUNT(*) FROM planner_tasks t WHERE t.meeting_id = m.id) AS task_count
+       FROM planner_meetings m WHERE m.project_id = ? AND m.created_by = ?
+       ORDER BY COALESCE(m.meeting_date, m.created_at) DESC`,
+    )
+    .bind(id, userId)
+    .all();
+
+  const deliverables = await db
+    .prepare(
+      `SELECT d.*, (SELECT COUNT(*) FROM planner_tasks t WHERE t.deliverable_id = d.id) AS task_count
+       FROM planner_deliverables d WHERE d.project_id = ? ORDER BY d.order_index, d.created_at`,
+    )
+    .bind(id)
+    .all();
+
+  const tasks = await db
+    .prepare(
+      `SELECT t.*, p.name AS project_name, m.title AS meeting_title, d.title AS deliverable_title
+       FROM planner_tasks t
+       LEFT JOIN planner_projects p ON p.id = t.project_id
+       LEFT JOIN planner_meetings m ON m.id = t.meeting_id
+       LEFT JOIN planner_deliverables d ON d.id = t.deliverable_id
+       WHERE t.project_id = ? AND t.created_by = ?
+       ORDER BY CASE t.status WHEN 'in_progress' THEN 0 WHEN 'blocked' THEN 1 WHEN 'planned' THEN 2 ELSE 3 END,
+                t.order_index`,
+    )
+    .bind(id, userId)
+    .all();
+
+  const templates = await db
+    .prepare('SELECT * FROM planner_prompt_templates WHERE project_id = ? AND created_by = ? ORDER BY updated_at DESC')
+    .bind(id, userId)
+    .all();
+
+  // Objectives from this project's meetings, surfaced as lightweight "AI understanding".
+  const objectives = [];
+  for (const meeting of meetings.results || []) {
+    for (const objective of parseJson(meeting.objectives_json, [])) {
+      if (objectives.length < 12 && !objectives.includes(objective)) {
+        objectives.push(objective);
+      }
+    }
+  }
+
+  return {
+    project,
+    meetings: (meetings.results || []).map(mapPlannerMeeting),
+    deliverables: (deliverables.results || []).map(mapPlannerDeliverable),
+    tasks: (tasks.results || []).map(mapPlannerTask),
+    promptTemplates: (templates.results || []).map(mapPlannerPromptTemplate),
+    objectives,
+  };
+}
+
+// --- Planner: WorkOS dashboard ---
+
+async function getPlannerDashboard(db, userId, url) {
+  const day = url && url.searchParams.get('date') ? normalizeDate(url.searchParams.get('date')) : today();
+
+  const counts = await db
+    .prepare(
+      `SELECT
+         (SELECT COUNT(*) FROM planner_projects WHERE created_by = ?1 AND status != 'archived') AS projects,
+         (SELECT COUNT(*) FROM planner_meetings WHERE created_by = ?1) AS meetings,
+         (SELECT COUNT(*) FROM planner_deliverables WHERE created_by = ?1) AS deliverables,
+         (SELECT COUNT(*) FROM planner_tasks WHERE created_by = ?1) AS total_tasks,
+         (SELECT COUNT(*) FROM planner_tasks WHERE created_by = ?1 AND validation_status = 'pending') AS pending_validation,
+         (SELECT COUNT(*) FROM planner_tasks WHERE created_by = ?1 AND status = 'done') AS done_tasks,
+         (SELECT COUNT(*) FROM planner_tasks WHERE created_by = ?1 AND status = 'blocked') AS blocked_tasks,
+         (SELECT COUNT(*) FROM planner_tasks WHERE created_by = ?1 AND status IN ('planned', 'in_progress', 'blocked')) AS open_tasks`,
+    )
+    .bind(userId)
+    .first();
+
+  const todayTasks = await db
+    .prepare(
+      `SELECT t.*, p.name AS project_name, m.title AS meeting_title, d.title AS deliverable_title
+       FROM planner_tasks t
+       LEFT JOIN planner_projects p ON p.id = t.project_id
+       LEFT JOIN planner_meetings m ON m.id = t.meeting_id
+       LEFT JOIN planner_deliverables d ON d.id = t.deliverable_id
+       WHERE t.created_by = ? AND t.plan_date = ? AND t.status != 'done'
+       ORDER BY t.scheduled_minute IS NULL, t.scheduled_minute, t.order_index
+       LIMIT 12`,
+    )
+    .bind(userId, day)
+    .all();
+
+  const validationQueue = await db
+    .prepare(
+      `SELECT t.*, p.name AS project_name, m.title AS meeting_title, d.title AS deliverable_title
+       FROM planner_tasks t
+       LEFT JOIN planner_projects p ON p.id = t.project_id
+       LEFT JOIN planner_meetings m ON m.id = t.meeting_id
+       LEFT JOIN planner_deliverables d ON d.id = t.deliverable_id
+       WHERE t.created_by = ? AND t.validation_status = 'pending'
+       ORDER BY CASE t.priority WHEN 'critical' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END,
+                COALESCE(t.confidence, 0) ASC
+       LIMIT 8`,
+    )
+    .bind(userId)
+    .all();
+
+  const recentMeetings = await db
+    .prepare(
+      `SELECT m.*, pr.name AS project_name,
+              (SELECT COUNT(*) FROM planner_deliverables d WHERE d.meeting_id = m.id) AS deliverable_count,
+              (SELECT COUNT(*) FROM planner_tasks t WHERE t.meeting_id = m.id) AS task_count
+       FROM planner_meetings m
+       LEFT JOIN planner_projects pr ON pr.id = m.project_id
+       WHERE m.created_by = ?
+       ORDER BY m.created_at DESC LIMIT 6`,
+    )
+    .bind(userId)
+    .all();
+
+  const todayList = (todayTasks.results || []).map(mapPlannerTask);
+
+  return {
+    date: day,
+    stats: {
+      projects: Number(counts?.projects || 0),
+      meetings: Number(counts?.meetings || 0),
+      deliverables: Number(counts?.deliverables || 0),
+      totalTasks: Number(counts?.total_tasks || 0),
+      openTasks: Number(counts?.open_tasks || 0),
+      doneTasks: Number(counts?.done_tasks || 0),
+      blockedTasks: Number(counts?.blocked_tasks || 0),
+      pendingValidation: Number(counts?.pending_validation || 0),
+    },
+    todayTasks: todayList,
+    todayEstimatedMinutes: todayList.reduce((sum, task) => sum + (task.estimatedMinutes || 0), 0),
+    validationQueue: (validationQueue.results || []).map(mapPlannerTask),
+    recentMeetings: (recentMeetings.results || []).map((row) => ({
+      ...mapPlannerMeeting(row),
+      projectName: row.project_name || null,
+      deliverableCount: Number(row.deliverable_count || 0),
+      taskCount: Number(row.task_count || 0),
+    })),
+  };
+}
+
+// --- Planner: prompt library ---
+
+async function listPlannerPromptTemplates(db, userId, url) {
+  const projectId = url && url.searchParams.get('projectId');
+  const rows = projectId
+    ? await db
+      .prepare('SELECT * FROM planner_prompt_templates WHERE created_by = ? AND project_id = ? ORDER BY updated_at DESC')
+      .bind(userId, projectId)
+      .all()
+    : await db
+      .prepare('SELECT * FROM planner_prompt_templates WHERE created_by = ? ORDER BY updated_at DESC LIMIT 100')
+      .bind(userId)
+      .all();
+
+  return (rows.results || []).map(mapPlannerPromptTemplate);
+}
+
+async function createPlannerPromptTemplate(db, userId, payload) {
+  const id = `ptpl-${crypto.randomUUID()}`;
+  await db
+    .prepare(
+      `INSERT INTO planner_prompt_templates (id, project_id, name, category, body, created_by)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+    )
+    .bind(
+      id,
+      payload.projectId ? String(payload.projectId) : null,
+      requiredText(payload.name, 'A template name is required.').slice(0, 200),
+      String(payload.category || 'general').trim().slice(0, 60) || 'general',
+      requiredText(payload.body, 'A template body is required.').slice(0, 20000),
+      userId,
+    )
+    .run();
+
+  const row = await db.prepare('SELECT * FROM planner_prompt_templates WHERE id = ?').bind(id).first();
+  return mapPlannerPromptTemplate(row);
+}
+
+async function updatePlannerPromptTemplate(db, userId, id, payload) {
+  const fields = {};
+
+  if (payload.name !== undefined) {
+    fields.name = requiredText(payload.name, 'A template name is required.').slice(0, 200);
+  }
+
+  if (payload.category !== undefined) {
+    fields.category = String(payload.category || 'general').trim().slice(0, 60) || 'general';
+  }
+
+  if (payload.body !== undefined) {
+    fields.body = requiredText(payload.body, 'A template body is required.').slice(0, 20000);
+  }
+
+  if (payload.incrementUsage) {
+    fields.usage_count = clampInteger((payload.usageCount || 0) + 1, 0, 1000000);
+  }
+
+  if (!Object.keys(fields).length) {
+    throw new HttpError(400, 'Nothing to update.');
+  }
+
+  const assignments = Object.keys(fields).map((column) => `${column} = ?`);
+  const result = await db
+    .prepare(`UPDATE planner_prompt_templates SET ${assignments.join(', ')}, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND created_by = ?`)
+    .bind(...Object.values(fields), id, userId)
+    .run();
+
+  if (!result.meta || result.meta.changes === 0) {
+    throw new HttpError(404, 'Prompt template not found.');
+  }
+
+  const row = await db.prepare('SELECT * FROM planner_prompt_templates WHERE id = ?').bind(id).first();
+  return mapPlannerPromptTemplate(row);
+}
+
+function mapPlannerPromptTemplate(row) {
+  if (!row) {
+    return null;
+  }
+
+  return {
+    id: row.id,
+    projectId: row.project_id,
+    name: row.name,
+    category: row.category,
+    body: row.body,
+    usageCount: Number(row.usage_count || 0),
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
+// --- Planner: Module A (structure notes) ---
+
+async function structurePlannerNotes(env, payload) {
+  const notes = String(payload.notes || '').trim();
+
+  if (!notes) {
+    throw new HttpError(400, 'Paste some notes to structure into tasks.');
+  }
+
+  const prompt = [
+    'You are a planning assistant for a software developer who works with an AI coding assistant.',
+    'Read the raw standup notes / meeting minutes below and break them into discrete, actionable engineering tasks.',
+    `Today is ${today()}.`,
+    'For each task return:',
+    '- title: a short imperative name.',
+    '- description: one or two sentences on what needs to happen.',
+    '- acceptanceCriteria: 1-4 checkable statements of what "done" means (infer sensible ones if not stated).',
+    '- projectTag: the project or area this belongs to if identifiable from context, else an empty string.',
+    '- estimatedMinutes: a rough whole-number estimate of focused time for an AI-assisted developer.',
+    '- estimateLabel: a human range matching the estimate, e.g. "15-30 min" or "1-2 hrs".',
+    '- complexity: one of trivial, simple, moderate, complex.',
+    'Only extract real work implied by the notes. If nothing actionable is present, return an empty tasks array.',
+    '',
+    'NOTES:',
+    notes.slice(0, PLANNER_MAX_NOTES),
+  ].join('\n');
+
+  const schema = {
+    type: 'OBJECT',
+    properties: {
+      tasks: {
+        type: 'ARRAY',
+        items: {
+          type: 'OBJECT',
+          properties: {
+            title: { type: 'STRING' },
+            description: { type: 'STRING' },
+            acceptanceCriteria: { type: 'ARRAY', items: { type: 'STRING' } },
+            projectTag: { type: 'STRING' },
+            estimatedMinutes: { type: 'NUMBER' },
+            estimateLabel: { type: 'STRING' },
+            complexity: { type: 'STRING' },
+          },
+          required: ['title', 'description', 'acceptanceCriteria', 'estimatedMinutes', 'estimateLabel'],
+        },
+      },
+    },
+    required: ['tasks'],
+  };
+
+  const result = await geminiGenerateJson(env, prompt, schema);
+  const tasks = (Array.isArray(result.tasks) ? result.tasks : [])
+    .map((task) => {
+      const minutes = Math.round(Number(task?.estimatedMinutes));
+      return {
+        title: String(task?.title || '').trim(),
+        description: String(task?.description || '').trim(),
+        acceptanceCriteria: plannerStringList(task?.acceptanceCriteria).slice(0, 8),
+        projectTag: String(task?.projectTag || '').trim(),
+        estimatedMinutes: Number.isFinite(minutes) && minutes > 0 ? Math.min(minutes, 4800) : 60,
+        estimateLabel: String(task?.estimateLabel || '').trim() || plannerMinutesToLabel(minutes),
+        complexity: String(task?.complexity || '').trim().toLowerCase(),
+      };
+    })
+    .filter((task) => task.title)
+    .slice(0, 40);
+
+  return { tasks };
+}
+
+// --- Planner: MOM import (meeting -> deliverables -> tasks) ---
+
+async function extractPlannerMeeting(env, payload) {
+  const notes = String(payload.notes || '').trim();
+
+  if (!notes) {
+    throw new HttpError(400, 'Paste the meeting notes to extract from.');
+  }
+
+  const prompt = [
+    'You are an engineering meeting analyst. Read the raw minutes / standup notes below and structure them.',
+    `Today is ${today()}.`,
+    'Return:',
+    '- meeting: { title (short), summary (2-3 sentences), objectives (array of goals), participants (array of {name, role}), confidence (0-1 overall) }.',
+    '- deliverables: distinct units of value committed in the meeting. Each has { title, note (evidence/why, e.g. "mentioned 3x" or owner), confidence (0-1), tasks: [...] }.',
+    '  Each task under a deliverable has: title (imperative), description, acceptanceCriteria (1-4 checkable items), category (e.g. Backend, Frontend, Docs, Infra), priority (critical|high|medium|low), estimatedMinutes (whole number of focused time), estimateLabel (e.g. "1-2 hrs"), confidence (0-1), sourceExcerpt (the sentence from the notes this came from).',
+    'Only extract real work implied by the notes. If nothing actionable is present, return an empty deliverables array.',
+    '',
+    'NOTES:',
+    notes.slice(0, PLANNER_MAX_NOTES),
+  ].join('\n');
+
+  const taskSchema = {
+    type: 'OBJECT',
+    properties: {
+      title: { type: 'STRING' },
+      description: { type: 'STRING' },
+      acceptanceCriteria: { type: 'ARRAY', items: { type: 'STRING' } },
+      category: { type: 'STRING' },
+      priority: { type: 'STRING' },
+      estimatedMinutes: { type: 'NUMBER' },
+      estimateLabel: { type: 'STRING' },
+      confidence: { type: 'NUMBER' },
+      sourceExcerpt: { type: 'STRING' },
+    },
+    required: ['title', 'description', 'acceptanceCriteria', 'estimatedMinutes', 'priority'],
+  };
+
+  const schema = {
+    type: 'OBJECT',
+    properties: {
+      meeting: {
+        type: 'OBJECT',
+        properties: {
+          title: { type: 'STRING' },
+          summary: { type: 'STRING' },
+          objectives: { type: 'ARRAY', items: { type: 'STRING' } },
+          participants: {
+            type: 'ARRAY',
+            items: { type: 'OBJECT', properties: { name: { type: 'STRING' }, role: { type: 'STRING' } }, required: ['name'] },
+          },
+          confidence: { type: 'NUMBER' },
+        },
+        required: ['title', 'summary', 'objectives', 'confidence'],
+      },
+      deliverables: {
+        type: 'ARRAY',
+        items: {
+          type: 'OBJECT',
+          properties: {
+            title: { type: 'STRING' },
+            note: { type: 'STRING' },
+            confidence: { type: 'NUMBER' },
+            tasks: { type: 'ARRAY', items: taskSchema },
+          },
+          required: ['title', 'tasks'],
+        },
+      },
+    },
+    required: ['meeting', 'deliverables'],
+  };
+
+  const result = await geminiGenerateJson(env, prompt, schema);
+  const m = result.meeting || {};
+
+  const meeting = {
+    title: String(m.title || 'Imported meeting').trim().slice(0, 300),
+    summary: String(m.summary || '').trim().slice(0, 4000),
+    objectives: plannerStringList(m.objectives).slice(0, 12),
+    participants: (Array.isArray(m.participants) ? m.participants : [])
+      .map((p) => ({ name: String(p?.name || '').trim().slice(0, 120), role: String(p?.role || '').trim().slice(0, 120) }))
+      .filter((p) => p.name)
+      .slice(0, 20),
+    confidence: plannerConfidence(m.confidence),
+    rawText: notes.slice(0, PLANNER_MAX_NOTES),
+  };
+
+  const deliverables = (Array.isArray(result.deliverables) ? result.deliverables : [])
+    .map((d) => ({
+      title: String(d?.title || '').trim().slice(0, 300),
+      note: String(d?.note || '').trim().slice(0, 1000),
+      confidence: plannerConfidence(d?.confidence),
+      tasks: (Array.isArray(d?.tasks) ? d.tasks : [])
+        .map((task) => {
+          const minutes = Math.round(Number(task?.estimatedMinutes));
+          const criteria = plannerStringList(task?.acceptanceCriteria).slice(0, 8);
+          return {
+            title: String(task?.title || '').trim().slice(0, 300),
+            description: String(task?.description || '').trim().slice(0, 6000),
+            acceptanceCriteria: criteria.length ? criteria : ['Works as described in the meeting notes.'],
+            category: String(task?.category || '').trim().slice(0, 80),
+            priority: plannerPriority(task?.priority),
+            estimatedMinutes: Number.isFinite(minutes) && minutes > 0 ? Math.min(minutes, 4800) : 60,
+            estimateLabel: String(task?.estimateLabel || '').trim() || plannerMinutesToLabel(minutes) || '30-60 min',
+            confidence: plannerConfidence(task?.confidence),
+            sourceExcerpt: String(task?.sourceExcerpt || '').trim().slice(0, 1000),
+          };
+        })
+        .filter((task) => task.title)
+        .slice(0, 20),
+    }))
+    .filter((d) => d.title)
+    .slice(0, 20);
+
+  return { meeting, deliverables };
+}
+
+async function commitPlannerMeeting(db, userId, payload) {
+  const meetingPayload = payload.meeting || {};
+  const deliverables = Array.isArray(payload.deliverables) ? payload.deliverables : [];
+
+  if (!deliverables.length) {
+    throw new HttpError(400, 'No deliverables to import.');
+  }
+
+  const planDate = payload.planDate ? normalizeDate(payload.planDate) : today();
+  const projectId = payload.projectId ? String(payload.projectId) : null;
+
+  const meetingId = `pmeet-${crypto.randomUUID()}`;
+  await db
+    .prepare(
+      `INSERT INTO planner_meetings
+         (id, project_id, title, meeting_date, source_type, raw_text, summary, objectives_json, participants_json, confidence, status, created_by)
+       VALUES (?, ?, ?, ?, 'paste', ?, ?, ?, ?, ?, 'processed', ?)`,
+    )
+    .bind(
+      meetingId,
+      projectId,
+      requiredText(meetingPayload.title, 'A meeting title is required.').slice(0, 300),
+      payload.meetingDate ? normalizeDate(payload.meetingDate) : planDate,
+      String(meetingPayload.rawText || '').slice(0, PLANNER_MAX_NOTES),
+      meetingPayload.summary ? String(meetingPayload.summary).trim().slice(0, 4000) : null,
+      JSON.stringify(plannerStringList(meetingPayload.objectives).slice(0, 12)),
+      JSON.stringify(Array.isArray(meetingPayload.participants) ? meetingPayload.participants.slice(0, 20) : []),
+      plannerConfidence(meetingPayload.confidence),
+      userId,
+    )
+    .run();
+
+  const createdTaskIds = [];
+  let taskOrder = 0;
+  let deliverableOrder = 0;
+
+  for (const deliverable of deliverables.slice(0, 30)) {
+    const tasks = Array.isArray(deliverable?.tasks) ? deliverable.tasks : [];
+    if (!tasks.length) {
+      continue;
+    }
+
+    deliverableOrder += 10;
+    const deliverableId = `pdel-${crypto.randomUUID()}`;
+    await db
+      .prepare(
+        `INSERT INTO planner_deliverables (id, meeting_id, project_id, title, note, confidence, status, order_index, created_by)
+         VALUES (?, ?, ?, ?, ?, ?, 'approved', ?, ?)`,
+      )
+      .bind(
+        deliverableId,
+        meetingId,
+        projectId,
+        requiredText(deliverable.title, 'A deliverable title is required.').slice(0, 300),
+        deliverable.note ? String(deliverable.note).trim().slice(0, 1000) : null,
+        plannerConfidence(deliverable.confidence),
+        deliverableOrder,
+        userId,
+      )
+      .run();
+
+    for (const task of tasks.slice(0, 40)) {
+      const title = requiredText(task?.title, 'Every task needs a title.').slice(0, 300);
+      taskOrder += 10;
+      const id = `ptask-${crypto.randomUUID()}`;
+      const minutes = Math.round(Number(task?.estimatedMinutes));
+      const estimatedMinutes = Number.isFinite(minutes) && minutes > 0 ? Math.min(minutes, 4800) : null;
+
+      await db
+        .prepare(
+          `INSERT INTO planner_tasks
+             (id, project_id, meeting_id, deliverable_id, plan_date, order_index, source, title, description,
+              acceptance_criteria_json, category, priority, confidence, source_excerpt, estimate_label,
+              estimated_minutes, estimate_source, validation_status, created_by)
+           VALUES (?, ?, ?, ?, ?, ?, 'ai', ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ai', 'confirmed', ?)`,
+        )
+        .bind(
+          id,
+          projectId,
+          meetingId,
+          deliverableId,
+          planDate,
+          taskOrder,
+          title,
+          task?.description ? String(task.description).trim().slice(0, 6000) : null,
+          JSON.stringify(plannerStringList(task?.acceptanceCriteria).slice(0, 12)),
+          task?.category ? String(task.category).trim().slice(0, 80) : null,
+          plannerPriority(task?.priority),
+          plannerConfidence(task?.confidence),
+          task?.sourceExcerpt ? String(task.sourceExcerpt).trim().slice(0, 1000) : null,
+          task?.estimateLabel ? String(task.estimateLabel).trim().slice(0, 60) : plannerMinutesToLabel(estimatedMinutes),
+          estimatedMinutes,
+          userId,
+        )
+        .run();
+      createdTaskIds.push(id);
+    }
+  }
+
+  if (!createdTaskIds.length) {
+    throw new HttpError(400, 'No tasks were selected to import.');
+  }
+
+  const placeholders = createdTaskIds.map(() => '?').join(', ');
+  const rows = await db
+    .prepare(
+      `SELECT t.*, p.name AS project_name, m.title AS meeting_title, d.title AS deliverable_title
+       FROM planner_tasks t
+       LEFT JOIN planner_projects p ON p.id = t.project_id
+       LEFT JOIN planner_meetings m ON m.id = t.meeting_id
+       LEFT JOIN planner_deliverables d ON d.id = t.deliverable_id
+       WHERE t.id IN (${placeholders}) ORDER BY t.order_index`,
+    )
+    .bind(...createdTaskIds)
+    .all();
+
+  const meetingRow = await db.prepare('SELECT * FROM planner_meetings WHERE id = ?').bind(meetingId).first();
+
+  return {
+    meeting: mapPlannerMeeting(meetingRow),
+    tasks: (rows.results || []).map(mapPlannerTask),
+    planDate,
+  };
+}
+
+async function getPlannerMeeting(db, userId, id) {
+  const meetingRow = await db
+    .prepare('SELECT * FROM planner_meetings WHERE id = ? AND created_by = ?')
+    .bind(id, userId)
+    .first();
+
+  if (!meetingRow) {
+    throw new HttpError(404, 'Meeting not found.');
+  }
+
+  const deliverables = await db
+    .prepare(
+      `SELECT d.*, (SELECT COUNT(*) FROM planner_tasks t WHERE t.deliverable_id = d.id) AS task_count
+       FROM planner_deliverables d WHERE d.meeting_id = ? ORDER BY d.order_index`,
+    )
+    .bind(id)
+    .all();
+
+  const tasks = await db
+    .prepare(
+      `SELECT t.*, p.name AS project_name, d.title AS deliverable_title
+       FROM planner_tasks t
+       LEFT JOIN planner_projects p ON p.id = t.project_id
+       LEFT JOIN planner_deliverables d ON d.id = t.deliverable_id
+       WHERE t.meeting_id = ? ORDER BY t.order_index`,
+    )
+    .bind(id)
+    .all();
+
+  return {
+    meeting: mapPlannerMeeting(meetingRow),
+    deliverables: (deliverables.results || []).map(mapPlannerDeliverable),
+    tasks: (tasks.results || []).map(mapPlannerTask),
+  };
+}
+
+// --- Planner: tasks ---
+
+async function acceptPlannerTasks(db, userId, payload) {
+  const tasks = Array.isArray(payload.tasks) ? payload.tasks : [];
+
+  if (!tasks.length) {
+    throw new HttpError(400, 'No tasks to accept.');
+  }
+
+  const planDate = payload.planDate ? normalizeDate(payload.planDate) : today();
+  const projectId = payload.projectId ? String(payload.projectId) : null;
+  const createdIds = [];
+
+  const base = await db
+    .prepare('SELECT COALESCE(MAX(order_index), 0) AS max_order FROM planner_tasks WHERE created_by = ? AND plan_date = ?')
+    .bind(userId, planDate)
+    .first();
+  let order = Number(base?.max_order || 0);
+
+  for (const task of tasks.slice(0, 100)) {
+    const title = requiredText(task?.title, 'Every task needs a title.').slice(0, 300);
+    order += 10;
+    const id = `ptask-${crypto.randomUUID()}`;
+    const minutes = Math.round(Number(task?.estimatedMinutes));
+    const estimatedMinutes = Number.isFinite(minutes) && minutes > 0 ? Math.min(minutes, 4800) : null;
+
+    await db
+      .prepare(
+        `INSERT INTO planner_tasks
+           (id, project_id, project_tag, plan_date, order_index, source, title, description,
+            acceptance_criteria_json, estimate_label, estimated_minutes, estimate_source, created_by)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ai', ?)`,
+      )
+      .bind(
+        id,
+        projectId,
+        task?.projectTag ? String(task.projectTag).trim().slice(0, 120) : null,
+        planDate,
+        order,
+        task?.source === 'manual' ? 'manual' : 'ai',
+        title,
+        task?.description ? String(task.description).trim().slice(0, 6000) : null,
+        JSON.stringify(plannerStringList(task?.acceptanceCriteria).slice(0, 12)),
+        task?.estimateLabel ? String(task.estimateLabel).trim().slice(0, 60) : plannerMinutesToLabel(estimatedMinutes),
+        estimatedMinutes,
+        userId,
+      )
+      .run();
+
+    createdIds.push(id);
+  }
+
+  const placeholders = createdIds.map(() => '?').join(', ');
+  const rows = await db
+    .prepare(
+      `SELECT t.*, p.name AS project_name FROM planner_tasks t
+       LEFT JOIN planner_projects p ON p.id = t.project_id
+       WHERE t.id IN (${placeholders}) ORDER BY t.order_index`,
+    )
+    .bind(...createdIds)
+    .all();
+
+  return { tasks: (rows.results || []).map(mapPlannerTask), planDate };
+}
+
+async function listPlannerTasks(db, userId, url) {
+  const params = url ? url.searchParams : new URLSearchParams();
+  const conditions = ['t.created_by = ?'];
+  const binds = [userId];
+
+  if (params.get('date')) {
+    conditions.push('t.plan_date = ?');
+    binds.push(normalizeDate(params.get('date')));
+  }
+
+  if (params.get('week')) {
+    const start = normalizeDate(params.get('week'));
+    conditions.push('t.plan_date >= ? AND t.plan_date <= ?');
+    binds.push(start, addDays(start, 6));
+  }
+
+  if (params.get('projectId')) {
+    conditions.push('t.project_id = ?');
+    binds.push(params.get('projectId'));
+  }
+
+  if (params.get('status')) {
+    conditions.push('t.status = ?');
+    binds.push(normalizeEnum(params.get('status'), PLANNER_STATUSES, 'Invalid task status.'));
+  }
+
+  const where = conditions.join(' AND ');
+  const rows = await db
+    .prepare(
+      `SELECT t.*, p.name AS project_name FROM planner_tasks t
+       LEFT JOIN planner_projects p ON p.id = t.project_id
+       WHERE ${where}
+       ORDER BY t.plan_date, t.order_index, t.created_at
+       LIMIT 500`,
+    )
+    .bind(...binds)
+    .all();
+
+  const tasks = (rows.results || []).map(mapPlannerTask);
+  const totalEstimatedMinutes = tasks.reduce((sum, task) => sum + (task.estimatedMinutes || 0), 0);
+
+  return { tasks, total: tasks.length, totalEstimatedMinutes };
+}
+
+async function getPlannerTask(db, userId, id) {
+  const row = await db
+    .prepare(
+      `SELECT t.*, p.name AS project_name, m.title AS meeting_title, m.meeting_date AS meeting_date,
+              d.title AS deliverable_title
+       FROM planner_tasks t
+       LEFT JOIN planner_projects p ON p.id = t.project_id
+       LEFT JOIN planner_meetings m ON m.id = t.meeting_id
+       LEFT JOIN planner_deliverables d ON d.id = t.deliverable_id
+       WHERE t.id = ? AND t.created_by = ?`,
+    )
+    .bind(id, userId)
+    .first();
+
+  if (!row) {
+    throw new HttpError(404, 'Task not found.');
+  }
+
+  return mapPlannerTask(row);
+}
+
+// Full task detail with provenance (source meeting/deliverable) and dependency graph.
+async function getPlannerTaskDetail(db, userId, id) {
+  const task = await getPlannerTask(db, userId, id);
+
+  const meeting = task.meetingId
+    ? mapPlannerMeeting(await db.prepare('SELECT * FROM planner_meetings WHERE id = ?').bind(task.meetingId).first())
+    : null;
+  const deliverable = task.deliverableId
+    ? mapPlannerDeliverable(await db.prepare('SELECT * FROM planner_deliverables WHERE id = ?').bind(task.deliverableId).first())
+    : null;
+
+  const dependencies = await db
+    .prepare(
+      `SELECT dep.*, t.title, t.status, t.priority
+       FROM planner_task_dependencies dep
+       JOIN planner_tasks t ON t.id = dep.depends_on_task_id
+       WHERE dep.task_id = ?`,
+    )
+    .bind(id)
+    .all();
+
+  const dependents = await db
+    .prepare(
+      `SELECT dep.*, t.title, t.status, t.priority
+       FROM planner_task_dependencies dep
+       JOIN planner_tasks t ON t.id = dep.task_id
+       WHERE dep.depends_on_task_id = ?`,
+    )
+    .bind(id)
+    .all();
+
+  return {
+    task,
+    meeting,
+    deliverable,
+    dependencies: (dependencies.results || []).map(mapPlannerDependency),
+    dependents: (dependents.results || []).map(mapPlannerDependency),
+  };
+}
+
+// --- Planner: task dependencies (with cycle guard) ---
+
+async function setPlannerTaskDependencies(db, userId, taskId, dependsOn) {
+  const task = await db.prepare('SELECT id FROM planner_tasks WHERE id = ? AND created_by = ?').bind(taskId, userId).first();
+
+  if (!task) {
+    throw new HttpError(404, 'Task not found.');
+  }
+
+  const requested = Array.from(new Set(
+    (Array.isArray(dependsOn) ? dependsOn : []).map((value) => String(value)).filter((value) => value && value !== taskId),
+  )).slice(0, 30);
+
+  // Only allow dependencies on the user's own tasks.
+  if (requested.length) {
+    const owned = await db
+      .prepare(`SELECT id FROM planner_tasks WHERE created_by = ? AND id IN (${requested.map(() => '?').join(', ')})`)
+      .bind(userId, ...requested)
+      .all();
+    const ownedIds = new Set((owned.results || []).map((row) => row.id));
+    for (const id of requested) {
+      if (!ownedIds.has(id)) {
+        throw new HttpError(400, 'One of those tasks does not exist.');
+      }
+    }
+  }
+
+  // Build the existing edge map (excluding this task's edges) and reject cycles.
+  const edges = await db
+    .prepare('SELECT task_id, depends_on_task_id FROM planner_task_dependencies WHERE task_id != ?')
+    .bind(taskId)
+    .all();
+  const graph = new Map();
+  (edges.results || []).forEach((row) => {
+    const list = graph.get(row.task_id) || [];
+    list.push(row.depends_on_task_id);
+    graph.set(row.task_id, list);
+  });
+
+  for (const candidate of requested) {
+    const queue = [candidate];
+    const seen = new Set();
+    while (queue.length) {
+      const current = queue.shift();
+      if (current === taskId) {
+        throw new HttpError(400, 'That dependency would create a circular chain.');
+      }
+      if (seen.has(current)) {
+        continue;
+      }
+      seen.add(current);
+      (graph.get(current) || []).forEach((next) => queue.push(next));
+    }
+  }
+
+  await db.prepare('DELETE FROM planner_task_dependencies WHERE task_id = ?').bind(taskId).run();
+  for (const dependsOnId of requested) {
+    await db
+      .prepare('INSERT OR IGNORE INTO planner_task_dependencies (id, task_id, depends_on_task_id) VALUES (?, ?, ?)')
+      .bind(`pdep-${crypto.randomUUID()}`, taskId, dependsOnId)
+      .run();
+  }
+
+  const rows = await db
+    .prepare(
+      `SELECT dep.*, t.title, t.status, t.priority
+       FROM planner_task_dependencies dep
+       JOIN planner_tasks t ON t.id = dep.depends_on_task_id
+       WHERE dep.task_id = ?`,
+    )
+    .bind(taskId)
+    .all();
+
+  return (rows.results || []).map(mapPlannerDependency);
+}
+
+// --- Planner: validation engine (confirm / reject / merge / split) ---
+
+async function validatePlannerTask(db, user, taskId, payload) {
+  const action = normalizeEnum(payload.action, ['confirm', 'reject', 'merge', 'split'], 'Invalid validation action.');
+  const before = await db.prepare('SELECT * FROM planner_tasks WHERE id = ? AND created_by = ?').bind(taskId, user.userId).first();
+
+  if (!before) {
+    throw new HttpError(404, 'Task not found.');
+  }
+
+  if (action === 'confirm' || action === 'reject') {
+    await db
+      .prepare('UPDATE planner_tasks SET validation_status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND created_by = ?')
+      .bind(action === 'confirm' ? 'confirmed' : 'rejected', taskId, user.userId)
+      .run();
+    const task = await getPlannerTask(db, user.userId, taskId);
+    return { action, task, tasks: [task] };
+  }
+
+  if (action === 'merge') {
+    const targetId = requiredText(payload.mergeWithTaskId, 'Choose a task to merge into.');
+    if (targetId === taskId) {
+      throw new HttpError(400, 'A task cannot be merged into itself.');
+    }
+    const target = await db.prepare('SELECT * FROM planner_tasks WHERE id = ? AND created_by = ?').bind(targetId, user.userId).first();
+    if (!target) {
+      throw new HttpError(404, 'The task to merge into no longer exists.');
+    }
+
+    const mergedCriteria = Array.from(new Set([
+      ...parseJson(target.acceptance_criteria_json, []),
+      ...parseJson(before.acceptance_criteria_json, []),
+    ])).slice(0, 20);
+    const description = [target.description, before.description].filter(Boolean).join('\n\n').slice(0, 6000);
+    const minutes = (Number(target.estimated_minutes) || 0) + (Number(before.estimated_minutes) || 0);
+
+    await db
+      .prepare(
+        `UPDATE planner_tasks
+         SET description = ?, acceptance_criteria_json = ?, estimated_minutes = ?,
+             validation_status = 'confirmed', updated_at = CURRENT_TIMESTAMP
+         WHERE id = ? AND created_by = ?`,
+      )
+      .bind(description, JSON.stringify(mergedCriteria), minutes || null, targetId, user.userId)
+      .run();
+
+    await db
+      .prepare("UPDATE planner_tasks SET validation_status = 'merged', updated_at = CURRENT_TIMESTAMP WHERE id = ? AND created_by = ?")
+      .bind(taskId, user.userId)
+      .run();
+
+    const task = await getPlannerTask(db, user.userId, targetId);
+    return { action, task, tasks: [task] };
+  }
+
+  // split
+  const splits = Array.isArray(payload.splits) ? payload.splits : [];
+  if (splits.length < 2) {
+    throw new HttpError(400, 'Splitting needs at least two tasks.');
+  }
+
+  const createdIds = [];
+  const base = await db
+    .prepare('SELECT COALESCE(MAX(order_index), 0) AS max_order FROM planner_tasks WHERE created_by = ? AND plan_date = ?')
+    .bind(user.userId, before.plan_date)
+    .first();
+  let order = Number(base?.max_order || 0);
+
+  for (const split of splits.slice(0, 10)) {
+    const title = requiredText(split?.title, 'Every split task needs a title.').slice(0, 300);
+    order += 10;
+    const id = `ptask-${crypto.randomUUID()}`;
+    const minutes = Math.round(Number(split?.estimatedMinutes));
+    const estimatedMinutes = Number.isFinite(minutes) && minutes > 0
+      ? Math.min(minutes, 4800)
+      : Math.max(15, Math.round((Number(before.estimated_minutes) || 60) / splits.length));
+
+    await db
+      .prepare(
+        `INSERT INTO planner_tasks
+           (id, project_id, meeting_id, deliverable_id, plan_date, order_index, source, title, description,
+            acceptance_criteria_json, category, priority, estimate_label, estimated_minutes, estimate_source,
+            validation_status, created_by)
+         VALUES (?, ?, ?, ?, ?, ?, 'ai', ?, ?, ?, ?, ?, ?, ?, 'ai', 'confirmed', ?)`,
+      )
+      .bind(
+        id,
+        before.project_id,
+        before.meeting_id,
+        before.deliverable_id,
+        before.plan_date,
+        order,
+        title,
+        split?.description ? String(split.description).trim().slice(0, 6000) : before.description,
+        before.acceptance_criteria_json,
+        before.category,
+        before.priority,
+        plannerMinutesToLabel(estimatedMinutes),
+        estimatedMinutes,
+        user.userId,
+      )
+      .run();
+    createdIds.push(id);
+  }
+
+  await db
+    .prepare("UPDATE planner_tasks SET validation_status = 'split', updated_at = CURRENT_TIMESTAMP WHERE id = ? AND created_by = ?")
+    .bind(taskId, user.userId)
+    .run();
+
+  const placeholders = createdIds.map(() => '?').join(', ');
+  const rows = await db
+    .prepare(
+      `SELECT t.*, p.name AS project_name FROM planner_tasks t
+       LEFT JOIN planner_projects p ON p.id = t.project_id
+       WHERE t.id IN (${placeholders}) ORDER BY t.order_index`,
+    )
+    .bind(...createdIds)
+    .all();
+
+  return { action, task: null, tasks: (rows.results || []).map(mapPlannerTask) };
+}
+
+function plannerTaskFields(payload) {
+  const fields = {};
+
+  if (payload.title !== undefined) {
+    fields.title = requiredText(payload.title, 'A task title is required.').slice(0, 300);
+  }
+
+  if (payload.description !== undefined) {
+    fields.description = payload.description === null ? null : String(payload.description).trim().slice(0, 6000) || null;
+  }
+
+  if (payload.acceptanceCriteria !== undefined) {
+    fields.acceptance_criteria_json = JSON.stringify(plannerStringList(payload.acceptanceCriteria).slice(0, 20));
+  }
+
+  if (payload.status !== undefined) {
+    fields.status = normalizeEnum(payload.status, PLANNER_STATUSES, 'Invalid task status.');
+    fields.completed_at = fields.status === 'done' ? new Date().toISOString() : null;
+  }
+
+  if (payload.projectId !== undefined) {
+    fields.project_id = payload.projectId ? String(payload.projectId) : null;
+  }
+
+  if (payload.projectTag !== undefined) {
+    fields.project_tag = payload.projectTag ? String(payload.projectTag).trim().slice(0, 120) : null;
+  }
+
+  if (payload.planDate !== undefined) {
+    fields.plan_date = payload.planDate ? normalizeDate(payload.planDate) : null;
+  }
+
+  if (payload.orderIndex !== undefined) {
+    fields.order_index = clampInteger(payload.orderIndex, 0, 1000000);
+  }
+
+  if (payload.estimatedMinutes !== undefined) {
+    const minutes = payload.estimatedMinutes === null ? null : clampInteger(payload.estimatedMinutes, 0, 4800);
+    fields.estimated_minutes = minutes;
+    fields.estimate_source = 'manual';
+    if (payload.estimateLabel === undefined) {
+      fields.estimate_label = plannerMinutesToLabel(minutes);
+    }
+  }
+
+  if (payload.estimateLabel !== undefined) {
+    fields.estimate_label = payload.estimateLabel ? String(payload.estimateLabel).trim().slice(0, 60) : null;
+  }
+
+  if (payload.actualMinutes !== undefined) {
+    fields.actual_minutes = payload.actualMinutes === null ? null : clampInteger(payload.actualMinutes, 0, 100000);
+  }
+
+  if (payload.priority !== undefined) {
+    fields.priority = normalizeEnum(payload.priority, PLANNER_PRIORITIES, 'Invalid priority.');
+  }
+
+  if (payload.category !== undefined) {
+    fields.category = payload.category ? String(payload.category).trim().slice(0, 80) : null;
+  }
+
+  if (payload.confidence !== undefined) {
+    fields.confidence = plannerConfidence(payload.confidence);
+  }
+
+  if (payload.sourceExcerpt !== undefined) {
+    fields.source_excerpt = payload.sourceExcerpt ? String(payload.sourceExcerpt).trim().slice(0, 4000) : null;
+  }
+
+  if (payload.meetingId !== undefined) {
+    fields.meeting_id = payload.meetingId ? String(payload.meetingId) : null;
+  }
+
+  if (payload.deliverableId !== undefined) {
+    fields.deliverable_id = payload.deliverableId ? String(payload.deliverableId) : null;
+  }
+
+  // Start-of-day minute for weekly time-blocking (0-1439); null clears the block time.
+  if (payload.scheduledMinute !== undefined) {
+    fields.scheduled_minute = payload.scheduledMinute === null ? null : clampInteger(payload.scheduledMinute, 0, 1439);
+  }
+
+  return fields;
+}
+
+async function createPlannerTask(db, userId, payload) {
+  const fields = plannerTaskFields(payload);
+
+  if (!fields.title) {
+    throw new HttpError(400, 'A task title is required.');
+  }
+
+  const id = `ptask-${crypto.randomUUID()}`;
+  const row = {
+    id,
+    source: 'manual',
+    plan_date: payload.planDate ? normalizeDate(payload.planDate) : today(),
+    created_by: userId,
+    ...fields,
+  };
+  const columns = Object.keys(row);
+
+  await db
+    .prepare(`INSERT INTO planner_tasks (${columns.join(', ')}) VALUES (${columns.map(() => '?').join(', ')})`)
+    .bind(...Object.values(row))
+    .run();
+
+  return getPlannerTask(db, userId, id);
+}
+
+async function updatePlannerTask(db, userId, id, payload) {
+  const fields = plannerTaskFields(payload);
+
+  if (!Object.keys(fields).length) {
+    throw new HttpError(400, 'Nothing to update.');
+  }
+
+  const assignments = Object.keys(fields).map((column) => `${column} = ?`);
+  const result = await db
+    .prepare(`UPDATE planner_tasks SET ${assignments.join(', ')}, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND created_by = ?`)
+    .bind(...Object.values(fields), id, userId)
+    .run();
+
+  if (!result.meta || result.meta.changes === 0) {
+    throw new HttpError(404, 'Task not found.');
+  }
+
+  return getPlannerTask(db, userId, id);
+}
+
+// --- Planner: Module B (prompt generation) ---
+
+async function generatePlannerPrompt(db, env, userId, id) {
+  const task = await getPlannerTask(db, userId, id);
+
+  const prompt = [
+    'You write clear, ready-to-paste prompts that a developer will hand to an AI coding assistant.',
+    'Given the task below, produce ONE well-structured prompt the developer can paste directly.',
+    'The prompt must include: the objective, relevant constraints and edge cases (infer sensible ones), and the expected output format.',
+    'Do not solve the task or write code yourself. Only write the prompt text.',
+    '',
+    `Task: ${task.title}`,
+    task.description ? `Description: ${task.description}` : '',
+    task.projectTag ? `Project/area: ${task.projectTag}` : '',
+    task.acceptanceCriteria.length ? `Acceptance criteria:\n${task.acceptanceCriteria.map((item) => `- ${item}`).join('\n')}` : '',
+  ].filter(Boolean).join('\n');
+
+  const result = await geminiGenerateJson(env, prompt, {
+    type: 'OBJECT',
+    properties: { prompt: { type: 'STRING' } },
+    required: ['prompt'],
+  });
+
+  const generated = String(result.prompt || '').trim();
+
+  if (!generated) {
+    throw new HttpError(502, 'The AI did not return a prompt. Please try again.');
+  }
+
+  await db
+    .prepare('UPDATE planner_tasks SET generated_prompt = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND created_by = ?')
+    .bind(generated.slice(0, 12000), id, userId)
+    .run();
+
+  return getPlannerTask(db, userId, id);
+}
+
+async function setPlannerPromptUsed(db, userId, id, payload) {
+  const promptUsed = String(payload.promptUsed || '').trim();
+
+  if (!promptUsed) {
+    throw new HttpError(400, 'No prompt text to store.');
+  }
+
+  const result = await db
+    .prepare('UPDATE planner_tasks SET prompt_used = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND created_by = ?')
+    .bind(promptUsed.slice(0, 12000), id, userId)
+    .run();
+
+  if (!result.meta || result.meta.changes === 0) {
+    throw new HttpError(404, 'Task not found.');
+  }
+
+  return getPlannerTask(db, userId, id);
+}
+
+// --- Planner: Module C (time estimation) ---
+
+async function generatePlannerEstimate(db, env, userId, id) {
+  const task = await getPlannerTask(db, userId, id);
+
+  const prompt = [
+    'You estimate how long an AI-assisted software task will take. Be realistic and directional.',
+    `Task: ${task.title}`,
+    task.description ? `Description: ${task.description}` : '',
+    task.acceptanceCriteria.length ? `Acceptance criteria:\n${task.acceptanceCriteria.map((item) => `- ${item}`).join('\n')}` : '',
+    'Return estimatedMinutes (whole number of focused minutes) and estimateLabel (a human range like "15-30 min" or "1-2 hrs").',
+  ].filter(Boolean).join('\n');
+
+  const result = await geminiGenerateJson(env, prompt, {
+    type: 'OBJECT',
+    properties: {
+      estimatedMinutes: { type: 'NUMBER' },
+      estimateLabel: { type: 'STRING' },
+    },
+    required: ['estimatedMinutes', 'estimateLabel'],
+  });
+
+  const minutes = Math.round(Number(result.estimatedMinutes));
+  const estimatedMinutes = Number.isFinite(minutes) && minutes > 0 ? Math.min(minutes, 4800) : 60;
+
+  await db
+    .prepare(
+      `UPDATE planner_tasks SET estimated_minutes = ?, estimate_label = ?, estimate_source = 'ai', updated_at = CURRENT_TIMESTAMP
+       WHERE id = ? AND created_by = ?`,
+    )
+    .bind(estimatedMinutes, String(result.estimateLabel || '').trim().slice(0, 60) || plannerMinutesToLabel(estimatedMinutes), id, userId)
+    .run();
+
+  return getPlannerTask(db, userId, id);
+}
+
+// --- Planner: Module E (comprehension summary) ---
+
+async function generatePlannerComprehension(db, env, userId, id, payload) {
+  const task = await getPlannerTask(db, userId, id);
+  const codeOrDiff = String(payload.codeOrDiff || '').trim();
+
+  if (!codeOrDiff) {
+    throw new HttpError(400, 'Paste the code/diff or a description of what changed.');
+  }
+
+  const prompt = [
+    'You help a developer understand what their AI assistant just implemented, so they are not dependent on re-querying an LLM.',
+    'Given the task context and the code/diff (or change description) below, write a plain-English summary covering:',
+    '1. what changed, 2. why it was done (based on the task), and 3. any notable approach or trade-off.',
+    'Keep it concise and skimmable (a few short paragraphs or bullets). Do not restate the raw code.',
+    'Also write ONE light comprehension question that helps the developer reflect (e.g. "Why was X chosen over Y?"). It is optional and never scored.',
+    '',
+    `Task: ${task.title}`,
+    task.description ? `Task description: ${task.description}` : '',
+    task.acceptanceCriteria.length ? `Acceptance criteria:\n${task.acceptanceCriteria.map((item) => `- ${item}`).join('\n')}` : '',
+    '',
+    'CODE / DIFF / CHANGE DESCRIPTION:',
+    codeOrDiff.slice(0, PLANNER_MAX_NOTES),
+  ].filter(Boolean).join('\n');
+
+  const result = await geminiGenerateJson(env, prompt, {
+    type: 'OBJECT',
+    properties: {
+      summary: { type: 'STRING' },
+      question: { type: 'STRING' },
+    },
+    required: ['summary'],
+  });
+
+  const summary = String(result.summary || '').trim();
+
+  if (!summary) {
+    throw new HttpError(502, 'The AI did not return a summary. Please try again.');
+  }
+
+  await db
+    .prepare(
+      `UPDATE planner_tasks
+       SET comprehension_input = ?, comprehension_summary = ?, comprehension_question = ?, updated_at = CURRENT_TIMESTAMP
+       WHERE id = ? AND created_by = ?`,
+    )
+    .bind(
+      codeOrDiff.slice(0, PLANNER_MAX_NOTES),
+      summary.slice(0, 8000),
+      result.question ? String(result.question).trim().slice(0, 1000) : null,
+      id,
+      userId,
+    )
+    .run();
+
+  return getPlannerTask(db, userId, id);
+}
+
+async function updatePlannerComprehension(db, userId, id, payload) {
+  const fields = {};
+
+  if (payload.userAnnotation !== undefined) {
+    fields.user_annotation = payload.userAnnotation ? String(payload.userAnnotation).trim().slice(0, 8000) : null;
+  }
+
+  if (payload.userAnswer !== undefined) {
+    fields.user_answer = payload.userAnswer ? String(payload.userAnswer).trim().slice(0, 4000) : null;
+  }
+
+  if (payload.summaryFeedback !== undefined) {
+    fields.summary_feedback = payload.summaryFeedback === null
+      ? null
+      : normalizeEnum(payload.summaryFeedback, ['up', 'down'], 'Invalid feedback.');
+  }
+
+  if (!Object.keys(fields).length) {
+    throw new HttpError(400, 'Nothing to update.');
+  }
+
+  const assignments = Object.keys(fields).map((column) => `${column} = ?`);
+  const result = await db
+    .prepare(`UPDATE planner_tasks SET ${assignments.join(', ')}, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND created_by = ?`)
+    .bind(...Object.values(fields), id, userId)
+    .run();
+
+  if (!result.meta || result.meta.changes === 0) {
+    throw new HttpError(404, 'Task not found.');
+  }
+
+  return getPlannerTask(db, userId, id);
+}
+
+// --- Planner: Module F (standup digest) ---
+
+async function getPlannerStandup(db, userId, url) {
+  const params = url ? url.searchParams : new URLSearchParams();
+  const date = normalizeDate(params.get('date') || today());
+  const previous = addDays(date, -1);
+
+  // "Completed" spans yesterday + today so a standup covers work since the last one.
+  const completed = await db
+    .prepare(
+      `SELECT t.*, p.name AS project_name FROM planner_tasks t
+       LEFT JOIN planner_projects p ON p.id = t.project_id
+       WHERE t.created_by = ? AND t.status = 'done'
+         AND (t.plan_date = ? OR t.plan_date = ? OR date(t.completed_at) IN (?, ?))
+       ORDER BY t.completed_at DESC`,
+    )
+    .bind(userId, date, previous, date, previous)
+    .all();
+
+  const doing = await db
+    .prepare(
+      `SELECT t.*, p.name AS project_name FROM planner_tasks t
+       LEFT JOIN planner_projects p ON p.id = t.project_id
+       WHERE t.created_by = ? AND t.plan_date = ? AND t.status IN ('planned', 'in_progress')
+       ORDER BY t.order_index`,
+    )
+    .bind(userId, date)
+    .all();
+
+  const blockers = await db
+    .prepare(
+      `SELECT t.*, p.name AS project_name FROM planner_tasks t
+       LEFT JOIN planner_projects p ON p.id = t.project_id
+       WHERE t.created_by = ? AND t.status = 'blocked'
+       ORDER BY t.updated_at DESC`,
+    )
+    .bind(userId)
+    .all();
+
+  const dedupe = (rows) => {
+    const seen = new Set();
+    return (rows.results || []).filter((row) => (seen.has(row.id) ? false : seen.add(row.id))).map(mapPlannerTask);
+  };
+
+  return {
+    date,
+    completed: dedupe(completed),
+    doing: dedupe(doing),
+    blockers: dedupe(blockers),
+  };
+}
+
+// --- Planner: export (NFR) ---
+
+async function exportPlannerTasks(db, userId, url) {
+  const params = url ? url.searchParams : new URLSearchParams();
+  const format = (params.get('format') || 'json').toLowerCase();
+
+  const rows = await db
+    .prepare(
+      `SELECT t.*, p.name AS project_name FROM planner_tasks t
+       LEFT JOIN planner_projects p ON p.id = t.project_id
+       WHERE t.created_by = ?
+       ORDER BY t.plan_date, t.order_index`,
+    )
+    .bind(userId)
+    .all();
+
+  const tasks = (rows.results || []).map(mapPlannerTask);
+
+  if (format === 'csv') {
+    const columns = ['id', 'title', 'projectName', 'projectTag', 'planDate', 'status', 'estimateLabel', 'estimatedMinutes', 'actualMinutes', 'createdAt', 'completedAt'];
+    const lines = [columns.join(',')];
+    for (const task of tasks) {
+      lines.push(columns.map((column) => csvCell(task[column])).join(','));
+    }
+    return new Response(lines.join('\n'), {
+      status: 200,
+      headers: {
+        ...jsonHeaders,
+        'content-type': 'text/csv; charset=utf-8',
+        'content-disposition': 'attachment; filename="dev-planner-tasks.csv"',
+      },
+    });
+  }
+
+  return new Response(JSON.stringify({ tasks }, null, 2), {
+    status: 200,
+    headers: {
+      ...jsonHeaders,
+      'content-disposition': 'attachment; filename="dev-planner-tasks.json"',
+    },
+  });
+}
+
+// --- Planner: helpers and mappers ---
+
+function plannerStringList(value) {
+  const list = Array.isArray(value) ? value : String(value || '').split('\n');
+  return list.map((item) => String(item).trim()).filter(Boolean);
+}
+
+function plannerMinutesToLabel(minutes) {
+  const value = Number(minutes);
+
+  if (!Number.isFinite(value) || value <= 0) {
+    return null;
+  }
+
+  if (value <= 15) return '5-15 min';
+  if (value <= 30) return '15-30 min';
+  if (value <= 60) return '30-60 min';
+  if (value <= 120) return '1-2 hrs';
+  if (value <= 240) return '2-4 hrs';
+  return '4+ hrs';
+}
+
+function mapPlannerProject(row) {
+  if (!row) {
+    return null;
+  }
+
+  return {
+    id: row.id,
+    name: row.name,
+    description: row.description,
+    code: row.code || null,
+    status: row.status || 'active',
+    repoUrl: row.repo_url || null,
+    techStack: parseJson(row.tech_stack_json, []),
+    architecture: row.architecture || null,
+    codingStandards: row.coding_standards || null,
+    folderStructure: row.folder_structure || null,
+    taskCount: Number(row.task_count || 0),
+    openTaskCount: Number(row.open_task_count || 0),
+    pendingValidation: Number(row.pending_validation || 0),
+    meetingCount: Number(row.meeting_count || 0),
+    deliverableCount: Number(row.deliverable_count || 0),
+    lastMeetingDate: row.last_meeting_date || null,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
+// --- Planner: AI Workspace (execution brief, prompt-only) ---
+
+async function getPlannerTaskWorkspace(db, userId, id) {
+  const detail = await getPlannerTaskDetail(db, userId, id);
+  const { task, meeting, deliverable, dependencies } = detail;
+  const project = task.projectId ? await getPlannerProject(db, userId, task.projectId).catch(() => null) : null;
+
+  const section = (heading, lines) => {
+    const body = lines.filter(Boolean).join('\n');
+    return body ? `## ${heading}\n${body}` : '';
+  };
+
+  const projectContext = section('Project', [
+    project ? `Name: ${project.name}${project.code ? ` (${project.code})` : ''}` : 'No linked project.',
+    project && project.description ? `Summary: ${project.description}` : '',
+    project && project.techStack.length ? `Tech stack: ${project.techStack.join(', ')}` : '',
+    project && project.repoUrl ? `Repository: ${project.repoUrl}` : '',
+    project && project.architecture ? `\n### Architecture\n${project.architecture}` : '',
+    project && project.codingStandards ? `\n### Coding standards\n${project.codingStandards}` : '',
+    project && project.folderStructure ? `\n### Folder structure\n${project.folderStructure}` : '',
+  ]);
+
+  const meetingContext = section('Source meeting', [
+    meeting ? `Title: ${meeting.title}` : 'No source meeting.',
+    meeting && meeting.meetingDate ? `Date: ${meeting.meetingDate}` : '',
+    meeting && meeting.summary ? `\n${meeting.summary}` : '',
+    meeting && meeting.objectives && meeting.objectives.length
+      ? `\n### Objectives\n${meeting.objectives.map((item) => `- ${item}`).join('\n')}`
+      : '',
+  ]);
+
+  const deliverableContext = section('Deliverable', [
+    deliverable ? `Title: ${deliverable.title}` : 'No parent deliverable.',
+    deliverable && deliverable.note ? `Note: ${deliverable.note}` : '',
+  ]);
+
+  const requirements = section('Task', [
+    `Title: ${task.title}`,
+    task.description ? `\n${task.description}` : '',
+    `\nPriority: ${task.priority} · Estimate: ${task.estimateLabel || `${task.estimatedMinutes || 0}m`}`,
+    dependencies.length ? `\n### Depends on\n${dependencies.map((dep) => `- ${dep.title} (${dep.status})`).join('\n')}` : '',
+    task.acceptanceCriteria.length
+      ? `\n### Acceptance criteria\n${task.acceptanceCriteria.map((item) => `- ${item}`).join('\n')}`
+      : '',
+  ]);
+
+  const expectedOutput = section('Expected output', [
+    task.acceptanceCriteria.length
+      ? 'Every acceptance criterion above is satisfied.'
+      : 'Working, reviewed changes that fulfil the task.',
+    'Changes are tested and reviewed before merge.',
+    '',
+    'Produce the implementation in your own coding environment — this workspace assembles context and does not generate code.',
+  ]);
+
+  const executionPrompt = task.generatedPrompt || [
+    `You are working on the task "${task.title}".`,
+    'Use the context below; do not ask for information already provided here.',
+    '',
+    projectContext,
+    meetingContext,
+    deliverableContext,
+    requirements,
+    expectedOutput,
+  ].filter(Boolean).join('\n\n');
+
+  const references = [
+    project && project.repoUrl ? { label: 'Repository', value: project.repoUrl } : null,
+    meeting ? { label: 'Source meeting', value: meeting.title } : null,
+    deliverable ? { label: 'Deliverable', value: deliverable.title } : null,
+  ].filter(Boolean);
+
+  return {
+    task,
+    project,
+    meeting,
+    deliverable,
+    dependencies,
+    brief: { projectContext, meetingContext, deliverableContext, requirements, expectedOutput, references },
+    executionPrompt,
+    promptUsed: task.promptUsed || null,
+    tokenEstimate: Math.ceil(executionPrompt.length / 4),
+  };
+}
+
+// --- Planner: knowledge base (cross-entity search) ---
+
+async function searchPlannerKnowledge(db, userId, url) {
+  const params = url ? url.searchParams : new URLSearchParams();
+  const term = String(params.get('q') || '').trim();
+  const type = String(params.get('type') || '').trim().toLowerCase();
+  const like = `%${term.replace(/[%_]/g, (ch) => `\\${ch}`)}%`;
+  const useTerm = term.length > 0;
+
+  const results = [];
+
+  const wantType = (name) => !type || type === name;
+
+  if (wantType('meetings')) {
+    const rows = useTerm
+      ? await db.prepare(
+        `SELECT id, title, summary, meeting_date, project_id FROM planner_meetings
+         WHERE created_by = ? AND (title LIKE ? ESCAPE '\\' OR summary LIKE ? ESCAPE '\\' OR raw_text LIKE ? ESCAPE '\\')
+         ORDER BY created_at DESC LIMIT 25`,
+      ).bind(userId, like, like, like).all()
+      : await db.prepare('SELECT id, title, summary, meeting_date, project_id FROM planner_meetings WHERE created_by = ? ORDER BY created_at DESC LIMIT 25').bind(userId).all();
+    for (const row of rows.results || []) {
+      results.push({ type: 'meeting', id: row.id, title: row.title, snippet: plannerSnippet(row.summary, term), projectId: row.project_id, meetingDate: row.meeting_date });
+    }
+  }
+
+  if (wantType('deliverables')) {
+    const rows = useTerm
+      ? await db.prepare(
+        `SELECT id, title, note, project_id FROM planner_deliverables
+         WHERE created_by = ? AND (title LIKE ? ESCAPE '\\' OR note LIKE ? ESCAPE '\\')
+         ORDER BY created_at DESC LIMIT 25`,
+      ).bind(userId, like, like).all()
+      : await db.prepare('SELECT id, title, note, project_id FROM planner_deliverables WHERE created_by = ? ORDER BY created_at DESC LIMIT 25').bind(userId).all();
+    for (const row of rows.results || []) {
+      results.push({ type: 'deliverable', id: row.id, title: row.title, snippet: plannerSnippet(row.note, term), projectId: row.project_id });
+    }
+  }
+
+  if (wantType('tasks')) {
+    const rows = useTerm
+      ? await db.prepare(
+        `SELECT id, title, description, comprehension_summary, project_id, status FROM planner_tasks
+         WHERE created_by = ? AND (title LIKE ? ESCAPE '\\' OR description LIKE ? ESCAPE '\\' OR acceptance_criteria_json LIKE ? ESCAPE '\\' OR comprehension_summary LIKE ? ESCAPE '\\')
+         ORDER BY created_at DESC LIMIT 25`,
+      ).bind(userId, like, like, like, like).all()
+      : await db.prepare('SELECT id, title, description, comprehension_summary, project_id, status FROM planner_tasks WHERE created_by = ? ORDER BY created_at DESC LIMIT 25').bind(userId).all();
+    for (const row of rows.results || []) {
+      results.push({ type: 'task', id: row.id, title: row.title, snippet: plannerSnippet(row.comprehension_summary || row.description, term), projectId: row.project_id, status: row.status });
+    }
+  }
+
+  if (wantType('prompts')) {
+    const rows = useTerm
+      ? await db.prepare(
+        `SELECT id, name, body, category, project_id FROM planner_prompt_templates
+         WHERE created_by = ? AND (name LIKE ? ESCAPE '\\' OR body LIKE ? ESCAPE '\\' OR category LIKE ? ESCAPE '\\')
+         ORDER BY updated_at DESC LIMIT 25`,
+      ).bind(userId, like, like, like).all()
+      : await db.prepare('SELECT id, name, body, category, project_id FROM planner_prompt_templates WHERE created_by = ? ORDER BY updated_at DESC LIMIT 25').bind(userId).all();
+    for (const row of rows.results || []) {
+      results.push({ type: 'prompt', id: row.id, title: row.name, snippet: plannerSnippet(row.body, term), projectId: row.project_id, category: row.category });
+    }
+  }
+
+  const facets = { meetings: 0, deliverables: 0, tasks: 0, prompts: 0 };
+  const typeToFacet = { meeting: 'meetings', deliverable: 'deliverables', task: 'tasks', prompt: 'prompts' };
+  results.forEach((row) => { facets[typeToFacet[row.type]] += 1; });
+
+  return { query: term, type: type || null, total: results.length, facets, results };
+}
+
+function plannerSnippet(text, term) {
+  const value = String(text || '').replace(/\s+/g, ' ').trim();
+  if (!value) {
+    return '';
+  }
+  if (term) {
+    const idx = value.toLowerCase().indexOf(term.toLowerCase());
+    if (idx > 60) {
+      return `…${value.slice(idx - 40, idx + 120)}…`;
+    }
+  }
+  return value.length > 200 ? `${value.slice(0, 200)}…` : value;
+}
+
+// --- Planner: analytics (delivery efficiency) ---
+
+async function getPlannerAnalytics(db, userId, url) {
+  const params = url ? url.searchParams : new URLSearchParams();
+  const range = String(params.get('range') || '7d').toLowerCase();
+  const days = range === '30d' ? 30 : range === 'all' ? null : 7;
+  const since = days === null ? '0000-01-01' : addDays(today(), -(days - 1));
+
+  const totals = await db
+    .prepare(
+      `SELECT
+         (SELECT COUNT(*) FROM planner_meetings WHERE created_by = ?1 AND date(created_at) >= ?2) AS meetings,
+         (SELECT COUNT(*) FROM planner_deliverables WHERE created_by = ?1 AND date(created_at) >= ?2) AS deliverables,
+         (SELECT COUNT(*) FROM planner_tasks WHERE created_by = ?1 AND date(created_at) >= ?2) AS tasks,
+         (SELECT COUNT(*) FROM planner_tasks WHERE created_by = ?1 AND source = 'ai' AND date(created_at) >= ?2) AS ai_tasks,
+         (SELECT COUNT(*) FROM planner_tasks WHERE created_by = ?1 AND validation_status = 'confirmed' AND date(created_at) >= ?2) AS confirmed_tasks,
+         (SELECT COUNT(*) FROM planner_tasks WHERE created_by = ?1 AND validation_status = 'pending' AND date(created_at) >= ?2) AS pending_tasks,
+         (SELECT COUNT(*) FROM planner_tasks WHERE created_by = ?1 AND status = 'done' AND date(created_at) >= ?2) AS done_tasks,
+         (SELECT COALESCE(SUM(estimated_minutes), 0) FROM planner_tasks WHERE created_by = ?1 AND date(created_at) >= ?2) AS est_minutes,
+         (SELECT COUNT(*) FROM planner_prompt_templates WHERE created_by = ?1) AS templates,
+         (SELECT COALESCE(SUM(usage_count), 0) FROM planner_prompt_templates WHERE created_by = ?1) AS template_uses`,
+    )
+    .bind(userId, since)
+    .first();
+
+  const statusRows = await db
+    .prepare(
+      `SELECT status, COUNT(*) AS cnt FROM planner_tasks
+       WHERE created_by = ? AND date(created_at) >= ? GROUP BY status`,
+    )
+    .bind(userId, since)
+    .all();
+  const tasksByStatus = { planned: 0, in_progress: 0, done: 0, blocked: 0 };
+  (statusRows.results || []).forEach((row) => { tasksByStatus[row.status] = Number(row.cnt); });
+
+  const priorityRows = await db
+    .prepare(
+      `SELECT priority, COUNT(*) AS cnt FROM planner_tasks
+       WHERE created_by = ? AND date(created_at) >= ? GROUP BY priority`,
+    )
+    .bind(userId, since)
+    .all();
+  const tasksByPriority = { critical: 0, high: 0, medium: 0, low: 0 };
+  (priorityRows.results || []).forEach((row) => {
+    if (tasksByPriority[row.priority] !== undefined) tasksByPriority[row.priority] = Number(row.cnt);
+  });
+
+  const seriesRows = await db
+    .prepare(
+      `SELECT date(created_at) AS day, COUNT(*) AS cnt FROM planner_tasks
+       WHERE created_by = ? AND date(created_at) >= ? GROUP BY date(created_at) ORDER BY day`,
+    )
+    .bind(userId, since)
+    .all();
+  const seriesMap = new Map((seriesRows.results || []).map((row) => [row.day, Number(row.cnt)]));
+
+  // Build a continuous daily series for the last N days (bounded for the 'all' case).
+  const bucketDays = days === null ? 30 : days;
+  const timeseries = [];
+  for (let i = bucketDays - 1; i >= 0; i -= 1) {
+    const day = addDays(today(), -i);
+    timeseries.push({ date: day, tasks: seriesMap.get(day) || 0 });
+  }
+
+  const tasks = Number(totals?.tasks || 0);
+  const aiTasks = Number(totals?.ai_tasks || 0);
+  const confirmed = Number(totals?.confirmed_tasks || 0);
+  const estMinutes = Number(totals?.est_minutes || 0);
+
+  return {
+    range: days === null ? 'all' : `${days}d`,
+    kpis: {
+      meetingsImported: Number(totals?.meetings || 0),
+      deliverablesExtracted: Number(totals?.deliverables || 0),
+      tasksGenerated: aiTasks,
+      tasksTotal: tasks,
+      promptTemplates: Number(totals?.templates || 0),
+      promptReuse: Number(totals?.template_uses || 0),
+    },
+    quality: {
+      aiTaskShare: tasks ? Math.round((aiTasks / tasks) * 100) : 0,
+      validationConfirmedPct: tasks ? Math.round((confirmed / tasks) * 100) : 0,
+      pendingValidation: Number(totals?.pending_tasks || 0),
+      donePct: tasks ? Math.round((Number(totals?.done_tasks || 0) / tasks) * 100) : 0,
+    },
+    timeImpact: {
+      estimatedMinutes: estMinutes,
+      estimatedHours: Math.round((estMinutes / 60) * 10) / 10,
+      avgTaskMinutes: tasks ? Math.round(estMinutes / tasks) : 0,
+    },
+    tasksByStatus,
+    tasksByPriority,
+    timeseries,
+  };
+}
+
+function mapPlannerTask(row) {
+  if (!row) {
+    return null;
+  }
+
+  return {
+    id: row.id,
+    projectId: row.project_id,
+    projectName: row.project_name || null,
+    projectTag: row.project_tag,
+    planDate: row.plan_date,
+    orderIndex: Number(row.order_index || 0),
+    source: row.source,
+    title: row.title,
+    description: row.description,
+    acceptanceCriteria: parseJson(row.acceptance_criteria_json, []),
+    status: row.status,
+    estimateLabel: row.estimate_label,
+    estimatedMinutes: row.estimated_minutes === null || row.estimated_minutes === undefined ? null : Number(row.estimated_minutes),
+    estimateSource: row.estimate_source,
+    actualMinutes: row.actual_minutes === null || row.actual_minutes === undefined ? null : Number(row.actual_minutes),
+    generatedPrompt: row.generated_prompt,
+    promptUsed: row.prompt_used,
+    comprehensionInput: row.comprehension_input,
+    comprehensionSummary: row.comprehension_summary,
+    userAnnotation: row.user_annotation,
+    comprehensionQuestion: row.comprehension_question,
+    userAnswer: row.user_answer,
+    summaryFeedback: row.summary_feedback,
+    meetingId: row.meeting_id || null,
+    meetingTitle: row.meeting_title || null,
+    deliverableId: row.deliverable_id || null,
+    deliverableTitle: row.deliverable_title || null,
+    priority: row.priority || 'medium',
+    category: row.category || null,
+    confidence: row.confidence === null || row.confidence === undefined ? null : Number(row.confidence),
+    sourceExcerpt: row.source_excerpt || null,
+    validationStatus: row.validation_status || 'pending',
+    scheduledMinute: row.scheduled_minute === null || row.scheduled_minute === undefined ? null : Number(row.scheduled_minute),
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+    completedAt: row.completed_at,
+  };
+}
+
+function plannerConfidence(value) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) {
+    return null;
+  }
+  return Math.min(1, Math.max(0, numeric > 1 ? numeric / 100 : numeric));
+}
+
+function plannerPriority(value) {
+  const normalized = String(value || '').trim().toLowerCase();
+  return PLANNER_PRIORITIES.includes(normalized) ? normalized : 'medium';
+}
+
+function mapPlannerMeeting(row) {
+  if (!row) {
+    return null;
+  }
+
+  return {
+    id: row.id,
+    projectId: row.project_id,
+    title: row.title,
+    meetingDate: row.meeting_date,
+    sourceType: row.source_type,
+    rawText: row.raw_text,
+    summary: row.summary,
+    objectives: parseJson(row.objectives_json, []),
+    participants: parseJson(row.participants_json, []),
+    confidence: row.confidence === null || row.confidence === undefined ? null : Number(row.confidence),
+    status: row.status,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
+function mapPlannerDeliverable(row) {
+  if (!row) {
+    return null;
+  }
+
+  return {
+    id: row.id,
+    meetingId: row.meeting_id,
+    projectId: row.project_id,
+    title: row.title,
+    note: row.note,
+    confidence: row.confidence === null || row.confidence === undefined ? null : Number(row.confidence),
+    status: row.status,
+    orderIndex: Number(row.order_index || 0),
+    taskCount: Number(row.task_count || 0),
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
+function mapPlannerDependency(row) {
+  return {
+    id: row.id,
+    taskId: row.task_id,
+    dependsOnTaskId: row.depends_on_task_id,
+    dependencyType: row.dependency_type,
+    title: row.title,
+    status: row.status,
+    priority: row.priority || 'medium',
+  };
 }
