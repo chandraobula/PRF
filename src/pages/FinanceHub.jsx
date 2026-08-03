@@ -10,7 +10,6 @@ import {
   CircleDollarSign,
   Download,
   FileBarChart2,
-  Flag,
   LayoutDashboard,
   Lightbulb,
   ListFilter,
@@ -22,17 +21,30 @@ import {
   Target,
   WalletCards,
   X,
+  Edit2,
+  Trash2,
+  TrendingUp,
+  Repeat,
+  Upload,
+  Flame,
 } from 'lucide-react';
 import { cn } from '../lib/utils';
 import BillScanner from '../components/Finance/BillScanner';
 import InterestTracker from '../components/Finance/InterestTracker';
+import ImportTransactions from '../components/Finance/ImportTransactions';
+import BudgetsPanel from '../components/Finance/BudgetsPanel';
+import GoalsPanel from '../components/Finance/GoalsPanel';
+import { CashflowTrend, CategoryMovers, MerchantBars, PaceMeter } from '../components/Finance/Charts';
 import {
   addFinanceTransaction,
+  deleteFinanceTransaction,
   financeExportUrl,
   formatMoney,
   formatMoneyCompact,
+  getFinanceAnalytics,
   getFinanceDashboard,
   getFinanceTransactions,
+  updateFinanceTransaction,
 } from '../services/financeApi';
 
 const emptyForm = {
@@ -65,8 +77,12 @@ export default function FinanceHub() {
   const [selectedCurrency, setSelectedCurrency] = useState('USD');
   const [asOf, setAsOf] = useState(() => new Date().toISOString().slice(0, 10));
   const [quickAddOpen, setQuickAddOpen] = useState(false);
+  const [editingTxId, setEditingTxId] = useState(null);
   const [ledgerRows, setLedgerRows] = useState([]);
   const [ledgerLoading, setLedgerLoading] = useState(false);
+  const [importOpen, setImportOpen] = useState(false);
+  const [analytics, setAnalytics] = useState(null);
+  const [analyticsLoading, setAnalyticsLoading] = useState(false);
 
   const loadFinance = useCallback(async () => {
     setIsLoading(true);
@@ -125,6 +141,24 @@ export default function FinanceHub() {
     return () => { active = false; };
   }, [activeTab, finance?.summary?.currency, finance?.summary?.monthStart, finance?.summary?.monthEnd, finance?.summary?.balanceMinor]);
 
+  // Analytics is its own request so the Overview tab isn't held up by six months
+  // of aggregation the user may never open.
+  useEffect(() => {
+    if (activeTab !== 'insights') {
+      return undefined;
+    }
+
+    let active = true;
+    setAnalyticsLoading(true);
+
+    getFinanceAnalytics(selectedCurrency, asOf)
+      .then((data) => { if (active) setAnalytics(data); })
+      .catch((error) => { if (active) setApiError(error.message || 'Could not load analytics.'); })
+      .finally(() => { if (active) setAnalyticsLoading(false); });
+
+    return () => { active = false; };
+  }, [activeTab, selectedCurrency, asOf]);
+
   const currency = finance?.summary?.currency || selectedCurrency;
   const enabledCurrencies = finance?.profile?.enabledCurrencies || ['USD', 'INR'];
   const categories = finance?.categories || [];
@@ -136,6 +170,7 @@ export default function FinanceHub() {
   // Ordered by how often each section is used day-to-day (most used first).
   const tabs = [
     { id: 'overview', label: 'Overview', icon: LayoutDashboard },
+    { id: 'insights', label: 'Insights', icon: TrendingUp },
     { id: 'transactions', label: 'Transactions', icon: ReceiptText },
     { id: 'scanner', label: 'Bills', icon: Camera },
     { id: 'budgets', label: 'Budgets', icon: PieChart },
@@ -145,7 +180,7 @@ export default function FinanceHub() {
   ];
 
   // The month navigator + income/expense summary only make sense for month-scoped views.
-  const showPeriodStrip = activeTab === 'overview' || activeTab === 'transactions';
+  const showPeriodStrip = activeTab === 'overview' || activeTab === 'transactions' || activeTab === 'insights';
 
   const handleSubmit = async (event) => {
     event.preventDefault();
@@ -160,13 +195,22 @@ export default function FinanceHub() {
     setApiError('');
 
     try {
-      await addFinanceTransaction({
-        ...form,
-        amount: Number(form.amount),
-        currency,
-        category: category?.name,
-        source: 'manual',
-      });
+      if (editingTxId) {
+        await updateFinanceTransaction(editingTxId, {
+          ...form,
+          amount: Number(form.amount),
+          currency,
+          category: category?.name,
+        });
+      } else {
+        await addFinanceTransaction({
+          ...form,
+          amount: Number(form.amount),
+          currency,
+          category: category?.name,
+          source: 'manual',
+        });
+      }
       setForm({
         ...emptyForm,
         occurredOn: new Date().toISOString().slice(0, 10),
@@ -174,11 +218,36 @@ export default function FinanceHub() {
         type: form.type,
       });
       setQuickAddOpen(false);
+      setEditingTxId(null);
       await loadFinance();
     } catch (error) {
       setApiError(error.message || 'Could not save transaction.');
     } finally {
       setIsSaving(false);
+    }
+  };
+
+  const editTransaction = (row) => {
+    setEditingTxId(row.id);
+    const category = categories.find((c) => c.name === row.categoryName);
+    setForm({
+      type: row.type,
+      occurredOn: row.occurredOn,
+      merchant: row.merchant || row.payee || '',
+      amount: String((row.amountMinor || 0) / 100),
+      categoryId: category?.id || '',
+      paymentMethod: row.paymentMethod || 'card',
+      notes: row.notes || '',
+    });
+    setQuickAddOpen(true);
+  };
+
+  const removeTransaction = async (id) => {
+    try {
+      await deleteFinanceTransaction(id);
+      await loadFinance();
+    } catch (err) {
+      setApiError(err.message || 'Could not delete transaction.');
     }
   };
 
@@ -192,6 +261,8 @@ export default function FinanceHub() {
     }
 
     switch (activeTab) {
+      case 'insights':
+        return <InsightsPanel analytics={analytics} loading={analyticsLoading} currency={currency} />;
       case 'transactions':
         return (
           <LedgerPanel
@@ -200,12 +271,29 @@ export default function FinanceHub() {
             loading={ledgerLoading}
             query={query}
             setQuery={setQuery}
+            onEdit={editTransaction}
+            onDelete={removeTransaction}
+            onImport={() => setImportOpen(true)}
           />
         );
       case 'budgets':
-        return <BudgetsPanel budgets={finance.budgets || []} currency={currency} />;
+        return (
+          <BudgetsPanel
+            budgets={finance.budgets || []}
+            currency={currency}
+            categories={categories}
+            onChanged={loadFinance}
+          />
+        );
       case 'goals':
-        return <GoalsPanel goals={finance.goals || []} habits={finance.habits || []} currency={currency} />;
+        return (
+          <GoalsPanel
+            goals={finance.goals || []}
+            habits={finance.habits || []}
+            currency={currency}
+            onChanged={loadFinance}
+          />
+        );
       case 'reports':
         return <ReportsPanel finance={finance} currency={currency} />;
       case 'scanner':
@@ -213,6 +301,7 @@ export default function FinanceHub() {
           <BillScanner
             currency={currency}
             expenseCategories={categories.filter((category) => category.type === 'expense')}
+            onImported={loadFinance}
           />
         );
       case 'liabilities':
@@ -301,14 +390,33 @@ export default function FinanceHub() {
         <Plus className="h-6 w-6" />
       </button>
 
+      {importOpen && (
+        <ImportTransactions
+          currency={currency}
+          onClose={() => setImportOpen(false)}
+          onImported={() => {
+            loadFinance();
+            setAnalytics(null);
+          }}
+        />
+      )}
+
       {quickAddOpen && (
         <QuickAddModal
+          title={editingTxId ? 'Edit transaction' : 'Add transaction'}
           form={form}
           categoriesForForm={categoriesForForm}
           isSaving={isSaving}
           onFormChange={setForm}
           onSubmit={handleSubmit}
-          onClose={() => setQuickAddOpen(false)}
+          onClose={() => {
+            setQuickAddOpen(false);
+            setEditingTxId(null);
+            setForm({
+              ...emptyForm,
+              occurredOn: new Date().toISOString().slice(0, 10),
+            });
+          }}
         />
       )}
     </div>
@@ -324,13 +432,13 @@ function SummaryStat({ label, value, tone }) {
   );
 }
 
-function QuickAddModal({ form, categoriesForForm, isSaving, onFormChange, onSubmit, onClose }) {
+function QuickAddModal({ title = 'Add transaction', form, categoriesForForm, isSaving, onFormChange, onSubmit, onClose }) {
   return (
-    <div className="fixed inset-0 z-50 flex items-end justify-center sm:items-center" role="dialog" aria-modal="true" aria-label="Add transaction">
+    <div className="fixed inset-0 z-50 flex items-end justify-center sm:items-center" role="dialog" aria-modal="true" aria-label={title}>
       <button className="absolute inset-0 bg-black/40 backdrop-blur-[2px]" onClick={onClose} aria-label="Close" />
       <section className="relative z-10 flex max-h-[92dvh] w-full max-w-lg flex-col rounded-t-[28px] bg-surface-card shadow-2xl sm:rounded-[24px]">
         <header className="flex items-center justify-between gap-4 border-b border-border-subtle p-5">
-          <h2 className="section-title">Add transaction</h2>
+          <h2 className="section-title">{title}</h2>
           <button type="button" onClick={onClose} className="icon-button bg-surface-container-low" aria-label="Close"><X className="h-5 w-5" /></button>
         </header>
         <form className="min-h-0 flex-1 space-y-4 overflow-y-auto p-5" onSubmit={onSubmit}>
@@ -478,7 +586,229 @@ function OverviewPanel({ finance, currency }) {
   );
 }
 
-function LedgerPanel({ currency, rows, loading, query, setQuery }) {
+function InsightsPanel({ analytics, loading, currency }) {
+  if (loading || !analytics) {
+    return <LoadingState />;
+  }
+
+  const { pace, trend, categoryDeltas, topMerchants, recurring, largest, weekday } = analytics;
+  const currentMonth = trend[trend.length - 1] || { expenseMinor: 0, netMinor: 0 };
+  const recurringMonthlyMinor = recurring.reduce((sum, item) => sum + item.monthlyEquivalentMinor, 0);
+  const weekendTotal = weekday.weekdayMinor + weekday.weekendMinor;
+  const weekendShare = weekendTotal > 0 ? Math.round((weekday.weekendMinor / weekendTotal) * 100) : 0;
+
+  const biggestRise = categoryDeltas.find((row) => row.deltaMinor > 0);
+  const biggestDrop = categoryDeltas.find((row) => row.deltaMinor < 0);
+
+  return (
+    <div className="space-y-4 animate-in fade-in slide-in-from-bottom-4 duration-500">
+      <section className="grid grid-cols-2 gap-gutter lg:grid-cols-4">
+        <MetricCard
+          icon={Flame}
+          label="Daily burn rate"
+          value={formatMoney(pace.dailyBurnMinor, currency)}
+          caption={`Day ${pace.daysElapsed} of ${pace.daysInMonth}`}
+          tone="amber"
+        />
+        <MetricCard
+          icon={TrendingUp}
+          label="Projected spend"
+          value={pace.projectionReliable ? formatMoney(pace.projectedExpenseMinor, currency) : '—'}
+          caption={pace.projectionReliable
+            ? (pace.averageExpenseMinor > 0
+              ? `${formatMoneyCompact(pace.averageExpenseMinor, currency)} monthly average`
+              : 'At the current pace')
+            : 'Available a few days into the month'}
+          tone="violet"
+        />
+        <MetricCard
+          icon={Repeat}
+          label="Recurring charges"
+          value={formatMoney(recurringMonthlyMinor, currency)}
+          caption={`${recurring.length} detected per month`}
+          tone="blue"
+        />
+        <MetricCard
+          icon={CalendarDays}
+          label="Weekend spending"
+          value={`${weekendShare}%`}
+          caption={`${formatMoneyCompact(weekday.weekendMinor, currency)} of ${formatMoneyCompact(weekendTotal, currency)}`}
+          tone="green"
+        />
+      </section>
+
+      <section className="app-card p-5 sm:p-6">
+        <div className="mb-5">
+          <h2 className="section-title">Cash flow over time</h2>
+          <p className="text-sm text-text-muted">Income against expenses for the last 6 months</p>
+        </div>
+        <CashflowTrend trend={trend} currency={currency} />
+      </section>
+
+      {analytics.incomeBreakdown?.totalMinor > 0 && (
+        <section className="app-card p-5 sm:p-6">
+          <div className="mb-5">
+            <h2 className="section-title">Where your income came from</h2>
+            <p className="text-sm text-text-muted">
+              Earned income kept separate from repayments, gifts and imported credits
+            </p>
+          </div>
+          <IncomeBreakdown breakdown={analytics.incomeBreakdown} currency={currency} />
+        </section>
+      )}
+
+      <section className="grid gap-4 lg:grid-cols-2">
+        <div className="app-card p-5 sm:p-6">
+          <div className="mb-5">
+            <h2 className="section-title">Where spending moved</h2>
+            <p className="text-sm text-text-muted">
+              {biggestRise
+                ? <>Biggest rise: <strong className="text-on-surface">{biggestRise.name}</strong>, up {formatMoney(biggestRise.deltaMinor, currency)}{biggestDrop ? <> · biggest drop: <strong className="text-on-surface">{biggestDrop.name}</strong></> : null}</>
+                : 'Compared with the same window last month'}
+            </p>
+          </div>
+          <CategoryMovers deltas={categoryDeltas} currency={currency} />
+        </div>
+
+        <div className="app-card p-5 sm:p-6">
+          <div className="mb-5">
+            <h2 className="section-title">Top merchants</h2>
+            <p className="text-sm text-text-muted">Who took the most of your money this month</p>
+          </div>
+          <MerchantBars merchants={topMerchants} currency={currency} />
+        </div>
+      </section>
+
+      <section className="grid gap-4 lg:grid-cols-2">
+        <div className="app-card p-5 sm:p-6">
+          <div className="mb-5">
+            <h2 className="section-title">Spending pace</h2>
+            <p className="text-sm text-text-muted">This month against your recent average</p>
+          </div>
+          {pace.averageExpenseMinor > 0 ? (
+            <PaceMeter
+              spentMinor={currentMonth.expenseMinor}
+              benchmarkMinor={pace.averageExpenseMinor}
+              currency={currency}
+              daysElapsed={pace.daysElapsed}
+              daysInMonth={pace.daysInMonth}
+            />
+          ) : (
+            <p className="text-sm text-text-muted">
+              Track a full month to unlock pace comparisons.
+            </p>
+          )}
+
+          <div className="mt-6 border-t border-border-subtle pt-5">
+            <h3 className="mb-3 text-[13px] font-bold text-on-surface">Largest expenses</h3>
+            <div className="space-y-2.5">
+              {largest.length === 0 && <p className="text-sm text-text-muted">Nothing recorded yet this month.</p>}
+              {largest.map((item) => (
+                <div key={item.id} className="flex items-center justify-between gap-3">
+                  <div className="min-w-0">
+                    <p className="truncate text-[13px] font-semibold text-on-surface">{item.merchant}</p>
+                    <p className="text-[11px] text-text-muted">{item.occurredOn} · {item.categoryName}</p>
+                  </div>
+                  <p className="shrink-0 text-[13px] font-bold tabular-nums text-on-surface">
+                    {formatMoney(item.amountMinor, currency)}
+                  </p>
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+
+        <div className="app-card p-5 sm:p-6">
+          <div className="mb-5 flex items-start justify-between gap-3">
+            <div>
+              <h2 className="section-title">Recurring charges</h2>
+              <p className="text-sm text-text-muted">Detected from repeat billing patterns</p>
+            </div>
+            <span className="w-10 h-10 shrink-0 rounded-xl bg-blue-500/10 text-blue-600 dark:text-blue-300 flex items-center justify-center">
+              <Repeat className="w-5 h-5" />
+            </span>
+          </div>
+
+          {recurring.length === 0 ? (
+            <p className="text-sm text-text-muted">
+              No repeat billing detected yet. Once a merchant charges you a similar amount three times, it shows up here.
+            </p>
+          ) : (
+            <div className="space-y-2.5">
+              {recurring.map((item) => (
+                <div key={item.name} className="flex items-center justify-between gap-3 rounded-xl border border-border-subtle p-3">
+                  <div className="min-w-0">
+                    <p className="truncate text-[13px] font-bold text-on-surface">{item.name}</p>
+                    <p className="text-[11px] text-text-muted">
+                      <span className="capitalize">{item.cadence}</span> · next around {item.nextExpected}
+                    </p>
+                  </div>
+                  <div className="shrink-0 text-right">
+                    <p className="text-[13px] font-bold tabular-nums text-on-surface">{formatMoney(item.amountMinor, currency)}</p>
+                    <p className="text-[11px] text-text-muted">{formatMoneyCompact(item.monthlyEquivalentMinor, currency)}/mo</p>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      </section>
+    </div>
+  );
+}
+
+function IncomeBreakdown({ breakdown, currency }) {
+  const { primaryMinor, otherMinor, totalMinor, byCategory } = breakdown;
+  const primaryShare = totalMinor > 0 ? Math.round((primaryMinor / totalMinor) * 100) : 0;
+
+  return (
+    <div>
+      <div className="grid gap-3 sm:grid-cols-2">
+        <div className="rounded-xl border border-border-subtle p-4">
+          <p className="text-[11px] font-bold uppercase tracking-wide text-text-muted">Earned income</p>
+          <p className="mt-1 font-display text-xl font-bold text-on-surface">{formatMoney(primaryMinor, currency)}</p>
+          <p className="mt-0.5 text-[12px] text-text-muted">Salary and freelance · {primaryShare}% of all money in</p>
+        </div>
+        <div className="rounded-xl border border-border-subtle p-4">
+          <p className="text-[11px] font-bold uppercase tracking-wide text-text-muted">Other money in</p>
+          <p className="mt-1 font-display text-xl font-bold text-on-surface">{formatMoney(otherMinor, currency)}</p>
+          <p className="mt-0.5 text-[12px] text-text-muted">Repayments, gifts and imported credits</p>
+        </div>
+      </div>
+
+      <div className="mt-5 space-y-3">
+        {byCategory.map((row) => (
+          <div key={row.name}>
+            <div className="mb-1.5 flex items-baseline justify-between gap-3">
+              <span className="flex min-w-0 items-center gap-2">
+                <span className="truncate text-[13px] font-semibold text-on-surface">{row.name}</span>
+                {!row.isPrimary && (
+                  <span className="shrink-0 rounded-full bg-surface-container px-2 py-0.5 text-[10px] font-bold uppercase tracking-wide text-text-muted">
+                    Not earnings
+                  </span>
+                )}
+              </span>
+              <span className="shrink-0 text-[12px] font-bold tabular-nums text-on-surface">
+                {formatMoney(row.amountMinor, currency)}
+              </span>
+            </div>
+            <div className="h-2.5 overflow-hidden rounded-full bg-surface-container">
+              <div
+                className="h-full rounded-full transition-[width] duration-500"
+                style={{
+                  width: `${totalMinor > 0 ? (row.amountMinor / totalMinor) * 100 : 0}%`,
+                  backgroundColor: row.isPrimary ? 'var(--viz-income)' : 'var(--viz-neutral)',
+                }}
+              />
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function LedgerPanel({ currency, rows, loading, query, setQuery, onEdit, onDelete, onImport }) {
   const search = query.trim().toLowerCase();
   const filtered = search
     ? rows.filter((row) => [row.merchant, row.payee, row.categoryName, row.notes, ...(row.tags || [])]
@@ -495,13 +825,23 @@ function LedgerPanel({ currency, rows, loading, query, setQuery }) {
               <h2 className="section-title">Ledger</h2>
               <p className="text-sm text-text-muted">Every transaction with a running balance. Tap + to add.</p>
             </div>
-            <a
-              className="min-h-11 inline-flex items-center justify-center gap-2 rounded-xl border border-border-subtle bg-surface-card px-4 text-sm font-bold hover:bg-surface-container-low"
-              href={financeExportUrl(currency)}
-            >
-              <Download className="h-4 w-4" />
-              CSV
-            </a>
+            <div className="flex gap-2">
+              <button
+                type="button"
+                onClick={onImport}
+                className="min-h-11 inline-flex flex-1 items-center justify-center gap-2 rounded-xl bg-primary px-4 text-sm font-bold text-white hover:opacity-90 sm:flex-none"
+              >
+                <Upload className="h-4 w-4" />
+                Import CSV
+              </button>
+              <a
+                className="min-h-11 inline-flex flex-1 items-center justify-center gap-2 rounded-xl border border-border-subtle bg-surface-card px-4 text-sm font-bold hover:bg-surface-container-low sm:flex-none"
+                href={financeExportUrl(currency)}
+              >
+                <Download className="h-4 w-4" />
+                Export
+              </a>
+            </div>
           </div>
           <div className="relative mt-4">
             <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-text-muted" />
@@ -525,6 +865,7 @@ function LedgerPanel({ currency, rows, loading, query, setQuery }) {
                 <th className="p-3 text-right font-semibold">Money in</th>
                 <th className="p-3 text-right font-semibold">Money out</th>
                 <th className="p-3 pr-6 text-right font-semibold">Balance</th>
+                <th className="p-3 pr-6 text-center font-semibold">Actions</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-border-subtle">
@@ -536,6 +877,16 @@ function LedgerPanel({ currency, rows, loading, query, setQuery }) {
                   <td className="p-3 text-right tabular-nums font-semibold text-success-proactive">{isCredit(row.type) ? formatMoney(row.amountMinor, row.currency || currency) : ''}</td>
                   <td className="p-3 text-right tabular-nums font-semibold text-error">{isCredit(row.type) ? '' : formatMoney(row.amountMinor, row.currency || currency)}</td>
                   <td className="p-3 pr-6 text-right tabular-nums font-bold text-on-surface">{formatMoney(row.balanceAfterMinor, currency)}</td>
+                  <td className="p-3 pr-6">
+                    <div className="flex items-center justify-center gap-2">
+                      <button className="icon-button" onClick={() => onEdit(row)} aria-label="Edit">
+                        <Edit2 className="w-4 h-4" />
+                      </button>
+                      <button className="icon-button hover:text-error" onClick={() => onDelete(row.id)} aria-label="Delete">
+                        <Trash2 className="w-4 h-4" />
+                      </button>
+                    </div>
+                  </td>
                 </tr>
               ))}
             </tbody>
@@ -555,6 +906,10 @@ function LedgerPanel({ currency, rows, loading, query, setQuery }) {
                   {isCredit(row.type) ? '+' : '-'}{formatMoney(row.amountMinor, row.currency || currency)}
                 </p>
                 <p className="text-xs text-text-muted tabular-nums">Bal {formatMoney(row.balanceAfterMinor, currency)}</p>
+                <div className="mt-2 flex justify-end gap-1">
+                  <button className="icon-button" onClick={() => onEdit(row)} aria-label="Edit"><Edit2 className="w-4 h-4" /></button>
+                  <button className="icon-button hover:text-error" onClick={() => onDelete(row.id)} aria-label="Delete"><Trash2 className="w-4 h-4" /></button>
+                </div>
               </div>
             </div>
           ))}
@@ -562,111 +917,6 @@ function LedgerPanel({ currency, rows, loading, query, setQuery }) {
 
         {loading && <div className="p-8 text-center text-sm text-text-muted">Loading ledger...</div>}
         {!loading && filtered.length === 0 && <div className="p-8 text-center text-sm text-text-muted">No transactions this month. Tap + to add one.</div>}
-      </section>
-    </div>
-  );
-}
-
-function BudgetsPanel({ budgets, currency, compact = false }) {
-  return (
-    <section className={cn('app-card p-5 sm:p-6 animate-in fade-in slide-in-from-bottom-4 duration-500', compact ? '' : 'space-y-5')}>
-      <div className="mb-5 flex items-center justify-between">
-        <div>
-          <h2 className="section-title">Budgets</h2>
-          <p className="text-sm text-text-muted">Monthly, flexible, and carry-forward limits</p>
-        </div>
-        <PieChart className="h-5 w-5 text-text-muted" />
-      </div>
-      <div className={cn('grid gap-4', compact ? 'grid-cols-1' : 'lg:grid-cols-2')}>
-        {budgets.map((budget) => (
-          <article key={budget.id} className="rounded-xl border border-border-subtle p-4">
-            <div className="flex items-start justify-between gap-4">
-              <div>
-                <h3 className="font-bold text-on-surface">{budget.name}</h3>
-                <p className="text-sm text-text-muted">{budget.categoryName} - {budget.period}</p>
-              </div>
-              <span className={cn(
-                'rounded-full px-2.5 py-1 text-xs font-bold',
-                budget.usagePercent >= budget.alertThresholdPercent
-                  ? 'bg-error/10 text-error'
-                  : 'bg-success-proactive/10 text-success-proactive',
-              )}
-              >
-                {budget.usagePercent}%
-              </span>
-            </div>
-            <ProgressBar percent={budget.usagePercent} className="mt-4" color={budget.categoryColor} />
-            <div className="mt-4 grid grid-cols-3 gap-3 text-sm">
-              <MiniStat label="Spent" value={formatMoneyCompact(budget.spentMinor, currency)} />
-              <MiniStat label="Left" value={formatMoneyCompact(budget.remainingMinor, currency)} />
-              <MiniStat label="Limit" value={formatMoneyCompact(budget.limitMinor, currency)} />
-            </div>
-            {budget.isFlexible && (
-              <p className="mt-3 text-xs leading-5 text-text-muted">Flexible budget with {formatMoneyCompact(budget.carryForwardMinor, currency)} carry-forward.</p>
-            )}
-          </article>
-        ))}
-      </div>
-    </section>
-  );
-}
-
-function GoalsPanel({ goals, habits, currency }) {
-  return (
-    <div className="grid gap-4 animate-in fade-in slide-in-from-bottom-4 duration-500 lg:grid-cols-[1fr_360px]">
-      <section className="app-card p-5 sm:p-6">
-        <div className="mb-5 flex items-center justify-between">
-          <div>
-            <h2 className="section-title">Goals</h2>
-            <p className="text-sm text-text-muted">Target dates, progress, and coaching nudges</p>
-          </div>
-          <Target className="h-5 w-5 text-text-muted" />
-        </div>
-        <div className="space-y-4">
-          {goals.map((goal) => (
-            <article key={goal.id} className="rounded-xl border border-border-subtle p-4">
-              <div className="flex items-start justify-between gap-4">
-                <div>
-                  <h3 className="font-bold text-on-surface">{goal.name}</h3>
-                  <p className="text-sm text-text-muted">Target {formatMoney(goal.targetAmountMinor, goal.currency || currency)} by {goal.targetDate || 'no date'}</p>
-                </div>
-                <span className="rounded-full bg-blue-500/10 px-2.5 py-1 text-xs font-bold text-blue-600 dark:text-blue-300">{goal.progressPercent}%</span>
-              </div>
-              <ProgressBar percent={goal.progressPercent} className="mt-4 bg-secondary" />
-              <div className="mt-4 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-                <p className="text-sm font-semibold text-on-surface">
-                  {formatMoney(goal.savedAmountMinor, goal.currency || currency)} saved
-                </p>
-                <p className="text-sm text-text-muted">{goal.recommendation}</p>
-              </div>
-            </article>
-          ))}
-        </div>
-      </section>
-
-      <section className="app-card p-5 sm:p-6 h-fit">
-        <div className="mb-5 flex items-center gap-3">
-          <span className="w-10 h-10 rounded-xl bg-emerald-500/10 text-emerald-600 dark:text-emerald-300 flex items-center justify-center">
-            <Flag className="w-5 h-5" />
-          </span>
-          <div>
-            <h2 className="section-title">Habits</h2>
-            <p className="text-sm text-text-muted">Streaks that keep finance calm</p>
-          </div>
-        </div>
-        <div className="space-y-3">
-          {habits.map((habit) => (
-            <div key={habit.id} className="flex items-center justify-between rounded-xl bg-surface-container-lowest p-3">
-              <div>
-                <p className="text-sm font-bold">{habit.name}</p>
-                <p className="text-xs text-text-muted">{habit.cadence} - best {habit.bestStreak}</p>
-              </div>
-              <span className="rounded-full bg-success-proactive/10 px-2.5 py-1 text-xs font-bold text-success-proactive">
-                {habit.currentStreak} streak
-              </span>
-            </div>
-          ))}
-        </div>
       </section>
     </div>
   );
@@ -812,14 +1062,6 @@ function MetricCard({ icon: Icon, label, value, caption, tone }) {
   );
 }
 
-function MiniStat({ label, value }) {
-  return (
-    <div>
-      <p className="text-[11px] font-semibold text-text-muted">{label}</p>
-      <p className="mt-0.5 text-sm font-bold text-on-surface">{value}</p>
-    </div>
-  );
-}
 
 function ProgressRow({ label, value, percent, color }) {
   return (

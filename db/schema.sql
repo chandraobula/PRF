@@ -5,6 +5,9 @@ CREATE TABLE IF NOT EXISTS users (
   email TEXT UNIQUE,
   display_name TEXT,
   role TEXT NOT NULL DEFAULT 'user' CHECK (role IN ('owner', 'admin', 'user', 'suspended')),
+  -- Set to 1 at successful account creation. Once true, onboarding is never shown again.
+  -- Defaults to 1 so existing users (who implicitly completed it) aren't shown it on next login.
+  has_completed_onboarding INTEGER NOT NULL DEFAULT 1,
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
@@ -497,3 +500,149 @@ CREATE INDEX IF NOT EXISTS idx_users_role ON users(role);
 CREATE INDEX IF NOT EXISTS idx_admin_audit_log_actor ON admin_audit_log(actor_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_admin_audit_log_target ON admin_audit_log(target_type, target_id);
 CREATE INDEX IF NOT EXISTS idx_admin_announcements_active ON admin_announcements(is_active, starts_at);
+
+-- ---------------------------------------------------------------------------
+-- AI Dev Planner & Comprehension Tool (admin-only)
+-- ---------------------------------------------------------------------------
+
+-- Projects let a developer separate work across multiple SaaS codebases (FRD D4, NFR multi-project).
+CREATE TABLE IF NOT EXISTS planner_projects (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  description TEXT,
+  code TEXT,
+  status TEXT NOT NULL DEFAULT 'active',
+  repo_url TEXT,
+  tech_stack_json TEXT NOT NULL DEFAULT '[]',
+  architecture TEXT,
+  coding_standards TEXT,
+  folder_structure TEXT,
+  created_by TEXT REFERENCES users(id) ON DELETE SET NULL,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS planner_prompt_templates (
+  id TEXT PRIMARY KEY,
+  project_id TEXT REFERENCES planner_projects(id) ON DELETE CASCADE,
+  name TEXT NOT NULL,
+  category TEXT NOT NULL DEFAULT 'general',
+  body TEXT NOT NULL,
+  usage_count INTEGER NOT NULL DEFAULT 0,
+  created_by TEXT REFERENCES users(id) ON DELETE SET NULL,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_planner_prompt_templates_project ON planner_prompt_templates (project_id, category);
+
+-- The single core entity (maps FRD section 9 Task). Drafts from note-parsing are held
+-- in the browser and only inserted here on "Accept", so there is no staging table.
+CREATE TABLE IF NOT EXISTS planner_tasks (
+  id TEXT PRIMARY KEY,
+  project_id TEXT REFERENCES planner_projects(id) ON DELETE SET NULL,
+  project_tag TEXT,
+  plan_date TEXT,
+  order_index INTEGER NOT NULL DEFAULT 0,
+  source TEXT NOT NULL DEFAULT 'ai' CHECK (source IN ('ai', 'manual')),
+  title TEXT NOT NULL,
+  description TEXT,
+  acceptance_criteria_json TEXT NOT NULL DEFAULT '[]',
+  status TEXT NOT NULL DEFAULT 'planned'
+    CHECK (status IN ('planned', 'in_progress', 'done', 'blocked')),
+  estimate_label TEXT,
+  estimated_minutes INTEGER,
+  estimate_source TEXT NOT NULL DEFAULT 'ai' CHECK (estimate_source IN ('ai', 'manual')),
+  actual_minutes INTEGER,
+  generated_prompt TEXT,
+  prompt_used TEXT,
+  comprehension_input TEXT,
+  comprehension_summary TEXT,
+  user_annotation TEXT,
+  comprehension_question TEXT,
+  user_answer TEXT,
+  summary_feedback TEXT CHECK (summary_feedback IN ('up', 'down')),
+  meeting_id TEXT REFERENCES planner_meetings(id) ON DELETE SET NULL,
+  deliverable_id TEXT REFERENCES planner_deliverables(id) ON DELETE SET NULL,
+  confidence REAL,
+  source_excerpt TEXT,
+  category TEXT,
+  priority TEXT NOT NULL DEFAULT 'medium',
+  validation_status TEXT NOT NULL DEFAULT 'pending',
+  scheduled_minute INTEGER,
+  created_by TEXT REFERENCES users(id) ON DELETE SET NULL,
+  completed_at TEXT,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS planner_meetings (
+  id TEXT PRIMARY KEY,
+  project_id TEXT REFERENCES planner_projects(id) ON DELETE SET NULL,
+  title TEXT NOT NULL,
+  meeting_date TEXT,
+  source_type TEXT NOT NULL DEFAULT 'paste' CHECK (source_type IN ('paste', 'upload')),
+  raw_text TEXT NOT NULL DEFAULT '',
+  summary TEXT,
+  objectives_json TEXT NOT NULL DEFAULT '[]',
+  participants_json TEXT NOT NULL DEFAULT '[]',
+  confidence REAL,
+  status TEXT NOT NULL DEFAULT 'processed' CHECK (status IN ('pending', 'processed', 'failed')),
+  created_by TEXT REFERENCES users(id) ON DELETE SET NULL,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS planner_deliverables (
+  id TEXT PRIMARY KEY,
+  meeting_id TEXT REFERENCES planner_meetings(id) ON DELETE CASCADE,
+  project_id TEXT REFERENCES planner_projects(id) ON DELETE SET NULL,
+  title TEXT NOT NULL,
+  note TEXT,
+  confidence REAL,
+  status TEXT NOT NULL DEFAULT 'proposed' CHECK (status IN ('proposed', 'approved', 'rejected')),
+  order_index INTEGER NOT NULL DEFAULT 0,
+  created_by TEXT REFERENCES users(id) ON DELETE SET NULL,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS planner_task_dependencies (
+  id TEXT PRIMARY KEY,
+  task_id TEXT NOT NULL REFERENCES planner_tasks(id) ON DELETE CASCADE,
+  depends_on_task_id TEXT NOT NULL REFERENCES planner_tasks(id) ON DELETE CASCADE,
+  dependency_type TEXT NOT NULL DEFAULT 'blocks' CHECK (dependency_type IN ('blocks', 'relates', 'subtask')),
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE (task_id, depends_on_task_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_planner_tasks_owner_date ON planner_tasks (created_by, plan_date);
+CREATE INDEX IF NOT EXISTS idx_planner_tasks_project ON planner_tasks (project_id);
+CREATE INDEX IF NOT EXISTS idx_planner_tasks_status ON planner_tasks (status, plan_date);
+CREATE INDEX IF NOT EXISTS idx_planner_tasks_meeting ON planner_tasks (meeting_id);
+CREATE INDEX IF NOT EXISTS idx_planner_tasks_deliverable ON planner_tasks (deliverable_id);
+CREATE INDEX IF NOT EXISTS idx_planner_projects_created_by ON planner_projects (created_by);
+CREATE INDEX IF NOT EXISTS idx_planner_meetings_owner ON planner_meetings (created_by, created_at);
+CREATE INDEX IF NOT EXISTS idx_planner_deliverables_meeting ON planner_deliverables (meeting_id, order_index);
+CREATE INDEX IF NOT EXISTS idx_planner_task_deps_task ON planner_task_dependencies (task_id);
+CREATE INDEX IF NOT EXISTS idx_planner_task_deps_depends ON planner_task_dependencies (depends_on_task_id);
+
+-- Sticky notes for the Work Hub board. Mirrors db/migrations/007_sticky_notes.sql
+-- so a fresh setup and an existing database end up with the same table.
+CREATE TABLE IF NOT EXISTS sticky_notes (
+  id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  board TEXT NOT NULL DEFAULT 'work',
+  body TEXT NOT NULL DEFAULT '',
+  color TEXT NOT NULL DEFAULT 'yellow',
+  -- 'hand' = Caveat, 'print' = Patrick Hand, 'clean' = Inter.
+  font TEXT NOT NULL DEFAULT 'hand',
+  rotation REAL NOT NULL DEFAULT 0,
+  sort_order INTEGER NOT NULL DEFAULT 0,
+  is_pinned INTEGER NOT NULL DEFAULT 0,
+  status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'archived')),
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_sticky_notes_user_board
+  ON sticky_notes (user_id, board, status, sort_order);

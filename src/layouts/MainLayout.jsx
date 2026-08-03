@@ -4,6 +4,8 @@ import {
   Home, Settings, Sparkles, DollarSign, Car, Briefcase, BookOpen,
   Coffee, FileText, Link2, Search, Bell, MoreHorizontal, X, ChevronRight,
   CalendarDays, RefreshCw, CalendarClock, StickyNote, ShieldCheck, LogOut,
+  ChevronDown, LayoutDashboard, ClipboardList, FileInput, Megaphone,
+  Gauge, FolderKanban, Library, BarChart3,
 } from 'lucide-react';
 import { cn } from '../lib/utils';
 import ThemeToggle from '../components/ThemeToggle';
@@ -34,21 +36,75 @@ const mobileTabs = [
   { icon: DollarSign, label: 'Money', path: '/finance' },
 ];
 
+// Admin-only destinations shown inside the collapsible Admin group in the sidebar.
+const adminNavItems = [
+  { icon: LayoutDashboard, label: 'Admin Dashboard', path: '/admin' },
+  { icon: Gauge, label: 'AI WorkOS', path: '/admin/planner/dashboard' },
+  { icon: FolderKanban, label: 'Projects', path: '/admin/planner/projects' },
+  { icon: ClipboardList, label: 'Planner', path: '/admin/planner' },
+  { icon: FileInput, label: 'Import Notes', path: '/admin/planner/import' },
+  { icon: Library, label: 'Knowledge Base', path: '/admin/planner/knowledge' },
+  { icon: BarChart3, label: 'Analytics', path: '/admin/planner/analytics' },
+  { icon: Megaphone, label: 'Standup', path: '/admin/planner/standup' },
+];
+
 const pageNames = {
   '/dashboard': 'Today', '/finance': 'Money', '/car': 'My car', '/work': 'Work',
   '/learning': 'Learning', '/pantry': 'Pantry', '/meal-plan': 'Meal Planner',
   '/subscriptions': 'Subscriptions', '/dates': 'Important Dates', '/notes': 'Notes', '/documents': 'Documents',
   '/services': 'Services', '/ai-assistant': 'LifeOS AI', '/settings': 'Settings', '/admin': 'Admin Panel',
+  '/admin/planner': 'Planner', '/admin/planner/import': 'Import Notes', '/admin/planner/standup': 'Standup',
+  '/admin/planner/dashboard': 'AI WorkOS', '/admin/planner/projects': 'Projects',
+  '/admin/planner/knowledge': 'Knowledge Base', '/admin/planner/analytics': 'Analytics',
 };
+
+// Longest-prefix match so /admin/planner/tasks/:id still resolves to a friendly title.
+function resolvePageName(pathname) {
+  if (pageNames[pathname]) {
+    return pageNames[pathname];
+  }
+  if (pathname.endsWith('/workspace')) {
+    return 'AI Workspace';
+  }
+  if (pathname.startsWith('/admin/planner/tasks/')) {
+    return 'Task';
+  }
+  if (pathname.startsWith('/admin/planner/projects/')) {
+    return 'Project';
+  }
+  return pageNames[pathname] || 'LifeOS';
+}
+
+// The Admin group is active when the path is /admin or any /admin/* sub-route.
+function isAdminSubItemActive(item, pathname) {
+  if (item.path === '/admin') {
+    return pathname === '/admin';
+  }
+  if (item.path === '/admin/planner') {
+    return pathname === '/admin/planner' || pathname.startsWith('/admin/planner/tasks');
+  }
+  if (item.path === '/admin/planner/projects') {
+    return pathname.startsWith('/admin/planner/projects');
+  }
+  return pathname === item.path;
+}
 
 export default function MainLayout() {
   const location = useLocation();
   const navigate = useNavigate();
   const [moreOpen, setMoreOpen] = useState(false);
   const [currentUser, setCurrentUser] = useState(null);
-  const pageName = pageNames[location.pathname] || 'LifeOS';
+  const [adminOpen, setAdminOpen] = useState(location.pathname.startsWith('/admin'));
+  const pageName = resolvePageName(location.pathname);
 
   useEffect(() => setMoreOpen(false), [location.pathname]);
+
+  // Keep the Admin group expanded whenever the user is somewhere under /admin.
+  useEffect(() => {
+    if (location.pathname.startsWith('/admin')) {
+      setAdminOpen(true);
+    }
+  }, [location.pathname]);
 
   // Keep the session warm while the app is open, and log out if it has expired.
   useEffect(() => {
@@ -89,7 +145,36 @@ export default function MainLayout() {
               return <Link key={path} to={path} className={cn('min-h-12 flex items-center gap-3 px-3 rounded-xl text-sm font-semibold transition-all focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-secondary', active ? 'bg-primary text-white shadow-sm' : 'text-on-surface-variant hover:bg-surface-container-low')} aria-current={active ? 'page' : undefined}><Icon className="w-5 h-5" /><span>{label}</span></Link>;
             })}
             {isAdmin(currentUser) && (
-              <Link to="/admin" className={cn('min-h-12 flex items-center gap-3 px-3 rounded-xl text-sm font-semibold transition-all focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-secondary', location.pathname === '/admin' ? 'bg-primary text-white shadow-sm' : 'text-on-surface-variant hover:bg-surface-container-low')} aria-current={location.pathname === '/admin' ? 'page' : undefined}><ShieldCheck className="w-5 h-5" /><span>Admin</span></Link>
+              <div>
+                <button
+                  type="button"
+                  onClick={() => setAdminOpen((open) => !open)}
+                  aria-expanded={adminOpen}
+                  className={cn('w-full min-h-12 flex items-center gap-3 px-3 rounded-xl text-sm font-semibold transition-all focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-secondary', location.pathname.startsWith('/admin') ? 'text-on-surface' : 'text-on-surface-variant hover:bg-surface-container-low')}
+                >
+                  <ShieldCheck className="w-5 h-5" />
+                  <span className="flex-1 text-left">Admin</span>
+                  <ChevronDown className={cn('w-4 h-4 transition-transform', adminOpen && 'rotate-180')} />
+                </button>
+                {adminOpen && (
+                  <div className="mt-1 ml-3 pl-3 border-l border-border-subtle space-y-1">
+                    {adminNavItems.map(({ icon: Icon, label, path }) => {
+                      const active = isAdminSubItemActive({ path }, location.pathname);
+                      return (
+                        <Link
+                          key={path}
+                          to={path}
+                          className={cn('min-h-11 flex items-center gap-3 px-3 rounded-xl text-sm font-semibold transition-all focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-secondary', active ? 'bg-primary text-white shadow-sm' : 'text-on-surface-variant hover:bg-surface-container-low')}
+                          aria-current={active ? 'page' : undefined}
+                        >
+                          <Icon className="w-4 h-4" />
+                          <span>{label}</span>
+                        </Link>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
             )}
           </div>
         </nav>
@@ -138,12 +223,30 @@ export default function MainLayout() {
       {moreOpen && <div className="fixed inset-0 z-50 lg:hidden" role="dialog" aria-modal="true" aria-label="More destinations">
         <button className="absolute inset-0 bg-black/35 backdrop-blur-[2px]" onClick={() => setMoreOpen(false)} aria-label="Close menu" />
         <section className="more-sheet absolute inset-x-0 bottom-0 bg-surface-card rounded-t-[28px] shadow-2xl">
-          <div className="w-10 h-1 rounded-full bg-surface-container-highest mx-auto mt-2" />
-          <div className="flex items-center justify-between px-5 pt-4 pb-3"><div><h2 className="font-display text-xl font-bold">More</h2><p className="text-sm text-text-muted">Everything else in your LifeOS</p></div><button className="icon-button bg-surface-container-low" onClick={() => setMoreOpen(false)} aria-label="Close menu"><X className="w-5 h-5" /></button></div>
-          <div className="px-3 pb-2">
-            {navItems.slice(3).map(({ icon: Icon, label, path }) => <Link key={path} to={path} className="flex items-center min-h-14 px-3 rounded-xl hover:bg-surface-container-low active:bg-surface-container"><span className="w-10 h-10 rounded-xl bg-surface-container-low flex items-center justify-center mr-3"><Icon className="w-5 h-5" /></span><span className="font-semibold flex-1">{label}</span><ChevronRight className="w-5 h-5 text-text-muted" /></Link>)}
-            <Link to="/settings" className="flex items-center min-h-14 px-3 rounded-xl hover:bg-surface-container-low"><span className="w-10 h-10 rounded-xl bg-surface-container-low flex items-center justify-center mr-3"><Settings className="w-5 h-5" /></span><span className="font-semibold flex-1">Settings</span><ChevronRight className="w-5 h-5 text-text-muted" /></Link>
-            <button type="button" onClick={handleLogout} className="w-full flex items-center min-h-14 px-3 rounded-xl hover:bg-error/10 text-error"><span className="w-10 h-10 rounded-xl bg-error/10 flex items-center justify-center mr-3"><LogOut className="w-5 h-5" /></span><span className="font-semibold flex-1 text-left">Log out</span></button>
+          <div className="shrink-0">
+            <div className="w-10 h-1 rounded-full bg-surface-container-highest mx-auto mt-2" />
+            <div className="flex items-center justify-between px-5 pt-4 pb-3">
+              <div><h2 className="font-display text-xl font-bold">More</h2><p className="text-sm text-text-muted">Everything else in your LifeOS</p></div>
+              <button className="icon-button bg-surface-container-low" onClick={() => setMoreOpen(false)} aria-label="Close menu"><X className="w-5 h-5" /></button>
+            </div>
+          </div>
+
+          {/* Scrolls independently of the page so long menus (admins see 8 extra
+              destinations) stay reachable on short screens. */}
+          <div className="more-sheet-body px-3 pb-2">
+            <p className="more-sheet-label">Your spaces</p>
+            {navItems.slice(3).map(({ icon: Icon, label, path }) => <Link key={path} to={path} className="more-sheet-item"><span className="more-sheet-icon"><Icon className="w-5 h-5" /></span><span className="font-semibold flex-1">{label}</span><ChevronRight className="w-5 h-5 text-text-muted" /></Link>)}
+
+            {isAdmin(currentUser) && (
+              <>
+                <p className="more-sheet-label">Admin</p>
+                {adminNavItems.map(({ icon: Icon, label, path }) => <Link key={path} to={path} className="more-sheet-item"><span className="more-sheet-icon bg-primary/10 text-primary"><Icon className="w-5 h-5" /></span><span className="font-semibold flex-1">{label}</span><ChevronRight className="w-5 h-5 text-text-muted" /></Link>)}
+              </>
+            )}
+
+            <p className="more-sheet-label">Account</p>
+            <Link to="/settings" className="more-sheet-item"><span className="more-sheet-icon"><Settings className="w-5 h-5" /></span><span className="font-semibold flex-1">Settings</span><ChevronRight className="w-5 h-5 text-text-muted" /></Link>
+            <button type="button" onClick={handleLogout} className="more-sheet-item w-full text-error hover:bg-error/10"><span className="more-sheet-icon bg-error/10 text-error"><LogOut className="w-5 h-5" /></span><span className="font-semibold flex-1 text-left">Log out</span></button>
           </div>
         </section>
       </div>}

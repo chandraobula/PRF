@@ -1,5 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { Camera, Edit2, FileText, Loader2, Plus, Save, Sparkles, Trash2, UploadCloud, X } from 'lucide-react';
+import { Camera, Edit2, FileDown, FileText, Loader2, Plus, Save, Sparkles, Trash2, UploadCloud, X } from 'lucide-react';
+import StatementReview from './StatementReview';
+import ReceiptItemsReview from './ReceiptItemsReview';
 import {
   addFinanceReceipt,
   deleteFinanceReceipt,
@@ -28,7 +30,7 @@ const emptyBill = {
   sizeBytes: null,
 };
 
-export default function BillScanner({ currency = 'USD', expenseCategories = [] }) {
+export default function BillScanner({ currency = 'USD', expenseCategories = [], onImported }) {
   const [bills, setBills] = useState([]);
   const [form, setForm] = useState(emptyBill);
   const [editingId, setEditingId] = useState('');
@@ -38,6 +40,9 @@ export default function BillScanner({ currency = 'USD', expenseCategories = [] }
   const [scanning, setScanning] = useState(false);
   const [scanNote, setScanNote] = useState('');
   const [formOpen, setFormOpen] = useState(false);
+  const [statement, setStatement] = useState(null);
+  const [statementType, setStatementType] = useState(null); // 'receipt' or 'transaction'
+  const [scannedMerchant, setScannedMerchant] = useState(''); // for receipt items context
   const fileInputRef = useRef(null);
   const scanInputRef = useRef(null);
 
@@ -110,18 +115,72 @@ export default function BillScanner({ currency = 'USD', expenseCategories = [] }
 
     try {
       const dataUrl = await readFileAsDataUrl(file);
-      const { receipt, items } = await scanFinanceDocument({ image: dataUrl, mimeType: file.type });
+      const { receipt, items, transactions } = await scanFinanceDocument({ image: dataUrl, mimeType: file.type });
+
+      // A payment-app or bank statement: keep every payment as its own entry
+      // instead of collapsing the file into a single total.
+      if (transactions && transactions.length > 0) {
+        setStatement(transactions);
+        setStatementType('transaction');
+        setScanNote(`Found ${transactions.length} individual transactions. Review them below — nothing is saved until you confirm.`);
+        return;
+      }
 
       if (!receipt || (!receipt.merchant && !receipt.totalMinor)) {
-        setError('No bill total was detected. You can still enter it manually below.');
+        setError('No bill total or transaction list was detected. You can still enter it manually below.');
         return;
       }
 
       const matchedCategory = expenseCategories.find(
         (category) => category.name.toLowerCase() === String(receipt.category || '').toLowerCase(),
       );
-      const lineSummary = (receipt.lineItems || []).map((line) => line.description).filter(Boolean).slice(0, 4).join(', ');
 
+      // Extract line items and show them individually if available
+      const lineItems = [];
+      if (items && items.length > 0) {
+        items.forEach((item) => {
+          if (item.name) {
+            const amountMinor = Math.round((item.unitPrice || 0) * 100);
+            if (amountMinor > 0) {
+              lineItems.push({
+                description: `${item.quantity || 1}x ${item.name}`,
+                amountMinor,
+                occurredOn: receipt.date || new Date().toISOString().slice(0, 10),
+                merchant: receipt.merchant || '',
+                category: matchedCategory?.name || receipt.category || expenseCategories[0]?.name || 'Food',
+                direction: 'debit',
+              });
+            }
+          }
+        });
+      } else if (receipt.lineItems && receipt.lineItems.length > 0) {
+        receipt.lineItems.forEach((line) => {
+          if (line.description) {
+            const amountMinor = Math.round((line.amount || 0) * 100);
+            if (amountMinor > 0) {
+              lineItems.push({
+                description: line.description,
+                amountMinor,
+                occurredOn: receipt.date || new Date().toISOString().slice(0, 10),
+                merchant: receipt.merchant || '',
+                category: matchedCategory?.name || receipt.category || expenseCategories[0]?.name || 'Food',
+                direction: 'debit',
+              });
+            }
+          }
+        });
+      }
+
+      // If we have line items, show them in review screen. Otherwise show the form.
+      if (lineItems.length > 0) {
+        setStatement(lineItems);
+        setStatementType('receipt');
+        setScannedMerchant(receipt.merchant || '');
+        setScanNote(`AI found ${lineItems.length} item${lineItems.length === 1 ? '' : 's'} in this receipt. Review and add them individually below.`);
+        return;
+      }
+
+      // Fall back to single-entry form if no line items found
       setEditingId('');
       setForm({
         occurredOn: receipt.date || new Date().toISOString().slice(0, 10),
@@ -129,12 +188,12 @@ export default function BillScanner({ currency = 'USD', expenseCategories = [] }
         amount: receipt.totalMinor ? String(receipt.totalMinor / 100) : '',
         category: matchedCategory?.name || receipt.category || expenseCategories[0]?.name || 'Food',
         paymentMethod: 'card',
-        notes: lineSummary || 'Scanned with AI',
+        notes: 'Scanned with AI',
         fileName: file.name,
         mimeType: file.type,
         sizeBytes: file.size,
       });
-      setScanNote(`AI read this ${file.type === 'application/pdf' ? 'PDF' : 'image'}${items?.length ? ` and found ${items.length} line item${items.length === 1 ? '' : 's'}` : ''}. Review and save.`);
+      setScanNote(`AI read this ${file.type === 'application/pdf' ? 'PDF' : 'image'}. Review and save.`);
       setFormOpen(true);
     } catch (scanError) {
       setError(scanError.message);
@@ -252,6 +311,23 @@ export default function BillScanner({ currency = 'USD', expenseCategories = [] }
         </div>
         {scanNote && <p className="mt-3 rounded-xl bg-ai-electric-blue/10 px-3 py-2 text-sm font-semibold text-ai-electric-blue">{scanNote}</p>}
         {error && !formOpen && <p className="mt-3 rounded-xl bg-error/10 px-3 py-2 text-sm font-semibold text-error">{error}</p>}
+
+        {/* Most people's spending lives in a payment app, not in paper receipts —
+            point them at the export that captures months of history in one go. */}
+        <div className="mt-4 flex items-start gap-3 rounded-xl border border-border-subtle bg-surface-container-lowest p-3.5">
+          <span className="mt-0.5 flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-primary/10 text-primary">
+            <FileDown className="h-4 w-4" />
+          </span>
+          <div className="min-w-0 text-[13px] leading-5">
+            <p className="font-bold text-on-surface">Got a PhonePe, Google Pay or Paytm account?</p>
+            <p className="mt-0.5 text-text-muted">
+              They all let you download your transaction history as a PDF — in PhonePe it's under{' '}
+              <span className="font-medium text-on-surface-variant">History → Statement → Download</span>. Upload that
+              PDF here and every payment becomes its own entry, with money received filed separately from your salary.
+              It's the fastest way to get months of real spending into Life OS.
+            </p>
+          </div>
+        </div>
       </section>
 
       <section className="bg-surface-card rounded-card border border-border-subtle shadow-sm overflow-hidden">
@@ -322,6 +398,27 @@ export default function BillScanner({ currency = 'USD', expenseCategories = [] }
         )}
       </section>
 
+      {statement && statementType === 'transaction' && (
+        <StatementReview
+          transactions={statement}
+          currency={currency}
+          expenseCategories={expenseCategories}
+          onClose={() => { setStatement(null); setStatementType(null); setScanNote(''); }}
+          onImported={async () => { await loadBills(); await onImported?.(); }}
+        />
+      )}
+
+      {statement && statementType === 'receipt' && (
+        <ReceiptItemsReview
+          items={statement}
+          currency={currency}
+          expenseCategories={expenseCategories}
+          merchant={scannedMerchant}
+          onClose={() => { setStatement(null); setStatementType(null); setScannedMerchant(''); setScanNote(''); }}
+          onImported={async () => { await loadBills(); await onImported?.(); }}
+        />
+      )}
+
       {formOpen && (
         <div className="fixed inset-0 z-50 flex items-end justify-center sm:items-center" role="dialog" aria-modal="true" aria-label={editingId ? 'Edit bill' : 'Add bill'}>
           <button className="absolute inset-0 bg-black/40 backdrop-blur-[2px]" onClick={() => { setFormOpen(false); resetForm(); }} aria-label="Close" />
@@ -343,6 +440,15 @@ export default function BillScanner({ currency = 'USD', expenseCategories = [] }
                     <option key={category.id || category.name} value={category.name}>{category.name}</option>
                   ))}
                 </select>
+              </label>
+              <label className="settings-field">
+                <span className="self-start mt-3">Items / Notes</span>
+                <textarea
+                  className="w-full min-h-[100px] p-3.5 rounded-xl border border-outline-variant bg-surface-card text-[15px] resize-y"
+                  value={form.notes}
+                  onChange={(event) => setForm({ ...form, notes: event.target.value })}
+                  placeholder="Apples - 2.99&#10;Milk - 1.99"
+                />
               </label>
               <input ref={fileInputRef} type="file" className="hidden" accept="image/*,application/pdf" onChange={handleFile} />
               <button type="button" onClick={() => fileInputRef.current?.click()} className="w-full min-h-12 inline-flex items-center justify-center gap-2 rounded-xl border border-border-subtle bg-surface-container-low px-4 text-sm font-bold text-on-surface hover:bg-surface-container">
