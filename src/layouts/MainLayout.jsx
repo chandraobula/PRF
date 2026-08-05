@@ -205,7 +205,7 @@ export default function MainLayout() {
           <div className="flex items-center gap-2">
             <button type="button" onClick={() => navigate('/documents')} className="icon-button" aria-label="Search"><Search className="w-5 h-5" /></button>
             <ThemeToggle />
-            <button type="button" className="icon-button relative" aria-label="Notifications"><Bell className="w-5 h-5" /><span className="absolute top-2 right-2 w-2 h-2 rounded-full bg-secondary ring-2 ring-surface-card" /></button>
+            <button type="button" onClick={() => navigate('/finance')} className="icon-button" aria-label="Notifications"><Bell className="w-5 h-5" /></button>
             <button type="button" onClick={() => navigate('/ai-assistant')} className="hidden lg:flex min-h-11 items-center gap-2 px-4 ml-1 rounded-xl bg-primary text-white text-sm font-bold hover:bg-primary/90"><Sparkles className="w-4 h-4" /> Ask LifeOS</button>
           </div>
         </header>

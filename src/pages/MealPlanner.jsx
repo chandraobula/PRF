@@ -1,25 +1,31 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
-import { CalendarDays, Check, ChevronLeft, ChevronRight, Loader2, Plus, ShoppingCart, Sparkles, Trash2, Undo2, Wand2, X } from 'lucide-react';
+import { Apple, CalendarDays, Check, ChevronLeft, ChevronRight, Coffee, Loader2, Plus, Sandwich, ShoppingCart, Sparkles, Trash2, Undo2, UtensilsCrossed, Wand2, X } from 'lucide-react';
 import { cn } from '../lib/utils';
 import { addMealPlanEntry, deleteMealPlanEntry, generateMealPlan, getMealPlan, updateMealPlanEntry } from '../services/mealPlanApi';
 import { addShoppingItem, getPantrySummary } from '../services/pantryApi';
 
+// Each slot gets its own icon + tint, reused as a small circular badge in both
+// views so a meal's time of day reads at a glance without repeating the label.
 const SLOTS = [
-  { key: 'breakfast', label: 'Breakfast' },
-  { key: 'lunch', label: 'Lunch' },
-  { key: 'dinner', label: 'Dinner' },
-  { key: 'snack', label: 'Snack' },
+  { key: 'breakfast', label: 'Breakfast', icon: Coffee, tint: 'bg-warning-maintenance/10 text-warning-maintenance' },
+  { key: 'lunch', label: 'Lunch', icon: Sandwich, tint: 'bg-success-proactive/10 text-success-proactive' },
+  { key: 'dinner', label: 'Dinner', icon: UtensilsCrossed, tint: 'bg-secondary/10 text-secondary' },
+  { key: 'snack', label: 'Snack', icon: Apple, tint: 'bg-ai-electric-blue/10 text-ai-electric-blue' },
 ];
 
-const STATUS_STYLES = {
-  planned: 'bg-surface-container text-on-surface',
-  cooked: 'bg-success-proactive/10 text-success-proactive',
-  skipped: 'bg-surface-container text-text-muted line-through',
-  leftover: 'bg-ai-electric-blue/10 text-ai-electric-blue',
+// Status is shown as a small dot + word rather than tinting the whole card, so
+// a day's cards read as a calm, uniform list instead of a wall of color.
+const STATUS_META = {
+  planned: { label: 'Planned', dot: 'bg-text-muted' },
+  cooked: { label: 'Cooked', dot: 'bg-success-proactive' },
+  leftover: { label: 'Leftover', dot: 'bg-ai-electric-blue' },
+  skipped: { label: 'Skipped', dot: 'bg-text-muted' },
 };
 
 const dayFormatter = new Intl.DateTimeFormat(undefined, { weekday: 'short' });
+const weekdayLongFormatter = new Intl.DateTimeFormat(undefined, { weekday: 'long' });
 const rangeFormatter = new Intl.DateTimeFormat(undefined, { month: 'short', day: 'numeric' });
+const dateNumFormatter = new Intl.DateTimeFormat(undefined, { day: 'numeric' });
 
 const toISO = (date) => {
   const local = new Date(date);
@@ -50,6 +56,74 @@ const emptyForm = {
   notes: '',
   status: 'planned',
 };
+
+/** One meal, as a full row inside the day view's single card. */
+function MealEntryRow({ entry, onEdit, onSetStatus, onDelete }) {
+  const status = STATUS_META[entry.status] || STATUS_META.planned;
+
+  return (
+    <div className="group flex items-center gap-3 py-3 pl-[52px] pr-5">
+      <button type="button" onClick={() => onEdit(entry)} className="min-w-0 flex-1 text-left">
+        <div className="flex items-center gap-2">
+          <p className={cn('truncate font-semibold text-on-surface', entry.status === 'skipped' && 'text-text-muted line-through')}>{entry.title}</p>
+        </div>
+        <p className="mt-0.5 flex items-center gap-1.5 text-xs text-text-muted">
+          <span className={cn('h-1.5 w-1.5 shrink-0 rounded-full', status.dot)} />
+          {status.label} · {entry.servings} serving{entry.servings === 1 ? '' : 's'}
+          {entry.notes ? ` · ${entry.notes}` : ''}
+        </p>
+      </button>
+      <div className="flex shrink-0 items-center gap-1 opacity-100 transition-opacity sm:opacity-0 sm:group-hover:opacity-100 sm:focus-within:opacity-100">
+        {entry.status === 'cooked'
+          ? <button type="button" onClick={() => onSetStatus(entry, 'planned')} className="flex h-8 w-8 items-center justify-center rounded-lg text-text-muted hover:bg-surface-container-low hover:text-on-surface" aria-label="Mark planned"><Undo2 className="h-4 w-4" /></button>
+          : <button type="button" onClick={() => onSetStatus(entry, 'cooked')} className="flex h-8 w-8 items-center justify-center rounded-lg text-text-muted hover:bg-surface-container-low hover:text-on-surface" aria-label="Mark cooked"><Check className="h-4 w-4" /></button>}
+        <button type="button" onClick={() => onDelete(entry.id)} className="flex h-8 w-8 items-center justify-center rounded-lg text-text-muted hover:bg-error/10 hover:text-error" aria-label={`Delete ${entry.title}`}><Trash2 className="h-4 w-4" /></button>
+      </div>
+    </div>
+  );
+}
+
+/** One slot's icon badge + label, shared by the day-card section header and week chips. */
+function SlotBadge({ slot, className }) {
+  const Icon = slot.icon;
+  return (
+    <span className={cn('flex h-8 w-8 shrink-0 items-center justify-center rounded-full', slot.tint, className)}>
+      <Icon className="h-4 w-4" />
+    </span>
+  );
+}
+
+/** One meal, as a compact pill inside a week-view day card. */
+function MealChip({ entry, slot, onClick }) {
+  const status = STATUS_META[entry.status] || STATUS_META.planned;
+  const Icon = slot.icon;
+
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className="inline-flex max-w-full items-center gap-1.5 rounded-full border border-border-subtle bg-surface-container-lowest px-3 py-1.5 text-xs font-semibold text-on-surface transition-colors hover:border-secondary/50"
+    >
+      <Icon className="h-3.5 w-3.5 shrink-0 text-text-muted" />
+      <span className={cn('truncate', entry.status === 'skipped' && 'text-text-muted line-through')}>{entry.title}</span>
+      <span className={cn('h-1.5 w-1.5 shrink-0 rounded-full', status.dot)} />
+    </button>
+  );
+}
+
+/** An unplanned slot on a given day, in either view — tap to add. */
+function EmptySlotChip({ slot, onClick, className }) {
+  const Icon = slot.icon;
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className={cn('inline-flex items-center gap-1.5 rounded-full border border-dashed border-border-subtle px-3 py-1.5 text-xs font-semibold text-text-muted transition-colors hover:border-secondary hover:text-secondary', className)}
+    >
+      <Icon className="h-3.5 w-3.5" /> Add {slot.label.toLowerCase()}
+    </button>
+  );
+}
 
 export default function MealPlanner() {
   const [weekStart, setWeekStart] = useState(() => startOfWeek(new Date()));
@@ -348,48 +422,40 @@ export default function MealPlanner() {
       {error && <div className="rounded-xl bg-error/10 px-4 py-3 text-sm font-semibold text-error">{error}</div>}
 
       {view === 'day' && (
-        <section className="app-card p-4 sm:p-5">
-          <div className="mb-4 flex items-center justify-between">
+        <section className="app-card overflow-hidden">
+          <header className="flex items-center justify-between border-b border-border-subtle bg-surface-container-lowest px-5 py-4">
             <div>
               <p className="font-display text-xl font-bold text-on-surface">
-                {toISO(selectedDay) === todayISO ? 'Today' : dayFormatter.format(selectedDay)}
+                {toISO(selectedDay) === todayISO ? 'Today' : weekdayLongFormatter.format(selectedDay)}
               </p>
               <p className="text-sm text-text-muted">{rangeFormatter.format(selectedDay)}</p>
             </div>
             <div className="flex gap-1">
-              <button type="button" onClick={goPrev} className="icon-button bg-surface-container-low" aria-label="Previous day"><ChevronLeft className="h-5 w-5" /></button>
-              <button type="button" onClick={goNext} className="icon-button bg-surface-container-low" aria-label="Next day"><ChevronRight className="h-5 w-5" /></button>
+              <button type="button" onClick={goPrev} className="icon-button bg-surface-card" aria-label="Previous day"><ChevronLeft className="h-5 w-5" /></button>
+              <button type="button" onClick={goNext} className="icon-button bg-surface-card" aria-label="Next day"><ChevronRight className="h-5 w-5" /></button>
             </div>
-          </div>
-          <div className="space-y-3">
+          </header>
+          <div className="divide-y divide-border-subtle">
             {SLOTS.map((slot) => {
               const dayISO = toISO(selectedDay);
               const cellEntries = entriesByCell.get(`${dayISO}|${slot.key}`) || [];
               return (
-                <div key={slot.key} className="rounded-xl border border-border-subtle p-3">
-                  <div className="mb-2 flex items-center justify-between">
-                    <p className="text-xs font-bold uppercase tracking-wide text-text-muted">{slot.label}</p>
-                    <button type="button" onClick={() => openAdd(dayISO, slot.key)} className="flex h-7 w-7 items-center justify-center rounded-lg text-text-muted hover:bg-surface-container-low hover:text-on-surface" aria-label={`Add ${slot.label}`}><Plus className="h-4 w-4" /></button>
+                <div key={slot.key}>
+                  <div className="flex items-center justify-between px-5 py-3">
+                    <div className="flex items-center gap-2.5">
+                      <SlotBadge slot={slot} />
+                      <p className="font-semibold text-on-surface">{slot.label}</p>
+                    </div>
+                    <button type="button" onClick={() => openAdd(dayISO, slot.key)} className="flex h-8 w-8 items-center justify-center rounded-lg text-text-muted hover:bg-surface-container-low hover:text-on-surface" aria-label={`Add ${slot.label}`}><Plus className="h-4 w-4" /></button>
                   </div>
                   {cellEntries.length === 0 ? (
-                    <button type="button" onClick={() => openAdd(dayISO, slot.key)} className="w-full rounded-lg border border-dashed border-border-subtle py-2.5 text-sm text-text-muted hover:border-secondary hover:text-secondary">Add {slot.label.toLowerCase()}</button>
+                    <button type="button" onClick={() => openAdd(dayISO, slot.key)} className="w-full py-2 pb-4 pl-[52px] pr-5 text-left text-sm text-text-muted hover:text-secondary">
+                      Nothing planned — tap to add {slot.label.toLowerCase()}
+                    </button>
                   ) : (
-                    <div className="space-y-2">
+                    <div className="pb-1">
                       {cellEntries.map((entry) => (
-                        <div key={entry.id} className={cn('rounded-xl px-3 py-2.5', STATUS_STYLES[entry.status] || STATUS_STYLES.planned)}>
-                          <div className="flex items-start justify-between gap-2">
-                            <button type="button" onClick={() => openEdit(entry)} className="min-w-0 flex-1 text-left">
-                              <p className="font-bold leading-tight">{entry.title}</p>
-                              <p className="text-xs opacity-70">{entry.servings} serving{entry.servings === 1 ? '' : 's'}{entry.notes ? ` · ${entry.notes}` : ''}</p>
-                            </button>
-                            <div className="flex shrink-0 items-center gap-0.5">
-                              {entry.status === 'cooked'
-                                ? <button type="button" onClick={() => setStatus(entry, 'planned')} className="rounded p-1.5 hover:bg-black/10" aria-label="Mark planned"><Undo2 className="h-4 w-4" /></button>
-                                : <button type="button" onClick={() => setStatus(entry, 'cooked')} className="rounded p-1.5 hover:bg-black/10" aria-label="Mark cooked"><Check className="h-4 w-4" /></button>}
-                              <button type="button" onClick={() => removeEntry(entry.id)} className="rounded p-1.5 hover:bg-black/10" aria-label={`Delete ${entry.title}`}><Trash2 className="h-4 w-4" /></button>
-                            </div>
-                          </div>
-                        </div>
+                        <MealEntryRow key={entry.id} entry={entry} onEdit={openEdit} onSetStatus={setStatus} onDelete={removeEntry} />
                       ))}
                     </div>
                   )}
@@ -401,54 +467,38 @@ export default function MealPlanner() {
       )}
 
       {view === 'week' && (
-      <section className="grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-7">
+      <section className="space-y-3">
         {days.map((day) => {
           const dateISO = toISO(day);
           const isToday = dateISO === todayISO;
+          const dayEntryCount = SLOTS.reduce((total, slot) => total + (entriesByCell.get(`${dateISO}|${slot.key}`)?.length || 0), 0);
+
           return (
-            <div key={dateISO} className={cn('app-card p-3 flex flex-col gap-3', isToday && 'ring-2 ring-secondary')}>
-              <div className="flex items-baseline justify-between">
-                <p className="font-bold text-on-surface">{dayFormatter.format(day)}</p>
-                <p className={cn('text-xs font-semibold', isToday ? 'text-secondary' : 'text-text-muted')}>{rangeFormatter.format(day)}</p>
-              </div>
-              <div className="space-y-3">
+            <div key={dateISO} className={cn('app-card overflow-hidden', isToday && 'ring-2 ring-secondary')}>
+              <button
+                type="button"
+                onClick={() => { goToDay(day); setView('day'); }}
+                className="flex w-full items-center justify-between px-5 py-3.5 text-left transition-colors hover:bg-surface-container-lowest"
+              >
+                <div className="flex items-center gap-3">
+                  <span className={cn('flex h-10 w-10 shrink-0 items-center justify-center rounded-xl font-display text-sm font-bold', isToday ? 'bg-secondary text-on-secondary' : 'bg-surface-container text-on-surface')}>
+                    {dateNumFormatter.format(day)}
+                  </span>
+                  <div>
+                    <p className="font-semibold text-on-surface">{dayFormatter.format(day)}{isToday ? ' · Today' : ''}</p>
+                    <p className="text-xs text-text-muted">{dayEntryCount === 0 ? 'Nothing planned' : `${dayEntryCount} meal${dayEntryCount === 1 ? '' : 's'} planned`}</p>
+                  </div>
+                </div>
+                <ChevronRight className="h-4 w-4 shrink-0 text-text-muted" />
+              </button>
+              <div className="flex flex-wrap gap-1.5 px-5 pb-4">
                 {SLOTS.map((slot) => {
                   const cellEntries = entriesByCell.get(`${dateISO}|${slot.key}`) || [];
-                  return (
-                    <div key={slot.key}>
-                      <div className="flex items-center justify-between">
-                        <p className="text-[11px] font-bold uppercase tracking-wide text-text-muted">{slot.label}</p>
-                        <button type="button" onClick={() => openAdd(dateISO, slot.key)} className="flex h-6 w-6 items-center justify-center rounded-md text-text-muted hover:bg-surface-container-low hover:text-on-surface" aria-label={`Add ${slot.label} on ${dateISO}`}>
-                          <Plus className="h-4 w-4" />
-                        </button>
-                      </div>
-                      <div className="mt-1 space-y-1">
-                        {cellEntries.map((entry) => (
-                          <div key={entry.id} className={cn('group rounded-lg px-2 py-1.5 text-sm', STATUS_STYLES[entry.status] || STATUS_STYLES.planned)}>
-                            <button type="button" onClick={() => openEdit(entry)} className="block w-full text-left font-semibold leading-tight truncate">
-                              {entry.title}
-                            </button>
-                            <div className="mt-1 flex items-center justify-between gap-1">
-                              <span className="text-[11px] opacity-70">{entry.servings} serving{entry.servings === 1 ? '' : 's'}</span>
-                              <div className="flex items-center gap-0.5 opacity-0 transition-opacity group-hover:opacity-100 focus-within:opacity-100">
-                                {entry.status === 'cooked' ? (
-                                  <button type="button" onClick={() => setStatus(entry, 'planned')} className="rounded p-1 hover:bg-black/5" aria-label="Mark planned"><Undo2 className="h-3.5 w-3.5" /></button>
-                                ) : (
-                                  <button type="button" onClick={() => setStatus(entry, 'cooked')} className="rounded p-1 hover:bg-black/5" aria-label="Mark cooked"><Check className="h-3.5 w-3.5" /></button>
-                                )}
-                                <button type="button" onClick={() => removeEntry(entry.id)} className="rounded p-1 hover:bg-black/5" aria-label={`Delete ${entry.title}`}><Trash2 className="h-3.5 w-3.5" /></button>
-                              </div>
-                            </div>
-                          </div>
-                        ))}
-                        {cellEntries.length === 0 && (
-                          <button type="button" onClick={() => openAdd(dateISO, slot.key)} className="w-full rounded-lg border border-dashed border-border-subtle py-1.5 text-xs text-text-muted hover:border-secondary hover:text-secondary">
-                            Add
-                          </button>
-                        )}
-                      </div>
-                    </div>
-                  );
+                  return cellEntries.length > 0
+                    ? cellEntries.map((entry) => (
+                      <MealChip key={entry.id} entry={entry} slot={slot} onClick={() => openEdit(entry)} />
+                    ))
+                    : <EmptySlotChip key={slot.key} slot={slot} onClick={() => openAdd(dateISO, slot.key)} />;
                 })}
               </div>
             </div>

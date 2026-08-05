@@ -30,12 +30,28 @@ export function applyTheme(theme) {
 }
 
 export function setTheme(theme) {
+  if (theme === 'system') {
+    try {
+      localStorage.removeItem(STORAGE_KEY);
+    } catch {
+      // Storage may be unavailable; still apply for the session.
+    }
+    applyTheme(resolveTheme());
+    return;
+  }
+
   try {
     localStorage.setItem(STORAGE_KEY, theme);
   } catch {
     // Storage may be unavailable; still apply for the session.
   }
   applyTheme(theme);
+}
+
+/** 'system' | 'light' | 'dark', matching what setTheme accepts. */
+export function getThemePreference() {
+  const stored = getStoredTheme();
+  return stored === 'light' || stored === 'dark' ? stored : 'system';
 }
 
 export function initTheme() {

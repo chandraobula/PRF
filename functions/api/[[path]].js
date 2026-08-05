@@ -117,6 +117,18 @@ export async function onRequest(context) {
       return await handleAdminRoute({ db: env.DB, request, url, route: route.slice(1), user: auth });
     }
 
+    if (route[0] === 'profile') {
+      return await handleProfileRoute({ db: env.DB, request, route: route.slice(1), user: auth });
+    }
+
+    if (route[0] === 'preferences') {
+      return await handlePreferencesRoute({ db: env.DB, request, route: route.slice(1), user: auth });
+    }
+
+    if (route[0] === 'integrations') {
+      return await handleIntegrationsRoute({ db: env.DB, request, route: route.slice(1), user: auth });
+    }
+
     if (route[0] === 'planner') {
       return await handlePlannerRoute({ db: env.DB, request, url, route: route.slice(1), user: auth, env });
     }
@@ -844,9 +856,14 @@ async function ensureUser(db, user) {
         month_start_day,
         dashboard_widgets_json
       )
-      VALUES (?, 'USD', 'INR', '["USD","INR"]', 'YYYY-MM-DD', 1, '["cash_flow","budgets","goals","insights","recent_transactions"]')
+      VALUES (?, 'INR', 'USD', '["INR","USD"]', 'YYYY-MM-DD', 1, '["cash_flow","budgets","goals","insights","recent_transactions"]')
     `,
     )
+    .bind(user.userId)
+    .run();
+
+  await db
+    .prepare('INSERT OR IGNORE INTO user_preferences (user_id) VALUES (?)')
     .bind(user.userId)
     .run();
 
@@ -894,6 +911,271 @@ async function ensureCategory(db, userId, category, type) {
     )
     .bind(idForUser(id, userId), userId, name, type, color, icon, sortOrder)
     .run();
+}
+
+// ---------------------------------------------------------------------------
+// Account settings — profile, preferences, integrations
+// ---------------------------------------------------------------------------
+
+const SETTINGS_THEMES = new Set(['system', 'light', 'dark']);
+const SETTINGS_TEXT_SIZES = new Set(['small', 'medium', 'large']);
+
+const INTEGRATION_CATALOG = [
+  { service: 'github', name: 'GitHub', description: 'Sync repositories and issues' },
+  { service: 'google_calendar', name: 'Google Calendar', description: 'Sync events and meetings' },
+  { service: 'slack', name: 'Slack', description: 'Send notifications to channels' },
+  { service: 'trello', name: 'Trello', description: 'Sync boards and cards' },
+  { service: 'gmail', name: 'Gmail', description: 'Read and send emails' },
+  { service: 'aws', name: 'AWS', description: 'Monitor infrastructure' },
+];
+
+async function handleProfileRoute({ db, request, route, user }) {
+  if (route.length) {
+    throw new HttpError(404, 'Not found');
+  }
+
+  if (request.method === 'GET') {
+    return sendJson({ profile: await getAccountProfile(db, user.userId) });
+  }
+
+  if (request.method === 'PATCH') {
+    const payload = await readJson(request);
+    return sendJson({ profile: await updateAccountProfile(db, user.userId, payload) });
+  }
+
+  if (request.method === 'DELETE') {
+    await deleteOwnAccount(db, user.userId);
+    return sendJson({ ok: true }, 200, { 'set-cookie': expiredSessionCookie(request) });
+  }
+
+  throw new HttpError(405, 'Method not allowed');
+}
+
+async function getAccountProfile(db, userId) {
+  const row = await db
+    .prepare('SELECT id, email, display_name, role, created_at FROM users WHERE id = ?')
+    .bind(userId)
+    .first();
+
+  if (!row) {
+    throw new HttpError(404, 'User not found.');
+  }
+
+  return {
+    id: row.id,
+    email: row.email,
+    displayName: row.display_name || '',
+    role: row.role,
+    createdAt: row.created_at,
+  };
+}
+
+async function updateAccountProfile(db, userId, payload) {
+  const updates = [];
+  const values = [];
+
+  if (payload.displayName !== undefined) {
+    const displayName = String(payload.displayName).trim().slice(0, 120);
+    if (!displayName) {
+      throw new HttpError(400, 'Name cannot be empty.');
+    }
+    updates.push('display_name = ?');
+    values.push(displayName);
+  }
+
+  let nextEmail;
+  if (payload.email !== undefined) {
+    nextEmail = normalizeEmail(payload.email);
+
+    const existing = await db
+      .prepare('SELECT id FROM users WHERE LOWER(email) = LOWER(?) AND id != ? LIMIT 1')
+      .bind(nextEmail, userId)
+      .first();
+
+    if (existing) {
+      throw new HttpError(409, 'That email is already in use.');
+    }
+
+    updates.push('email = ?');
+    values.push(nextEmail);
+  }
+
+  if (updates.length) {
+    await db
+      .prepare(`UPDATE users SET ${updates.join(', ')}, updated_at = CURRENT_TIMESTAMP WHERE id = ?`)
+      .bind(...values, userId)
+      .run();
+
+    if (nextEmail) {
+      await db.prepare('UPDATE auth_credentials SET email = ? WHERE user_id = ?').bind(nextEmail, userId).run();
+    }
+  }
+
+  return getAccountProfile(db, userId);
+}
+
+async function deleteOwnAccount(db, userId) {
+  const row = await db.prepare('SELECT role FROM users WHERE id = ?').bind(userId).first();
+
+  if (!row) {
+    throw new HttpError(404, 'User not found.');
+  }
+
+  if (row.role === 'owner') {
+    throw new HttpError(403, 'The owner account cannot be deleted. Transfer ownership first.');
+  }
+
+  // The ON DELETE CASCADE in the schema handles everything else once the
+  // user row goes; sessions are removed explicitly so the request's own
+  // cookie is unambiguously dead even if cascade timing differed.
+  await db.prepare('DELETE FROM auth_sessions WHERE user_id = ?').bind(userId).run();
+  await db.prepare('DELETE FROM auth_credentials WHERE user_id = ?').bind(userId).run();
+  await db.prepare('DELETE FROM users WHERE id = ?').bind(userId).run();
+}
+
+async function handlePreferencesRoute({ db, request, route, user }) {
+  if (route.length) {
+    throw new HttpError(404, 'Not found');
+  }
+
+  if (request.method === 'GET') {
+    return sendJson({ preferences: await getUserPreferences(db, user.userId) });
+  }
+
+  if (request.method === 'PATCH') {
+    const payload = await readJson(request);
+    return sendJson({ preferences: await updateUserPreferences(db, user.userId, payload) });
+  }
+
+  throw new HttpError(405, 'Method not allowed');
+}
+
+async function getUserPreferences(db, userId) {
+  const row = await db.prepare('SELECT * FROM user_preferences WHERE user_id = ?').bind(userId).first();
+
+  if (!row) {
+    // A signed-in user should already have a row via ensureUser, but fall
+    // back to defaults rather than 404 in case ensureUser hasn't run yet.
+    await db.prepare('INSERT OR IGNORE INTO user_preferences (user_id) VALUES (?)').bind(userId).run();
+    return getUserPreferences(db, userId);
+  }
+
+  return mapUserPreferences(row);
+}
+
+function mapUserPreferences(row) {
+  return {
+    theme: row.theme,
+    reduceMotion: Boolean(row.reduce_motion),
+    textSize: row.text_size,
+    language: row.language,
+    region: row.region,
+    timezone: row.timezone,
+    currency: row.currency,
+    notifyDailyBriefing: Boolean(row.notify_daily_briefing),
+    notifyBills: Boolean(row.notify_bills),
+    notifyFocusSessions: Boolean(row.notify_focus_sessions),
+  };
+}
+
+async function updateUserPreferences(db, userId, payload) {
+  const columns = {
+    theme: payload.theme === undefined ? undefined : validateEnum(payload.theme, SETTINGS_THEMES, 'theme'),
+    reduce_motion: payload.reduceMotion === undefined ? undefined : (payload.reduceMotion ? 1 : 0),
+    text_size: payload.textSize === undefined ? undefined : validateEnum(payload.textSize, SETTINGS_TEXT_SIZES, 'textSize'),
+    language: payload.language === undefined ? undefined : String(payload.language).trim().slice(0, 40),
+    region: payload.region === undefined ? undefined : String(payload.region).trim().slice(0, 60),
+    timezone: payload.timezone === undefined ? undefined : String(payload.timezone).trim().slice(0, 60),
+    currency: payload.currency === undefined ? undefined : normalizeCurrency(payload.currency),
+    notify_daily_briefing: payload.notifyDailyBriefing === undefined ? undefined : (payload.notifyDailyBriefing ? 1 : 0),
+    notify_bills: payload.notifyBills === undefined ? undefined : (payload.notifyBills ? 1 : 0),
+    notify_focus_sessions: payload.notifyFocusSessions === undefined ? undefined : (payload.notifyFocusSessions ? 1 : 0),
+  };
+
+  const updates = Object.entries(columns).filter(([, value]) => value !== undefined);
+
+  if (updates.length) {
+    await db
+      .prepare('INSERT OR IGNORE INTO user_preferences (user_id) VALUES (?)')
+      .bind(userId)
+      .run();
+
+    await db
+      .prepare(
+        `UPDATE user_preferences SET ${updates.map(([key]) => `${key} = ?`).join(', ')}, updated_at = CURRENT_TIMESTAMP WHERE user_id = ?`,
+      )
+      .bind(...updates.map(([, value]) => value), userId)
+      .run();
+  }
+
+  return getUserPreferences(db, userId);
+}
+
+function validateEnum(value, allowed, label) {
+  if (!allowed.has(value)) {
+    throw new HttpError(400, `Invalid ${label}.`);
+  }
+  return value;
+}
+
+async function handleIntegrationsRoute({ db, request, route, user }) {
+  const [service] = route;
+
+  if (!service && request.method === 'GET') {
+    return sendJson({ integrations: await listUserIntegrations(db, user.userId) });
+  }
+
+  if (service && request.method === 'PATCH') {
+    const payload = await readJson(request);
+    return sendJson({ integration: await updateUserIntegration(db, user.userId, service, payload) });
+  }
+
+  throw new HttpError(404, 'Not found');
+}
+
+async function listUserIntegrations(db, userId) {
+  const result = await db
+    .prepare('SELECT service, status, connected_at FROM user_integrations WHERE user_id = ?')
+    .bind(userId)
+    .all();
+
+  const stored = new Map((result.results || []).map((row) => [row.service, row]));
+
+  return INTEGRATION_CATALOG.map((entry) => {
+    const row = stored.get(entry.service);
+    return {
+      ...entry,
+      status: row?.status || 'disconnected',
+      connectedAt: row?.connected_at || null,
+    };
+  });
+}
+
+async function updateUserIntegration(db, userId, service, payload) {
+  const catalogEntry = INTEGRATION_CATALOG.find((entry) => entry.service === service);
+
+  if (!catalogEntry) {
+    throw new HttpError(404, 'Unknown service.');
+  }
+
+  const status = payload.status === 'connected' ? 'connected' : 'disconnected';
+  const connectedAt = status === 'connected' ? new Date().toISOString() : null;
+
+  await db
+    .prepare(
+      `
+      INSERT INTO user_integrations (user_id, service, status, connected_at, updated_at)
+      VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+      ON CONFLICT (user_id, service) DO UPDATE SET
+        status = excluded.status,
+        connected_at = excluded.connected_at,
+        updated_at = CURRENT_TIMESTAMP
+    `,
+    )
+    .bind(userId, service, status, connectedAt)
+    .run();
+
+  return { ...catalogEntry, status, connectedAt };
 }
 
 async function getFinanceSummary(db, userId, url) {
@@ -967,9 +1249,9 @@ async function getProfile(db, userId) {
 
   return {
     userId,
-    currency: row?.currency || 'USD',
-    secondaryCurrency: row?.secondary_currency || 'INR',
-    enabledCurrencies: parseJson(row?.enabled_currencies_json, ['USD', 'INR']),
+    currency: row?.currency || 'INR',
+    secondaryCurrency: row?.secondary_currency || 'USD',
+    enabledCurrencies: parseJson(row?.enabled_currencies_json, ['INR', 'USD']),
     dateFormat: row?.date_format || 'YYYY-MM-DD',
     monthStartDay: row?.month_start_day || 1,
     dashboardWidgets: parseJson(row?.dashboard_widgets_json, []),
@@ -1094,7 +1376,7 @@ async function createTransaction(db, userId, payload) {
   const id = payload.id || crypto.randomUUID();
   const type = normalizeTransactionType(payload.type);
   const amountMinor = normalizeMoney(payload.amountMinor, payload.amount);
-  const currency = normalizeCurrency(payload.currency || 'USD');
+  const currency = normalizeCurrency(payload.currency || 'INR');
   const occurredOn = normalizeDate(payload.occurredOn || payload.date || today());
   const categoryId = await resolveCategoryId(db, userId, type, payload.categoryId, payload.category);
   const accountId = payload.accountId || (await defaultAccountId(db, userId, currency));
@@ -1274,7 +1556,7 @@ async function listCategories(db, userId) {
 
 async function listBudgets(db, userId, url, selectedCurrency) {
   const asOf = url.searchParams.get('asOf') || today();
-  const currency = normalizeCurrency(selectedCurrency || url.searchParams.get('currency') || 'USD');
+  const currency = normalizeCurrency(selectedCurrency || url.searchParams.get('currency') || 'INR');
   const { start, nextStart } = monthBounds(asOf);
 
   const result = await db
@@ -1343,7 +1625,7 @@ async function createBudget(db, userId, payload) {
       payload.period || 'monthly',
       normalizeDate(payload.periodStart || start),
       normalizeDate(payload.periodEnd || addDays(nextStart, -1)),
-      normalizeCurrency(payload.currency || 'USD'),
+      normalizeCurrency(payload.currency || 'INR'),
       normalizeMoney(payload.limitMinor, payload.limit),
       normalizeMoney(payload.carryForwardMinor, payload.carryForward ?? 0),
       payload.alertThresholdPercent || 80,
@@ -1501,7 +1783,7 @@ async function createGoal(db, userId, payload) {
       payload.goalType || 'custom',
       normalizeMoney(payload.targetAmountMinor, payload.targetAmount),
       normalizeMoney(payload.savedAmountMinor, payload.savedAmount ?? 0),
-      normalizeCurrency(payload.currency || 'USD'),
+      normalizeCurrency(payload.currency || 'INR'),
       payload.targetDate ? normalizeDate(payload.targetDate) : null,
       payload.priority || 3,
       payload.recommendation || null,
@@ -1745,7 +2027,7 @@ const TREND_MONTHS = 6;
 
 async function getFinanceAnalytics(db, userId, url) {
   const asOf = url.searchParams.get('asOf') || today();
-  const currency = normalizeCurrency(url.searchParams.get('currency') || 'USD');
+  const currency = normalizeCurrency(url.searchParams.get('currency') || 'INR');
   const { start, nextStart, previousStart } = monthBounds(asOf);
 
   const [trend, current, previous, topMerchants, largest, weekday, recurring, incomeBreakdown] = await Promise.all([
@@ -2133,7 +2415,7 @@ async function importTransactions(db, userId, payload) {
     throw new HttpError(413, `Too many rows — import at most ${IMPORT_MAX_ROWS} at a time.`);
   }
 
-  const currency = normalizeCurrency(payload.currency || 'USD');
+  const currency = normalizeCurrency(payload.currency || 'INR');
   const skipDuplicates = payload.skipDuplicates !== false;
 
   // One read of the existing keys beats a per-row SELECT inside the loop.
@@ -2205,7 +2487,7 @@ async function importTransactions(db, userId, payload) {
 
 async function buildMonthlyReport(db, userId, url) {
   const asOf = url.searchParams.get('asOf') || today();
-  const currency = normalizeCurrency(url.searchParams.get('currency') || 'USD');
+  const currency = normalizeCurrency(url.searchParams.get('currency') || 'INR');
   const { start, nextStart } = monthBounds(asOf);
   const cashflow = await monthlyCashflow(db, userId, start, nextStart, currency);
   const categorySpend = await spendingByCategory(db, userId, start, nextStart, currency);
@@ -2332,7 +2614,7 @@ async function createLiability(db, userId, payload) {
       requiredText(payload.name, 'Loan name is required.'),
       payload.provider || payload.lender || null,
       normalizeLiabilityType(payload.liabilityType || payload.type || 'loan'),
-      normalizeCurrency(payload.currency || 'USD'),
+      normalizeCurrency(payload.currency || 'INR'),
       originalAmountMinor,
       paidAmountMinor,
       Number(payload.aprPercent ?? payload.interestRate ?? payload.apy ?? 0),
@@ -2838,7 +3120,7 @@ async function scanDocument(env, payload) {
     '',
     '2) "receipt": the bill/spend summary when the file is a receipt, invoice, or bill (otherwise leave fields empty/0).',
     'receipt.merchant (store or biller name), receipt.total (the grand total paid, a number),',
-    'receipt.currency (ISO code like USD, INR; default USD), receipt.date (YYYY-MM-DD of the transaction),',
+    'receipt.currency (ISO code like INR, USD; default INR), receipt.date (YYYY-MM-DD of the transaction),',
     `receipt.category (best expense category, one of: ${EXPENSE_SCAN_CATEGORIES.join(', ')}),`,
     'and receipt.lineItems (array of { description, amount } for each charge line).',
     'If there is no bill/total in the file, set receipt.total to 0 and leave merchant empty.',
@@ -3047,7 +3329,7 @@ function normalizeScanReceipt(raw) {
   return {
     merchant,
     totalMinor,
-    currency: normalizeCurrency(raw.currency || 'USD'),
+    currency: normalizeCurrency(raw.currency || 'INR'),
     date: normalizeScanDate(raw.date),
     category: normalizeScanExpenseCategory(raw.category),
     lineItems,
@@ -3767,7 +4049,7 @@ async function resolveCategoryId(db, userId, type, categoryId, categoryName) {
   return row?.id || null;
 }
 
-async function defaultAccountId(db, userId, currency = 'USD') {
+async function defaultAccountId(db, userId, currency = 'INR') {
   const row = await db
     .prepare(
       `
@@ -3856,7 +4138,7 @@ function mapTransaction(row) {
     status: row.status,
     occurredOn: row.occurred_on,
     amountMinor: Number(row.amount_minor || 0),
-    currency: row.currency || 'USD',
+    currency: row.currency || 'INR',
     merchant: row.merchant,
     payee: row.payee,
     paymentMethod: row.payment_method,
@@ -3917,7 +4199,7 @@ function mapBudget(row, asOf = today()) {
     period: row.period,
     periodStart: row.period_start,
     periodEnd: row.period_end,
-    currency: row.currency || 'USD',
+    currency: row.currency || 'INR',
     limitMinor,
     spentMinor,
     carryForwardMinor,
@@ -3984,7 +4266,7 @@ function mapGoal(row, asOf = today()) {
     targetAmountMinor,
     savedAmountMinor,
     remainingMinor,
-    currency: row.currency || 'USD',
+    currency: row.currency || 'INR',
     targetDate: row.target_date,
     priority: Number(row.priority || 3),
     status: row.status,
@@ -4024,7 +4306,7 @@ function mapLiability(row) {
     name: row.name,
     provider: row.provider,
     liabilityType: row.liability_type,
-    currency: row.currency || 'USD',
+    currency: row.currency || 'INR',
     originalAmountMinor,
     principalAmountMinor: originalAmountMinor,
     paidAmountMinor,
@@ -4823,7 +5105,7 @@ async function createSubscription(db, userId, payload) {
       payload.category || 'Other',
       amountMinor,
       moneyOrNull(payload.previousAmount),
-      normalizeCurrency(payload.currency || 'USD'),
+      normalizeCurrency(payload.currency || 'INR'),
       normalizeEnum(payload.cadence || 'monthly', ['weekly', 'monthly', 'quarterly', 'yearly', 'custom'], 'Invalid cadence.'),
       dateOrNull(payload.nextRenewalOn),
       Number.isFinite(Number(payload.reminderDaysBefore)) ? Math.max(0, Math.round(Number(payload.reminderDaysBefore))) : 3,
@@ -4905,7 +5187,7 @@ async function detectSubscriptions(db, userId) {
       amountMinor: latest.amountMinor,
       previousAmountMinor: increaseMinor > 0 ? firstAmount : null,
       increaseMinor,
-      currency: group.currency || 'USD',
+      currency: group.currency || 'INR',
       cadence,
       occurrences: group.charges.length,
       lastDate: latest.date,
@@ -5528,7 +5810,7 @@ function normalizeEnum(value, allowed, message) {
 }
 
 function normalizeCurrency(currency) {
-  const normalized = String(currency || 'USD').trim().toUpperCase();
+  const normalized = String(currency || 'INR').trim().toUpperCase();
 
   if (!['USD', 'INR'].includes(normalized)) {
     throw new HttpError(400, 'Currency must be USD or INR.');

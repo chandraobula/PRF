@@ -21,7 +21,7 @@ const emptyLoan = {
   nextPaymentOn: '',
 };
 
-export default function InterestTracker({ currency = 'USD' }) {
+export default function InterestTracker({ currency = 'INR' }) {
   const [liabilities, setLiabilities] = useState([]);
   const [form, setForm] = useState(emptyLoan);
   const [editingId, setEditingId] = useState('');

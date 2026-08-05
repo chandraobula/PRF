@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useMemo, useState } from 'react';
 import { Check, Copy } from 'lucide-react';
 
 // ---------------------------------------------------------------------------
@@ -7,8 +7,12 @@ import { Check, Copy } from 'lucide-react';
 // ---------------------------------------------------------------------------
 
 export default function ChatMarkdown({ text }) {
-  if (!text) return null;
-  return <div className="chat-prose">{renderBlocks(text)}</div>;
+  // Streaming re-renders the parent on every animation-frame flush; memoizing
+  // on the text itself skips a full re-parse when a render is triggered by
+  // something else (a status chip, a sibling turn) while this text is unchanged.
+  const blocks = useMemo(() => (text ? renderBlocks(text) : null), [text]);
+  if (!blocks) return null;
+  return <div className="chat-prose">{blocks}</div>;
 }
 
 function renderBlocks(text) {

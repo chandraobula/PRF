@@ -74,7 +74,7 @@ export default function FinanceHub() {
   const [apiError, setApiError] = useState('');
   const [query, setQuery] = useState('');
   const [form, setForm] = useState(emptyForm);
-  const [selectedCurrency, setSelectedCurrency] = useState('USD');
+  const [selectedCurrency, setSelectedCurrency] = useState('INR');
   const [asOf, setAsOf] = useState(() => new Date().toISOString().slice(0, 10));
   const [quickAddOpen, setQuickAddOpen] = useState(false);
   const [editingTxId, setEditingTxId] = useState(null);
@@ -160,7 +160,10 @@ export default function FinanceHub() {
   }, [activeTab, selectedCurrency, asOf]);
 
   const currency = finance?.summary?.currency || selectedCurrency;
-  const enabledCurrencies = finance?.profile?.enabledCurrencies || ['USD', 'INR'];
+  // INR always leads regardless of the order stored on the profile, so accounts
+  // created before INR became the default still show it first in the switcher.
+  const enabledCurrencies = [...(finance?.profile?.enabledCurrencies || ['INR', 'USD'])]
+    .sort((a, b) => (a === 'INR' ? -1 : b === 'INR' ? 1 : 0));
   const categories = finance?.categories || [];
   const categoriesForForm = categories.filter((category) => (
     form.type === 'income'

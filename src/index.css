@@ -570,6 +570,10 @@
     @apply block mt-1.5 text-xs leading-5 text-text-muted;
   }
 
+  .settings-select {
+    @apply min-h-10 px-3 pr-8 rounded-lg border border-outline-variant bg-surface-card text-sm font-semibold text-on-surface focus:border-secondary shrink-0;
+  }
+
   .settings-nav-item {
     @apply min-h-12 lg:min-h-[58px] px-3 flex items-center gap-3 rounded-xl text-on-surface-variant hover:bg-surface-container-low transition-colors shrink-0 lg:shrink;
   }
@@ -591,6 +595,27 @@
    and scroll container are handed over to it. */
 .app-content:has(> .ai-chat-shell) {
   @apply p-0 overflow-hidden;
+}
+
+/* Settings > Appearance > Reduce motion. Applied as a root attribute so it
+   takes effect instantly on toggle, not just after a reload. */
+:root[data-reduce-motion="true"] *,
+:root[data-reduce-motion="true"] *::before,
+:root[data-reduce-motion="true"] *::after {
+  animation-duration: 0.001ms !important;
+  animation-iteration-count: 1 !important;
+  transition-duration: 0.001ms !important;
+  scroll-behavior: auto !important;
+}
+
+/* Settings > Appearance > Text size. Scales the rem baseline, which most of
+   the app's spacing and type already derive from. */
+:root[data-text-size="small"] {
+  font-size: 14px;
+}
+
+:root[data-text-size="large"] {
+  font-size: 18px;
 }
 
 @keyframes sheet-in {

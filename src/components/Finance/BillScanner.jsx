@@ -30,7 +30,7 @@ const emptyBill = {
   sizeBytes: null,
 };
 
-export default function BillScanner({ currency = 'USD', expenseCategories = [], onImported }) {
+export default function BillScanner({ currency = 'INR', expenseCategories = [], onImported }) {
   const [bills, setBills] = useState([]);
   const [form, setForm] = useState(emptyBill);
   const [editingId, setEditingId] = useState('');

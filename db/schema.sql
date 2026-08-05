@@ -32,9 +32,9 @@ CREATE TABLE IF NOT EXISTS auth_sessions (
 
 CREATE TABLE IF NOT EXISTS finance_profiles (
   user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
-  currency TEXT NOT NULL DEFAULT 'USD',
-  secondary_currency TEXT NOT NULL DEFAULT 'INR',
-  enabled_currencies_json TEXT NOT NULL DEFAULT '["USD","INR"]',
+  currency TEXT NOT NULL DEFAULT 'INR',
+  secondary_currency TEXT NOT NULL DEFAULT 'USD',
+  enabled_currencies_json TEXT NOT NULL DEFAULT '["INR","USD"]',
   date_format TEXT NOT NULL DEFAULT 'YYYY-MM-DD',
   month_start_day INTEGER NOT NULL DEFAULT 1 CHECK (month_start_day BETWEEN 1 AND 28),
   default_account_id TEXT,
@@ -64,7 +64,7 @@ CREATE TABLE IF NOT EXISTS finance_accounts (
   user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   name TEXT NOT NULL,
   type TEXT NOT NULL CHECK (type IN ('cash', 'bank', 'credit_card', 'wallet', 'loan', 'investment', 'other')),
-  currency TEXT NOT NULL DEFAULT 'USD',
+  currency TEXT NOT NULL DEFAULT 'INR',
   opening_balance_minor INTEGER NOT NULL DEFAULT 0,
   current_balance_minor INTEGER NOT NULL DEFAULT 0,
   institution TEXT,
@@ -121,7 +121,7 @@ CREATE TABLE IF NOT EXISTS finance_transactions (
   status TEXT NOT NULL DEFAULT 'posted' CHECK (status IN ('posted', 'pending', 'deleted')),
   occurred_on TEXT NOT NULL,
   amount_minor INTEGER NOT NULL CHECK (amount_minor >= 0),
-  currency TEXT NOT NULL DEFAULT 'USD',
+  currency TEXT NOT NULL DEFAULT 'INR',
   merchant TEXT,
   payee TEXT,
   payment_method TEXT,
@@ -150,7 +150,7 @@ CREATE TABLE IF NOT EXISTS finance_budgets (
   period TEXT NOT NULL CHECK (period IN ('weekly', 'monthly', 'yearly', 'custom')),
   period_start TEXT NOT NULL,
   period_end TEXT NOT NULL,
-  currency TEXT NOT NULL DEFAULT 'USD',
+  currency TEXT NOT NULL DEFAULT 'INR',
   limit_minor INTEGER NOT NULL CHECK (limit_minor >= 0),
   carry_forward_minor INTEGER NOT NULL DEFAULT 0,
   alert_threshold_percent INTEGER NOT NULL DEFAULT 80,
@@ -175,7 +175,7 @@ CREATE TABLE IF NOT EXISTS finance_goals (
   goal_type TEXT NOT NULL CHECK (goal_type IN ('emergency_fund', 'vacation', 'vehicle', 'house', 'education', 'wedding', 'gadget', 'custom')),
   target_amount_minor INTEGER NOT NULL CHECK (target_amount_minor >= 0),
   saved_amount_minor INTEGER NOT NULL DEFAULT 0 CHECK (saved_amount_minor >= 0),
-  currency TEXT NOT NULL DEFAULT 'USD',
+  currency TEXT NOT NULL DEFAULT 'INR',
   target_date TEXT,
   priority INTEGER NOT NULL DEFAULT 3 CHECK (priority BETWEEN 1 AND 5),
   status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'paused', 'completed', 'archived')),
@@ -261,7 +261,7 @@ CREATE TABLE IF NOT EXISTS finance_liabilities (
   name TEXT NOT NULL,
   provider TEXT,
   liability_type TEXT NOT NULL CHECK (liability_type IN ('loan', 'credit_card', 'emi', 'mortgage', 'other')),
-  currency TEXT NOT NULL DEFAULT 'USD',
+  currency TEXT NOT NULL DEFAULT 'INR',
   original_amount_minor INTEGER NOT NULL CHECK (original_amount_minor >= 0),
   paid_amount_minor INTEGER NOT NULL DEFAULT 0 CHECK (paid_amount_minor >= 0),
   apr_percent REAL NOT NULL DEFAULT 0,
@@ -375,7 +375,7 @@ CREATE TABLE IF NOT EXISTS subscriptions (
   category TEXT NOT NULL DEFAULT 'Other',
   amount_minor INTEGER NOT NULL DEFAULT 0 CHECK (amount_minor >= 0),
   previous_amount_minor INTEGER,
-  currency TEXT NOT NULL DEFAULT 'USD',
+  currency TEXT NOT NULL DEFAULT 'INR',
   cadence TEXT NOT NULL DEFAULT 'monthly' CHECK (cadence IN ('weekly', 'monthly', 'quarterly', 'yearly', 'custom')),
   next_renewal_on TEXT,
   reminder_days_before INTEGER NOT NULL DEFAULT 3,
@@ -646,3 +646,30 @@ CREATE TABLE IF NOT EXISTS sticky_notes (
 
 CREATE INDEX IF NOT EXISTS idx_sticky_notes_user_board
   ON sticky_notes (user_id, board, status, sort_order);
+
+-- Settings page (notifications, appearance, language & region) and Connect
+-- Services page. Mirrors db/migrations/010_user_settings.sql so a fresh
+-- setup and an existing database end up with the same tables.
+CREATE TABLE IF NOT EXISTS user_preferences (
+  user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+  theme TEXT NOT NULL DEFAULT 'system' CHECK (theme IN ('system', 'light', 'dark')),
+  reduce_motion INTEGER NOT NULL DEFAULT 0,
+  text_size TEXT NOT NULL DEFAULT 'medium' CHECK (text_size IN ('small', 'medium', 'large')),
+  language TEXT NOT NULL DEFAULT 'en',
+  region TEXT NOT NULL DEFAULT 'IN',
+  timezone TEXT NOT NULL DEFAULT 'Asia/Kolkata',
+  currency TEXT NOT NULL DEFAULT 'INR',
+  notify_daily_briefing INTEGER NOT NULL DEFAULT 1,
+  notify_bills INTEGER NOT NULL DEFAULT 1,
+  notify_focus_sessions INTEGER NOT NULL DEFAULT 0,
+  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS user_integrations (
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  service TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'disconnected' CHECK (status IN ('connected', 'disconnected')),
+  connected_at TEXT,
+  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (user_id, service)
+);

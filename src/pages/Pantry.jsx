@@ -64,7 +64,7 @@ export default function Pantry() {
   const [scanItems, setScanItems] = useState(null);
   const [scanReceipt, setScanReceipt] = useState(null);
   const [logExpense, setLogExpense] = useState(false);
-  const [expenseForm, setExpenseForm] = useState({ merchant: '', amount: '', category: 'Food', date: '', currency: 'USD' });
+  const [expenseForm, setExpenseForm] = useState({ merchant: '', amount: '', category: 'Food', date: '', currency: 'INR' });
   const [savingScan, setSavingScan] = useState(false);
   const scanInputRef = useRef(null);
 
@@ -274,7 +274,7 @@ export default function Pantry() {
           amount: String(receipt.totalMinor / 100),
           category: receipt.category || 'Food',
           date: receipt.date || new Date().toISOString().slice(0, 10),
-          currency: receipt.currency || 'USD',
+          currency: receipt.currency || 'INR',
         });
       } else {
         setLogExpense(false);
@@ -325,7 +325,7 @@ export default function Pantry() {
         await addFinanceReceipt({
           merchant: expenseForm.merchant || 'Groceries',
           amount: Number(expenseForm.amount),
-          currency: expenseForm.currency || 'USD',
+          currency: expenseForm.currency || 'INR',
           category: expenseForm.category || 'Food',
           occurredOn: expenseForm.date || new Date().toISOString().slice(0, 10),
           paymentMethod: 'card',

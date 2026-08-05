@@ -26,6 +26,7 @@ MIGRATIONS=(
   "db/migrations/007_sticky_notes.sql"
   "db/migrations/008_sticky_notes_font.sql"
   "db/migrations/009_onboarding_flag.sql"
+  "db/migrations/010_user_settings.sql"
 )
 
 for migration in "${MIGRATIONS[@]}"; do

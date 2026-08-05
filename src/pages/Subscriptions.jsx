@@ -10,7 +10,7 @@ import {
   updateSubscription,
 } from '../services/subscriptionsApi';
 
-const emptySub = { name: '', provider: '', category: 'Streaming', amount: '', currency: 'USD', cadence: 'monthly', nextRenewalOn: '', notes: '' };
+const emptySub = { name: '', provider: '', category: 'Streaming', amount: '', currency: 'INR', cadence: 'monthly', nextRenewalOn: '', notes: '' };
 const CADENCES = ['weekly', 'monthly', 'quarterly', 'yearly'];
 const cadenceLabel = { weekly: '/wk', monthly: '/mo', quarterly: '/qtr', yearly: '/yr', custom: '' };
 
@@ -45,7 +45,7 @@ export default function Subscriptions() {
     setEditingId(sub.id);
     setForm({
       name: sub.name || '', provider: sub.provider || '', category: sub.category || 'Other',
-      amount: String(sub.amountMinor / 100), currency: sub.currency || 'USD', cadence: sub.cadence || 'monthly',
+      amount: String(sub.amountMinor / 100), currency: sub.currency || 'INR', cadence: sub.cadence || 'monthly',
       nextRenewalOn: sub.nextRenewalOn || '', notes: sub.notes || '',
     });
     setError('');
@@ -122,8 +122,8 @@ export default function Subscriptions() {
       {error && <div className="rounded-xl bg-error/10 px-4 py-3 text-sm font-semibold text-error">{error}</div>}
 
       <section className="grid grid-cols-3 gap-3">
-        <StatCard label="Monthly" value={summary ? formatMoney(summary.monthlyEstimateMinor, 'USD') : '—'} />
-        <StatCard label="Yearly" value={summary ? formatMoney(summary.yearlyEstimateMinor, 'USD') : '—'} />
+        <StatCard label="Monthly" value={summary ? formatMoney(summary.monthlyEstimateMinor, 'INR') : '—'} />
+        <StatCard label="Yearly" value={summary ? formatMoney(summary.yearlyEstimateMinor, 'INR') : '—'} />
         <StatCard label="Active" value={summary ? String(summary.activeCount) : '—'} />
       </section>
 

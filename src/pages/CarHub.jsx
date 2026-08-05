@@ -213,9 +213,9 @@ export default function CarHub() {
                     {summary.ownership.currentValueMinor != null && (
                       <div className="text-right">
                         <p className="text-xs text-text-muted">Current value</p>
-                        <p className="font-display text-xl font-bold text-on-surface">{formatMoney(summary.ownership.currentValueMinor, 'USD')}</p>
+                        <p className="font-display text-xl font-bold text-on-surface">{formatMoney(summary.ownership.currentValueMinor, 'INR')}</p>
                         {summary.ownership.purchasePriceMinor != null && (
-                          <p className="text-xs text-text-muted">of {formatMoney(summary.ownership.purchasePriceMinor, 'USD')} paid</p>
+                          <p className="text-xs text-text-muted">of {formatMoney(summary.ownership.purchasePriceMinor, 'INR')} paid</p>
                         )}
                       </div>
                     )}

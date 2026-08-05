@@ -59,7 +59,7 @@ export default function Dashboard() {
   const name = currentUser?.displayName?.split(' ')[0] || 'there';
 
   const financeSummary = finance?.summary || {};
-  const currency = financeSummary.currency || 'USD';
+  const currency = financeSummary.currency || 'INR';
   const recentTx = finance?.recentTransactions || [];
   const vehicles = car?.vehicles || [];
   const activeVehicle = vehicles.find(v => v.id === car?.activeVehicle?.id) || car?.activeVehicle || vehicles[0];

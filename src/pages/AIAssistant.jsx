@@ -114,6 +114,28 @@ export default function AIAssistant() {
       )));
     };
 
+    // Tokens can arrive far faster than the display refreshes. Buffering them
+    // and committing at most once per animation frame keeps the number of
+    // full-message re-renders (and ChatMarkdown re-parses) tied to frame rate
+    // instead of token rate, which is what actually made streaming feel janky.
+    let pendingContent = '';
+    let rafId = null;
+
+    const flushContent = () => {
+      rafId = null;
+      if (!pendingContent) return;
+      const toApply = pendingContent;
+      pendingContent = '';
+      patchAssistant((message) => ({ content: message.content + toApply, status: '' }));
+    };
+
+    const queueContent = (chunk) => {
+      pendingContent += chunk;
+      if (rafId == null) {
+        rafId = requestAnimationFrame(flushContent);
+      }
+    };
+
     const controller = new AbortController();
     abortRef.current = controller;
 
@@ -122,14 +144,24 @@ export default function AIAssistant() {
 
       await streamChatMessage(payload, {
         signal: controller.signal,
-        onContent: (chunk) => patchAssistant((message) => ({
-          content: message.content + chunk,
-          status: '',
-        })),
-        onStatus: (message, tools) => patchAssistant(() => ({ status: message, tools })),
-        onReset: () => patchAssistant(() => ({ content: '' })),
+        onContent: queueContent,
+        onStatus: (message, tools) => {
+          // A status chip means this round has no content pending yet — flush
+          // immediately so it isn't held behind the next animation frame.
+          flushContent();
+          patchAssistant(() => ({ status: message, tools }));
+        },
+        onReset: () => {
+          pendingContent = '';
+          if (rafId != null) {
+            cancelAnimationFrame(rafId);
+            rafId = null;
+          }
+          patchAssistant(() => ({ content: '' }));
+        },
       });
     } catch (streamError) {
+      flushContent();
       if (streamError.name === 'AbortError') {
         patchAssistant((message) => ({ status: '', stopped: !message.content }));
       } else {
@@ -137,6 +169,11 @@ export default function AIAssistant() {
         patchAssistant(() => ({ status: '', failed: true }));
       }
     } finally {
+      flushContent();
+      if (rafId != null) {
+        cancelAnimationFrame(rafId);
+        rafId = null;
+      }
       abortRef.current = null;
       setIsStreaming(false);
     }

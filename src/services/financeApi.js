@@ -2,14 +2,14 @@ import { notifyUnauthorized } from '../lib/session';
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || '/api';
 
-export async function getFinanceDashboard(currency = 'USD', asOf) {
+export async function getFinanceDashboard(currency = 'INR', asOf) {
   const params = new URLSearchParams({ currency });
   if (asOf) params.set('asOf', asOf);
   const data = await apiRequest(`/finance/summary?${params.toString()}`);
   return { ...data, isLive: true };
 }
 
-export async function getFinanceTransactions({ currency = 'USD', startDate, endDate, limit = 500 } = {}) {
+export async function getFinanceTransactions({ currency = 'INR', startDate, endDate, limit = 500 } = {}) {
   const params = new URLSearchParams({ currency, limit: String(limit) });
   if (startDate) params.set('startDate', startDate);
   if (endDate) params.set('endDate', endDate);
@@ -41,7 +41,7 @@ export async function deleteFinanceTransaction(id) {
   });
 }
 
-export async function getFinanceReceipts(currency = 'USD') {
+export async function getFinanceReceipts(currency = 'INR') {
   return apiRequest(`/finance/receipts?currency=${encodeURIComponent(currency)}`);
 }
 
@@ -72,7 +72,7 @@ export async function deleteFinanceReceipt(id) {
   });
 }
 
-export async function getFinanceLiabilities(currency = 'USD') {
+export async function getFinanceLiabilities(currency = 'INR') {
   return apiRequest(`/finance/liabilities?currency=${encodeURIComponent(currency)}`);
 }
 
@@ -156,24 +156,24 @@ export async function contributeToFinanceGoal(id, { amount, direction = 'deposit
   return response.goal;
 }
 
-export async function getFinanceAnalytics(currency = 'USD', asOf) {
+export async function getFinanceAnalytics(currency = 'INR', asOf) {
   const params = new URLSearchParams({ currency });
   if (asOf) params.set('asOf', asOf);
   return apiRequest(`/finance/analytics?${params.toString()}`);
 }
 
-export async function importFinanceTransactions({ transactions, currency = 'USD', skipDuplicates = true }) {
+export async function importFinanceTransactions({ transactions, currency = 'INR', skipDuplicates = true }) {
   return apiRequest('/finance/import', {
     method: 'POST',
     body: JSON.stringify({ transactions, currency, skipDuplicates }),
   });
 }
 
-export function financeExportUrl(currency = 'USD') {
+export function financeExportUrl(currency = 'INR') {
   return `${API_BASE_URL}/finance/export.csv?currency=${encodeURIComponent(currency)}`;
 }
 
-export function formatMoney(amountMinor = 0, currency = 'USD') {
+export function formatMoney(amountMinor = 0, currency = 'INR') {
   return new Intl.NumberFormat(undefined, {
     style: 'currency',
     currency,
@@ -181,7 +181,7 @@ export function formatMoney(amountMinor = 0, currency = 'USD') {
   }).format(amountMinor / 100);
 }
 
-export function formatMoneyCompact(amountMinor = 0, currency = 'USD') {
+export function formatMoneyCompact(amountMinor = 0, currency = 'INR') {
   const amount = amountMinor / 100;
 
   // Compact notation only earns its keep above a thousand. Below that it just

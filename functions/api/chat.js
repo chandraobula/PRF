@@ -17,11 +17,18 @@ const MAX_TOOL_ROUNDS = 6;
 // Models are tried in order. The first one that accepts the request wins, so a
 // model being retired, rate-limited or out of credit degrades instead of 500ing.
 // Every entry must support OpenRouter tool calling (`supported_parameters: tools`).
+// Ordered by active-parameter count (the main driver of time-to-first-token on
+// OpenRouter's shared free pool) so the common case answers fast, with larger
+// models as a quality fallback: gpt-oss-20b (3.6B active) and nemotron-nano-9b
+// (9B, both full tool+structured-output support) first, nemotron-3-super
+// (12B active) for tougher multi-tool questions, ling-3.0-flash as a last,
+// large-context resort. Re-check openrouter.ai/api/v1/models periodically —
+// free-tier slugs and their capabilities change without notice.
 const DEFAULT_MODELS = [
+  'openai/gpt-oss-20b:free',
+  'nvidia/nemotron-nano-9b-v2:free',
   'nvidia/nemotron-3-super-120b-a12b:free',
   'inclusionai/ling-3.0-flash:free',
-  'openai/gpt-oss-20b:free',
-  'nvidia/nemotron-3-nano-30b-a3b:free',
 ];
 
 // Status codes worth retrying on the next model in the chain.
@@ -521,9 +528,15 @@ async function callOpenRouter({ apiKey, models, messages, toolChoice, referer })
           'X-Title': 'Life OS',
         },
         body: JSON.stringify(payload),
+        // Free-tier models occasionally stall with no response at all. Bound
+        // just the time-to-first-byte so a hung model fails over to the next
+        // one in the chain instead of leaving the user staring at nothing.
+        signal: AbortSignal.timeout(15000),
       });
     } catch (networkError) {
-      lastError = new Error(`Could not reach OpenRouter (${networkError.message}).`);
+      lastError = networkError.name === 'TimeoutError' || networkError.name === 'AbortError'
+        ? new Error(`${model} did not respond in time.`)
+        : new Error(`Could not reach OpenRouter (${networkError.message}).`);
       continue;
     }
 
