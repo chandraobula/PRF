@@ -10,6 +10,7 @@ import {
   CircleDollarSign,
   Download,
   FileBarChart2,
+  Landmark,
   LayoutDashboard,
   Lightbulb,
   ListFilter,
@@ -34,6 +35,7 @@ import InterestTracker from '../components/Finance/InterestTracker';
 import ImportTransactions from '../components/Finance/ImportTransactions';
 import BudgetsPanel from '../components/Finance/BudgetsPanel';
 import GoalsPanel from '../components/Finance/GoalsPanel';
+import AccountsPanel from '../components/Finance/AccountsPanel';
 import { CashflowTrend, CategoryMovers, MerchantBars, PaceMeter } from '../components/Finance/Charts';
 import {
   addFinanceTransaction,
@@ -55,9 +57,31 @@ const emptyForm = {
   categoryId: '',
   paymentMethod: 'card',
   notes: '',
+  accountId: '',
+  toAccountId: '',
+  savingsTo: '',
+  savingsToCustom: '',
 };
 
 const MONTH_LABEL = new Intl.DateTimeFormat(undefined, { month: 'long', year: 'numeric' });
+
+/** A savings contribution is a transfer into an investment-type pot. */
+const isSavingsRow = (row) => row.type === 'transfer' && row.toAccountType === 'investment';
+
+/**
+ * How a transaction moves spendable cash. Income adds, spending and saving
+ * subtract — but a move between two everyday accounts nets to zero, since
+ * "Total balance" already sums them together.
+ */
+function liquidEffect(transaction) {
+  if (transaction.type === 'income' || transaction.type === 'refund') {
+    return transaction.amountMinor;
+  }
+  if (transaction.type === 'transfer') {
+    return isSavingsRow(transaction) ? -transaction.amountMinor : 0;
+  }
+  return -transaction.amountMinor;
+}
 
 const shiftMonth = (iso, delta) => {
   const date = new Date(`${iso}T00:00:00`);
@@ -124,10 +148,7 @@ export default function FinanceHub() {
         let balance = finance.summary.balanceMinor || 0;
         const rows = tx.map((transaction) => {
           const row = { ...transaction, balanceAfterMinor: balance };
-          const effect = (transaction.type === 'income' || transaction.type === 'refund')
-            ? transaction.amountMinor
-            : -transaction.amountMinor;
-          balance -= effect;
+          balance -= liquidEffect(transaction);
           return row;
         });
         if (active) setLedgerRows(rows);
@@ -176,6 +197,7 @@ export default function FinanceHub() {
     { id: 'insights', label: 'Insights', icon: TrendingUp },
     { id: 'transactions', label: 'Transactions', icon: ReceiptText },
     { id: 'scanner', label: 'Bills', icon: Camera },
+    { id: 'accounts', label: 'Accounts', icon: Landmark },
     { id: 'budgets', label: 'Budgets', icon: PieChart },
     { id: 'goals', label: 'Goals', icon: Target },
     { id: 'liabilities', label: 'Loans', icon: CircleDollarSign },
@@ -188,7 +210,18 @@ export default function FinanceHub() {
   const handleSubmit = async (event) => {
     event.preventDefault();
 
-    if (!form.amount || !form.merchant) {
+    if (!form.amount) return;
+
+    const savingsPot = form.type === 'transfer'
+      ? (form.savingsTo === CUSTOM_POT ? form.savingsToCustom.trim() : form.savingsTo)
+      : '';
+
+    if (form.type === 'transfer') {
+      if (!savingsPot) {
+        setApiError('Choose where you are saving this money.');
+        return;
+      }
+    } else if (!form.merchant) {
       return;
     }
 
@@ -198,21 +231,22 @@ export default function FinanceHub() {
     setApiError('');
 
     try {
+      const payload = {
+        ...form,
+        amount: Number(form.amount),
+        currency,
+        category: category?.name,
+        // The pot's name doubles as the ledger label, so a savings row reads
+        // "SIP / Mutual fund" rather than a generic "Transfer".
+        ...(form.type === 'transfer'
+          ? { savingsTo: savingsPot, merchant: savingsPot }
+          : { merchant: form.merchant }),
+      };
+
       if (editingTxId) {
-        await updateFinanceTransaction(editingTxId, {
-          ...form,
-          amount: Number(form.amount),
-          currency,
-          category: category?.name,
-        });
+        await updateFinanceTransaction(editingTxId, payload);
       } else {
-        await addFinanceTransaction({
-          ...form,
-          amount: Number(form.amount),
-          currency,
-          category: category?.name,
-          source: 'manual',
-        });
+        await addFinanceTransaction({ ...payload, source: 'manual' });
       }
       setForm({
         ...emptyForm,
@@ -241,6 +275,10 @@ export default function FinanceHub() {
       categoryId: category?.id || '',
       paymentMethod: row.paymentMethod || 'card',
       notes: row.notes || '',
+      accountId: row.accountId || '',
+      toAccountId: row.toAccountId || '',
+      savingsTo: row.toAccountName || '',
+      savingsToCustom: '',
     });
     setQuickAddOpen(true);
   };
@@ -293,6 +331,14 @@ export default function FinanceHub() {
           <GoalsPanel
             goals={finance.goals || []}
             habits={finance.habits || []}
+            currency={currency}
+            onChanged={loadFinance}
+          />
+        );
+      case 'accounts':
+        return (
+          <AccountsPanel
+            accounts={finance.accounts || []}
             currency={currency}
             onChanged={loadFinance}
           />
@@ -409,6 +455,9 @@ export default function FinanceHub() {
           title={editingTxId ? 'Edit transaction' : 'Add transaction'}
           form={form}
           categoriesForForm={categoriesForForm}
+          accounts={finance?.accounts || []}
+          savingsVehicles={finance?.savingsVehicles || []}
+          currency={currency}
           isSaving={isSaving}
           onFormChange={setForm}
           onSubmit={handleSubmit}
@@ -435,7 +484,29 @@ function SummaryStat({ label, value, tone }) {
   );
 }
 
-function QuickAddModal({ title = 'Add transaction', form, categoriesForForm, isSaving, onFormChange, onSubmit, onClose }) {
+const CUSTOM_POT = '__custom__';
+
+function QuickAddModal({ title = 'Add transaction', form, categoriesForForm, accounts = [], savingsVehicles = [], currency, isSaving, onFormChange, onSubmit, onClose }) {
+  // Internally a savings contribution is a transfer into a savings pot, but the
+  // user only ever sees "Savings" — amount, date, and where it went.
+  const isSavings = form.type === 'transfer';
+  const fromAccount = accounts.find((account) => account.id === form.accountId) || null;
+  // Money can only move between accounts holding the same currency (there is no
+  // exchange-rate conversion), so pots are scoped to the source's currency.
+  const activeCurrency = fromAccount?.currency || currency;
+  // Scoped to the currency on screen, so the common case has a single obvious
+  // source account and the field below disappears entirely.
+  const spendingAccounts = accounts.filter((account) => (
+    account.type !== 'investment' && account.currency === activeCurrency
+  ));
+  const existingPots = accounts
+    .filter((account) => account.type === 'investment' && (!activeCurrency || account.currency === activeCurrency))
+    .map((account) => account.name);
+  const presetPots = savingsVehicles.filter((name) => (
+    !existingPots.some((pot) => pot.toLowerCase() === name.toLowerCase())
+  ));
+  const usingCustomPot = form.savingsTo === CUSTOM_POT;
+
   return (
     <div className="fixed inset-0 z-50 flex items-end justify-center sm:items-center" role="dialog" aria-modal="true" aria-label={title}>
       <button className="absolute inset-0 bg-black/40 backdrop-blur-[2px]" onClick={onClose} aria-label="Close" />
@@ -445,23 +516,91 @@ function QuickAddModal({ title = 'Add transaction', form, categoriesForForm, isS
           <button type="button" onClick={onClose} className="icon-button bg-surface-container-low" aria-label="Close"><X className="h-5 w-5" /></button>
         </header>
         <form className="min-h-0 flex-1 space-y-4 overflow-y-auto p-5" onSubmit={onSubmit}>
-          <div className="grid grid-cols-3 gap-2 rounded-xl bg-surface-container-low p-1">
-            {['expense', 'income', 'refund'].map((type) => (
-              <button key={type} type="button" onClick={() => onFormChange({ ...form, type, categoryId: '' })} className={cn('min-h-10 rounded-lg text-xs font-bold capitalize', form.type === type ? 'bg-surface-card shadow-sm text-on-surface' : 'text-on-surface-variant')}>{type}</button>
+          <div className="grid grid-cols-4 gap-2 rounded-xl bg-surface-container-low p-1">
+            {[
+              { id: 'expense', label: 'Expense' },
+              { id: 'income', label: 'Income' },
+              { id: 'refund', label: 'Refund' },
+              { id: 'transfer', label: 'Savings' },
+            ].map(({ id, label }) => (
+              <button key={id} type="button" onClick={() => onFormChange({ ...form, type: id, categoryId: '' })} className={cn('min-h-10 rounded-lg text-xs font-bold', form.type === id ? 'bg-surface-card shadow-sm text-on-surface' : 'text-on-surface-variant')}>{label}</button>
             ))}
           </div>
-          <label className="settings-field"><span>Merchant or source</span><input value={form.merchant} onChange={(event) => onFormChange({ ...form, merchant: event.target.value })} placeholder="Whole Foods, salary" autoFocus /></label>
+
+          {isSavings ? (
+            <p className="rounded-xl bg-surface-container-lowest px-3.5 py-3 text-[13px] leading-5 text-text-muted">
+              Money you're setting aside out of your income — SIP, FD, gold, insurance, chit fund. Counted as
+              savings, never as spending.
+            </p>
+          ) : (
+            <label className="settings-field"><span>Merchant or source</span><input value={form.merchant} onChange={(event) => onFormChange({ ...form, merchant: event.target.value })} placeholder="Whole Foods, salary" autoFocus /></label>
+          )}
+
           <div className="grid grid-cols-2 gap-3">
             <label className="settings-field"><span>Amount</span><input inputMode="decimal" min="0" step="0.01" type="number" value={form.amount} onChange={(event) => onFormChange({ ...form, amount: event.target.value })} placeholder="0.00" /></label>
             <label className="settings-field"><span>Date</span><input type="date" value={form.occurredOn} onChange={(event) => onFormChange({ ...form, occurredOn: event.target.value })} /></label>
           </div>
-          <label className="settings-field">
-            <span>Category</span>
-            <select className="w-full min-h-12 px-3.5 rounded-xl border border-outline-variant bg-surface-card text-[15px]" value={form.categoryId} onChange={(event) => onFormChange({ ...form, categoryId: event.target.value })}>
-              <option value="">Uncategorized</option>
-              {categoriesForForm.map((category) => <option key={category.id} value={category.id}>{category.name}</option>)}
-            </select>
-          </label>
+
+          {isSavings ? (
+            <div className="space-y-3">
+              <label className="settings-field">
+                <span>Where are you saving it?</span>
+                <select
+                  className="w-full min-h-12 px-3.5 rounded-xl border border-outline-variant bg-surface-card text-[15px]"
+                  value={form.savingsTo}
+                  onChange={(event) => onFormChange({ ...form, savingsTo: event.target.value, savingsToCustom: '' })}
+                >
+                  <option value="">Choose where</option>
+                  {existingPots.length > 0 && (
+                    <optgroup label="Your savings">
+                      {existingPots.map((name) => <option key={name} value={name}>{name}</option>)}
+                    </optgroup>
+                  )}
+                  {presetPots.length > 0 && (
+                    <optgroup label={existingPots.length > 0 ? 'Start something new' : 'Savings options'}>
+                      {presetPots.map((name) => <option key={name} value={name}>{name}</option>)}
+                    </optgroup>
+                  )}
+                  <option value={CUSTOM_POT}>Something else…</option>
+                </select>
+              </label>
+
+              {usingCustomPot && (
+                <label className="settings-field">
+                  <span>Name it</span>
+                  <input
+                    value={form.savingsToCustom}
+                    onChange={(event) => onFormChange({ ...form, savingsToCustom: event.target.value })}
+                    placeholder="LIC Jeevan Anand, Nifty 50 index fund"
+                  />
+                </label>
+              )}
+
+              {/* Only worth asking which account it came out of when there's a real choice. */}
+              {spendingAccounts.length > 1 && (
+                <label className="settings-field">
+                  <span>Paid from</span>
+                  <select
+                    className="w-full min-h-12 px-3.5 rounded-xl border border-outline-variant bg-surface-card text-[15px]"
+                    value={form.accountId}
+                    onChange={(event) => onFormChange({ ...form, accountId: event.target.value, savingsTo: '', savingsToCustom: '' })}
+                  >
+                    <option value="">Default account</option>
+                    {spendingAccounts.map((account) => <option key={account.id} value={account.id}>{account.name}</option>)}
+                  </select>
+                </label>
+              )}
+            </div>
+          ) : (
+            <label className="settings-field">
+              <span>Category</span>
+              <select className="w-full min-h-12 px-3.5 rounded-xl border border-outline-variant bg-surface-card text-[15px]" value={form.categoryId} onChange={(event) => onFormChange({ ...form, categoryId: event.target.value })}>
+                <option value="">Uncategorized</option>
+                {categoriesForForm.map((category) => <option key={category.id} value={category.id}>{category.name}</option>)}
+              </select>
+            </label>
+          )}
+
           <label className="settings-field"><span>Notes</span><input value={form.notes} onChange={(event) => onFormChange({ ...form, notes: event.target.value })} placeholder="Optional" /></label>
           <div className="flex gap-2 pt-1">
             <button type="button" onClick={onClose} className="min-h-12 flex-1 rounded-xl border border-border-subtle text-sm font-bold">Cancel</button>
@@ -501,15 +640,82 @@ function OverviewPanel({ finance, currency }) {
   const { summary } = finance;
   const primaryInsight = finance.insights?.[0];
   const topGoal = finance.goals?.[0];
+  const incomeMinor = summary.incomeMinor || 0;
+  const savedMinor = summary.savedMinor || 0;
+  const idleMinor = summary.idleMinor ?? 0;
+  // Save first, spend later: show what was set aside before what was spent,
+  // and keep the unspent-but-unsaved remainder honest rather than calling it
+  // savings.
+  const allocationBase = Math.max(incomeMinor, summary.expenseMinor + savedMinor, 1);
+  const savedPercent = Math.min(100, (savedMinor / allocationBase) * 100);
+  const spentPercent = Math.min(100 - savedPercent, (summary.expenseMinor / allocationBase) * 100);
 
   return (
     <div className="space-y-6 animate-in fade-in slide-in-from-bottom-4 duration-500">
+      {finance.netWorth && (
+        <section className="app-card overflow-hidden">
+          <div className="flex flex-col gap-4 p-5 sm:flex-row sm:items-center sm:justify-between sm:p-6">
+            <div>
+              <p className="text-xs font-bold uppercase tracking-wide text-text-muted">Net worth</p>
+              <p className="mt-1 font-display text-3xl font-bold text-on-surface">{formatMoney(finance.netWorth.netWorthMinor, currency)}</p>
+              <p className="mt-1 text-sm text-text-muted">Everything you own — including what's invested — minus what you owe</p>
+            </div>
+            <div className="flex gap-6">
+              <div>
+                <p className="text-xs font-semibold text-text-muted">Assets</p>
+                <p className="mt-0.5 font-bold tabular-nums text-success-proactive">{formatMoney(finance.netWorth.assetsMinor, currency)}</p>
+              </div>
+              <div>
+                <p className="text-xs font-semibold text-text-muted">Liabilities</p>
+                <p className="mt-0.5 font-bold tabular-nums text-error">{formatMoney(finance.netWorth.liabilitiesMinor, currency)}</p>
+              </div>
+            </div>
+          </div>
+        </section>
+      )}
+
+      {incomeMinor > 0 && (
+        <section className="app-card p-5 sm:p-6">
+          <div className="flex items-center justify-between gap-4 mb-4">
+            <div>
+              <h2 className="section-title">Where this month's income went</h2>
+              <p className="text-sm text-text-muted">What you set aside, what you spent, and what's still sitting idle</p>
+            </div>
+            <span className="shrink-0 text-xs font-bold tabular-nums text-text-muted">{formatMoney(incomeMinor, currency)} in</span>
+          </div>
+          <div className="flex h-2.5 overflow-hidden rounded-full bg-surface-container-low">
+            <div className="bg-blue-600 dark:bg-blue-400" style={{ width: `${savedPercent}%` }} />
+            <div className="bg-error" style={{ width: `${spentPercent}%` }} />
+          </div>
+          <div className="mt-4 grid grid-cols-3 gap-3">
+            <div>
+              <p className="text-xs font-semibold text-text-muted">Saved</p>
+              <p className="mt-0.5 font-bold tabular-nums text-blue-600 dark:text-blue-400">{formatMoney(savedMinor, currency)}</p>
+            </div>
+            <div>
+              <p className="text-xs font-semibold text-text-muted">Spent</p>
+              <p className="mt-0.5 font-bold tabular-nums text-error">{formatMoney(summary.expenseMinor, currency)}</p>
+            </div>
+            <div>
+              <p className="text-xs font-semibold text-text-muted">Still idle</p>
+              <p className={cn('mt-0.5 font-bold tabular-nums', idleMinor < 0 ? 'text-error' : 'text-on-surface')}>{formatMoney(idleMinor, currency)}</p>
+            </div>
+          </div>
+          {savedMinor === 0 && (
+            <p className="mt-4 text-[13px] leading-5 text-text-muted">
+              Nothing set aside yet this month. Add a transaction, pick <strong className="text-on-surface">Savings</strong>,
+              and choose where it goes — it won't be counted as spending.
+            </p>
+          )}
+        </section>
+      )}
+
       <section className="grid grid-cols-1 gap-gutter md:grid-cols-4">
         <MetricCard
           icon={WalletCards}
           label="Total balance"
           value={formatMoney(summary.balanceMinor, currency)}
-          caption={`${summary.savingsRate}% savings rate`}
+          caption={`${summary.savingsRate}% of income saved`}
           tone="blue"
         />
         <MetricCard
@@ -876,9 +1082,9 @@ function LedgerPanel({ currency, rows, loading, query, setQuery, onEdit, onDelet
                 <tr key={row.id} className="hover:bg-surface-container-lowest">
                   <td className="p-3 pl-6 whitespace-nowrap tabular-nums text-text-muted">{row.occurredOn}</td>
                   <td className="p-3 font-semibold text-on-surface">{row.merchant || row.payee || 'Transaction'}</td>
-                  <td className="p-3 text-text-muted">{row.categoryName || 'Uncategorized'}</td>
+                  <td className="p-3 text-text-muted">{isSavingsRow(row) ? 'Savings' : (row.categoryName || 'Uncategorized')}</td>
                   <td className="p-3 text-right tabular-nums font-semibold text-success-proactive">{isCredit(row.type) ? formatMoney(row.amountMinor, row.currency || currency) : ''}</td>
-                  <td className="p-3 text-right tabular-nums font-semibold text-error">{isCredit(row.type) ? '' : formatMoney(row.amountMinor, row.currency || currency)}</td>
+                  <td className={cn('p-3 text-right tabular-nums font-semibold', isSavingsRow(row) ? 'text-blue-600 dark:text-blue-400' : 'text-error')}>{isCredit(row.type) ? '' : formatMoney(row.amountMinor, row.currency || currency)}</td>
                   <td className="p-3 pr-6 text-right tabular-nums font-bold text-on-surface">{formatMoney(row.balanceAfterMinor, currency)}</td>
                   <td className="p-3 pr-6">
                     <div className="flex items-center justify-center gap-2">
@@ -902,10 +1108,10 @@ function LedgerPanel({ currency, rows, loading, query, setQuery, onEdit, onDelet
             <div key={row.id} className="flex items-center justify-between gap-3 px-4 py-3">
               <div className="min-w-0">
                 <p className="font-semibold text-on-surface truncate">{row.merchant || row.payee || 'Transaction'}</p>
-                <p className="text-xs text-text-muted">{row.occurredOn} · {row.categoryName || 'Uncategorized'}</p>
+                <p className="text-xs text-text-muted">{row.occurredOn} · {isSavingsRow(row) ? 'Savings' : (row.categoryName || 'Uncategorized')}</p>
               </div>
               <div className="text-right shrink-0">
-                <p className={cn('text-sm font-bold tabular-nums', isCredit(row.type) ? 'text-success-proactive' : 'text-error')}>
+                <p className={cn('text-sm font-bold tabular-nums', isCredit(row.type) ? 'text-success-proactive' : isSavingsRow(row) ? 'text-blue-600 dark:text-blue-400' : 'text-error')}>
                   {isCredit(row.type) ? '+' : '-'}{formatMoney(row.amountMinor, row.currency || currency)}
                 </p>
                 <p className="text-xs text-text-muted tabular-nums">Bal {formatMoney(row.balanceAfterMinor, currency)}</p>
@@ -950,7 +1156,7 @@ function ReportsPanel({ finance, currency }) {
           icon={Target}
           label="Savings rate"
           value={`${summary.savingsRate}%`}
-          caption="Income minus expenses"
+          caption={`${formatMoney(summary.savedMinor || 0, currency)} set aside this month`}
           tone="blue"
         />
       </section>

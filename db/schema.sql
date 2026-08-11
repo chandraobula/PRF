@@ -112,6 +112,9 @@ CREATE TABLE IF NOT EXISTS finance_transactions (
   id TEXT PRIMARY KEY,
   user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   account_id TEXT REFERENCES finance_accounts(id) ON DELETE SET NULL,
+  -- Destination account for type='transfer' rows (e.g. bank -> investment).
+  -- Mirrors db/migrations/011_finance_transfers.sql.
+  to_account_id TEXT REFERENCES finance_accounts(id) ON DELETE SET NULL,
   category_id TEXT REFERENCES finance_categories(id) ON DELETE SET NULL,
   receipt_id TEXT REFERENCES finance_receipts(id) ON DELETE SET NULL,
   recurring_rule_id TEXT REFERENCES finance_recurring_rules(id) ON DELETE SET NULL,

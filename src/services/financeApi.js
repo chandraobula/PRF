@@ -17,6 +17,33 @@ export async function getFinanceTransactions({ currency = 'INR', startDate, endD
   return data.transactions || [];
 }
 
+// -- Accounts ------------------------------------------------------------
+
+export async function listFinanceAccounts() {
+  const data = await apiRequest('/finance/accounts');
+  return data.accounts || [];
+}
+
+export async function addFinanceAccount(payload) {
+  const response = await apiRequest('/finance/accounts', {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  });
+  return response.account;
+}
+
+export async function updateFinanceAccount(id, payload) {
+  const response = await apiRequest(`/finance/accounts/${encodeURIComponent(id)}`, {
+    method: 'PATCH',
+    body: JSON.stringify(payload),
+  });
+  return response.account;
+}
+
+export async function deleteFinanceAccount(id) {
+  return apiRequest(`/finance/accounts/${encodeURIComponent(id)}`, { method: 'DELETE' });
+}
+
 export async function addFinanceTransaction(payload) {
   const response = await apiRequest('/finance/transactions', {
     method: 'POST',

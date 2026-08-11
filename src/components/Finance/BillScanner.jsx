@@ -43,6 +43,7 @@ export default function BillScanner({ currency = 'INR', expenseCategories = [], 
   const [statement, setStatement] = useState(null);
   const [statementType, setStatementType] = useState(null); // 'receipt' or 'transaction'
   const [scannedMerchant, setScannedMerchant] = useState(''); // for receipt items context
+  const [billTotalMinor, setBillTotalMinor] = useState(0); // the bill's own printed total, to reconcile against
   const fileInputRef = useRef(null);
   const scanInputRef = useRef(null);
 
@@ -135,40 +136,35 @@ export default function BillScanner({ currency = 'INR', expenseCategories = [], 
         (category) => category.name.toLowerCase() === String(receipt.category || '').toLowerCase(),
       );
 
-      // Extract line items and show them individually if available
-      const lineItems = [];
-      if (items && items.length > 0) {
-        items.forEach((item) => {
-          if (item.name) {
-            const amountMinor = Math.round((item.unitPrice || 0) * 100);
-            if (amountMinor > 0) {
-              lineItems.push({
-                description: `${item.quantity || 1}x ${item.name}`,
-                amountMinor,
-                occurredOn: receipt.date || new Date().toISOString().slice(0, 10),
-                merchant: receipt.merchant || '',
-                category: matchedCategory?.name || receipt.category || expenseCategories[0]?.name || 'Food',
-                direction: 'debit',
-              });
-            }
-          }
-        });
-      } else if (receipt.lineItems && receipt.lineItems.length > 0) {
-        receipt.lineItems.forEach((line) => {
-          if (line.description) {
-            const amountMinor = Math.round((line.amount || 0) * 100);
-            if (amountMinor > 0) {
-              lineItems.push({
-                description: line.description,
-                amountMinor,
-                occurredOn: receipt.date || new Date().toISOString().slice(0, 10),
-                merchant: receipt.merchant || '',
-                category: matchedCategory?.name || receipt.category || expenseCategories[0]?.name || 'Food',
-                direction: 'debit',
-              });
-            }
-          }
-        });
+      const occurredOn = receipt.date || new Date().toISOString().slice(0, 10);
+      const fallbackCategory = matchedCategory?.name || receipt.category || expenseCategories[0]?.name || 'Food';
+      const toRow = (description, amountMinor, category) => ({
+        description,
+        amountMinor,
+        occurredOn,
+        merchant: receipt.merchant || '',
+        category: category || fallbackCategory,
+        direction: 'debit',
+      });
+
+      // The bill's own printed lines come first: they cover every kind of bill
+      // and carry the exact line totals. The grocery `items` list is the
+      // fallback for photos of shopping with no itemised bill behind them.
+      let lineItems = (receipt.lineItems || [])
+        .filter((line) => line.description)
+        .map((line) => toRow(
+          line.quantity > 1 ? `${line.quantity}x ${line.description}` : line.description,
+          line.amountMinor || 0,
+          line.category,
+        ));
+
+      if (lineItems.length === 0) {
+        lineItems = (items || [])
+          .filter((item) => item.name)
+          .map((item) => toRow(
+            item.quantity > 1 ? `${item.quantity}x ${item.name}` : item.name,
+            item.priceMinor || 0,
+          ));
       }
 
       // If we have line items, show them in review screen. Otherwise show the form.
@@ -176,7 +172,8 @@ export default function BillScanner({ currency = 'INR', expenseCategories = [], 
         setStatement(lineItems);
         setStatementType('receipt');
         setScannedMerchant(receipt.merchant || '');
-        setScanNote(`AI found ${lineItems.length} item${lineItems.length === 1 ? '' : 's'} in this receipt. Review and add them individually below.`);
+        setBillTotalMinor(receipt.totalMinor || 0);
+        setScanNote(`Found ${lineItems.length} line${lineItems.length === 1 ? '' : 's'} on this bill. Pick which ones to add.`);
         return;
       }
 
@@ -414,7 +411,8 @@ export default function BillScanner({ currency = 'INR', expenseCategories = [], 
           currency={currency}
           expenseCategories={expenseCategories}
           merchant={scannedMerchant}
-          onClose={() => { setStatement(null); setStatementType(null); setScannedMerchant(''); setScanNote(''); }}
+          billTotalMinor={billTotalMinor}
+          onClose={() => { setStatement(null); setStatementType(null); setScannedMerchant(''); setBillTotalMinor(0); setScanNote(''); }}
           onImported={async () => { await loadBills(); await onImported?.(); }}
         />
       )}

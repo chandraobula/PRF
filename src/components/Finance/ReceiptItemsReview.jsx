@@ -4,15 +4,20 @@ import {
 } from 'lucide-react';
 import { cn } from '../../lib/utils';
 import { Modal } from './BudgetsPanel';
-import { formatMoney, addFinanceReceipt } from '../../services/financeApi';
+import { formatMoney, addFinanceReceipt, addFinanceTransaction } from '../../services/financeApi';
 
 export default function ReceiptItemsReview({
-  items, currency, expenseCategories = [], merchant, onClose, onImported,
+  items, currency, expenseCategories = [], merchant, billTotalMinor = 0, onClose, onImported,
 }) {
   const [rows, setRows] = useState(() => items.map((entry, index) => ({
     ...entry,
     key: `${index}`,
-    included: true,
+    // Kept as text while editing so typing "12.50" doesn't lose the decimal
+    // point on the keystroke where the value is still incomplete.
+    amountText: String((entry.amountMinor || 0) / 100),
+    // Everything the scan managed to price starts included, so the figures add
+    // up to the bill. A line it couldn't price (0.00) starts out excluded.
+    included: entry.amountMinor !== 0,
   })));
   const [isImporting, setIsImporting] = useState(false);
   const [error, setError] = useState('');
@@ -20,6 +25,15 @@ export default function ReceiptItemsReview({
 
   const selected = rows.filter((row) => row.included);
   const totalMinor = useMemo(() => selected.reduce((sum, row) => sum + row.amountMinor, 0), [selected]);
+  const lineSumMinor = useMemo(() => rows.reduce((sum, row) => sum + row.amountMinor, 0), [rows]);
+  // Where the picked lines land against the bill's own printed total, so it is
+  // obvious what is being left out (or that the scan misread a line).
+  const excludedMinor = billTotalMinor > 0 ? billTotalMinor - totalMinor : lineSumMinor - totalMinor;
+  // If *every* line together still doesn't match the printed total, the scan
+  // itself is off — a line was missed, misread or duplicated. Worth flagging,
+  // because a fallback model can be less accurate than the primary one.
+  const scanGapMinor = billTotalMinor > 0 ? lineSumMinor - billTotalMinor : 0;
+  const scanLooksOff = billTotalMinor > 0 && Math.abs(scanGapMinor) > Math.max(100, Math.round(billTotalMinor * 0.01));
 
   const toggle = (key) => setRows((current) => current.map((row) => (
     row.key === key ? { ...row, included: !row.included } : row
@@ -29,6 +43,16 @@ export default function ReceiptItemsReview({
     row.key === key ? { ...row, category } : row
   )));
 
+  const setAmount = (key, value) => setRows((current) => current.map((row) => {
+    if (row.key !== key) return row;
+    const parsed = Number(value);
+    return {
+      ...row,
+      amountText: value,
+      amountMinor: value.trim() && Number.isFinite(parsed) ? Math.round(parsed * 100) : 0,
+    };
+  }));
+
   const toggleAll = (included) => setRows((current) => current.map((row) => ({ ...row, included })));
 
   const remove = (key) => setRows((current) => current.filter((row) => row.key !== key));
@@ -37,42 +61,85 @@ export default function ReceiptItemsReview({
     setIsImporting(true);
     setError('');
 
-    try {
-      const promises = selected.map((row) => addFinanceReceipt({
+    const failures = [];
+    let imported = 0;
+
+    // One at a time so a line the API rejects is named precisely, and the rest
+    // still get added instead of the whole batch failing opaquely.
+    for (const row of selected) {
+      const store = row.merchant || merchant || 'Receipt';
+      const shared = {
         occurredOn: row.occurredOn,
-        merchant: row.merchant || merchant || 'Receipt',
-        amount: row.amountMinor / 100,
+        // The line itself is the description shown in the ledger; the store is
+        // kept as the payee so a bill doesn't become 14 identical-looking rows.
+        merchant: row.description,
+        payee: store,
         category: row.category,
         currency,
-        paymentMethod: 'card',
-        notes: row.description,
+        notes: `From ${store} bill`,
         tags: ['receipt-item'],
-      }));
+      };
 
-      await Promise.all(promises);
-      setResult({ imported: selected.length });
-      onImported?.();
-    } catch (importError) {
-      setError(importError.message || 'Could not add these items.');
-    } finally {
-      setIsImporting(false);
+      try {
+        if (row.amountMinor < 0) {
+          // A discount or savings line is money coming back, not money spent.
+          await addFinanceTransaction({
+            ...shared,
+            type: 'refund',
+            amount: Math.abs(row.amountMinor) / 100,
+            source: 'receipt',
+          });
+        } else {
+          await addFinanceReceipt({ ...shared, amount: row.amountMinor / 100, paymentMethod: 'card' });
+        }
+        imported += 1;
+      } catch (importError) {
+        failures.push(`${row.description}: ${importError.message}`);
+      }
     }
+
+    setIsImporting(false);
+
+    if (imported === 0) {
+      setError(failures[0] || 'Could not add these lines.');
+      return;
+    }
+
+    setResult({ imported, failures });
+  };
+
+  // Refreshing the parent remounts this panel, which would rip the confirmation
+  // (and any list of lines that failed) off the screen before it could be read.
+  // So the reload waits until the dialog is actually being dismissed.
+  const dismiss = () => {
+    if (result?.imported) {
+      onImported?.();
+    }
+    onClose();
   };
 
   if (result) {
     return (
-      <Modal title="Items added" onClose={onClose} maxWidth="max-w-md">
+      <Modal title="Added to your expenses" onClose={dismiss} maxWidth="max-w-md">
         <div className="p-5 text-center">
           <div className="mx-auto mb-4 flex h-14 w-14 items-center justify-center rounded-2xl bg-success-proactive/10 text-success-proactive">
             <CheckCircle2 className="h-7 w-7" />
           </div>
           <h3 className="font-display text-xl font-bold text-on-surface">
-            Added {result.imported} {result.imported === 1 ? 'item' : 'items'}
+            Added {result.imported} {result.imported === 1 ? 'line' : 'lines'}
           </h3>
           <p className="mt-1 text-sm text-text-muted">
-            Each item is now its own entry. You can edit or delete any of them anytime.
+            Each one is now its own expense. You can edit or delete any of them anytime.
           </p>
-          <button type="button" onClick={onClose} className="mt-6 min-h-12 rounded-xl bg-primary px-6 text-sm font-bold text-white">
+          {result.failures?.length > 0 && (
+            <div className="mt-4 rounded-xl border border-warning-maintenance/30 bg-warning-maintenance/10 p-3 text-left text-[13px] leading-5 text-on-surface">
+              <p className="font-bold">{result.failures.length} could not be added:</p>
+              <ul className="mt-1 list-disc space-y-0.5 pl-4 text-text-muted">
+                {result.failures.map((line) => <li key={line}>{line}</li>)}
+              </ul>
+            </div>
+          )}
+          <button type="button" onClick={dismiss} className="mt-6 min-h-12 rounded-xl bg-primary px-6 text-sm font-bold text-white">
             Done
           </button>
         </div>
@@ -81,7 +148,11 @@ export default function ReceiptItemsReview({
   }
 
   return (
-    <Modal title={`${items.length} items found`} onClose={onClose} maxWidth="max-w-3xl">
+    <Modal
+      title={merchant ? `${merchant} — ${items.length} lines` : `${items.length} lines found`}
+      onClose={onClose}
+      maxWidth="max-w-3xl"
+    >
       <div className="min-h-0 flex-1 overflow-y-auto">
         <div className="border-b border-border-subtle p-5">
           <div className="flex items-start gap-3 rounded-xl border border-border-subtle p-3">
@@ -89,30 +160,60 @@ export default function ReceiptItemsReview({
               <ShoppingCart className="h-4 w-4" />
             </span>
             <div>
-              <p className="font-semibold text-on-surface">Each item becomes its own entry</p>
+              <p className="font-semibold text-on-surface">Choose what counts as an expense</p>
               <p className="mt-0.5 text-sm text-text-muted">
-                You can edit, delete, or categorize them individually after adding.
+                Every line from the bill is listed below. Untick anything you don't want recorded, fix an
+                amount the scan misread, and each remaining line is added as its own expense.
               </p>
             </div>
           </div>
         </div>
 
-        <div className="flex items-center justify-between gap-3 border-b border-border-subtle px-5 py-3">
-          <div>
+        <div className="border-b border-border-subtle px-5 py-3">
+          <div className="flex items-center justify-between gap-3">
             <p className="text-[13px] text-text-muted">
-              <strong className="text-on-surface">{selected.length}</strong> of {rows.length} selected
+              <strong className="text-on-surface">{selected.length}</strong> of {rows.length} lines selected
             </p>
-            <p className="text-sm font-bold text-on-surface">{formatMoney(totalMinor, currency)}</p>
+            <div className="flex gap-1">
+              <button type="button" onClick={() => toggleAll(true)} className="min-h-9 rounded-lg px-2.5 text-[12px] font-semibold text-text-muted hover:bg-surface-container-low hover:text-on-surface">
+                Select all
+              </button>
+              <button type="button" onClick={() => toggleAll(false)} className="min-h-9 rounded-lg px-2.5 text-[12px] font-semibold text-text-muted hover:bg-surface-container-low hover:text-on-surface">
+                Clear
+              </button>
+            </div>
           </div>
-          <div className="flex gap-1">
-            <button type="button" onClick={() => toggleAll(true)} className="min-h-9 rounded-lg px-2.5 text-[12px] font-semibold text-text-muted hover:bg-surface-container-low hover:text-on-surface">
-              Select all
-            </button>
-            <button type="button" onClick={() => toggleAll(false)} className="min-h-9 rounded-lg px-2.5 text-[12px] font-semibold text-text-muted hover:bg-surface-container-low hover:text-on-surface">
-              Clear
-            </button>
+
+          <div className="mt-3 grid grid-cols-3 gap-3 rounded-xl bg-surface-container-lowest px-3.5 py-3">
+            <div>
+              <p className="text-[11px] font-bold uppercase tracking-wide text-text-muted">Adding</p>
+              <p className="mt-0.5 text-sm font-bold tabular-nums text-on-surface">{formatMoney(totalMinor, currency)}</p>
+            </div>
+            <div>
+              <p className="text-[11px] font-bold uppercase tracking-wide text-text-muted">Not included</p>
+              <p className="mt-0.5 text-sm font-bold tabular-nums text-text-muted">{formatMoney(excludedMinor, currency)}</p>
+            </div>
+            <div>
+              <p className="text-[11px] font-bold uppercase tracking-wide text-text-muted">
+                {billTotalMinor > 0 ? 'Bill total' : 'All lines'}
+              </p>
+              <p className="mt-0.5 text-sm font-bold tabular-nums text-on-surface">
+                {formatMoney(billTotalMinor > 0 ? billTotalMinor : lineSumMinor, currency)}
+              </p>
+            </div>
           </div>
         </div>
+
+        {scanLooksOff && (
+          <div className="flex items-start gap-2.5 border-b border-border-subtle bg-warning-maintenance/10 px-5 py-3 text-[13px] leading-5">
+            <AlertCircle className="mt-0.5 h-4 w-4 shrink-0 text-warning-maintenance" />
+            <span className="text-on-surface">
+              These lines add up to <strong>{formatMoney(lineSumMinor, currency)}</strong>, but the bill says{' '}
+              <strong>{formatMoney(billTotalMinor, currency)}</strong>. The scan may have missed or misread a
+              line — worth checking the amounts below before adding them.
+            </span>
+          </div>
+        )}
 
         <ul className="divide-y divide-border-subtle border-t border-border-subtle">
           {rows.map((row) => (
@@ -143,9 +244,17 @@ export default function ReceiptItemsReview({
               </div>
 
               <div className="flex shrink-0 flex-col items-end gap-2">
-                <p className="text-[14px] font-bold tabular-nums text-on-surface">
-                  {formatMoney(row.amountMinor, currency)}
-                </p>
+                {/* Editable, because a misread price should be fixable here
+                    rather than forcing the line to be deleted and re-added. */}
+                <input
+                  type="number"
+                  inputMode="decimal"
+                  step="0.01"
+                  value={row.amountText}
+                  onChange={(event) => setAmount(row.key, event.target.value)}
+                  className="min-h-9 w-28 rounded-lg border border-outline-variant bg-surface-card px-2 text-right text-[14px] font-bold tabular-nums text-on-surface"
+                  aria-label={`Amount for ${row.description}`}
+                />
                 <button
                   type="button"
                   onClick={() => remove(row.key)}
@@ -184,7 +293,7 @@ export default function ReceiptItemsReview({
             className="min-h-12 flex-1 inline-flex items-center justify-center gap-2 rounded-xl bg-primary text-sm font-bold text-white disabled:opacity-50"
           >
             {isImporting ? <Loader2 className="h-4 w-4 animate-spin" /> : <ShoppingCart className="h-4 w-4" />}
-            Add {selected.length} item{selected.length === 1 ? '' : 's'}
+            Add {selected.length} line{selected.length === 1 ? '' : 's'}
           </button>
         </div>
       </footer>

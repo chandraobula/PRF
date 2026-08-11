@@ -385,7 +385,28 @@ async function handleFinanceRoute({ db, request, url, route, user, env }) {
 
   if (resource === 'scan' && request.method === 'POST') {
     const payload = await readJson(request);
-    return sendJson(await scanDocument(env, payload));
+    return sendJson(await scanDocument(env, payload, 'bill'));
+  }
+
+  if (resource === 'accounts') {
+    if (!id && request.method === 'GET') {
+      return sendJson({ accounts: await listAccounts(db, user.userId) });
+    }
+
+    if (!id && request.method === 'POST') {
+      const payload = await readJson(request);
+      return sendJson({ account: await createAccount(db, user.userId, payload) }, 201);
+    }
+
+    if (id && request.method === 'PATCH') {
+      const payload = await readJson(request);
+      return sendJson({ account: await updateAccount(db, user.userId, id, payload) });
+    }
+
+    if (id && request.method === 'DELETE') {
+      await archiveAccount(db, user.userId, id);
+      return sendJson({ ok: true });
+    }
   }
 
   if (resource === 'transactions') {
@@ -550,7 +571,7 @@ async function handlePantryRoute({ db, request, route, user, env }) {
 
   if (resource === 'scan' && request.method === 'POST') {
     const payload = await readJson(request);
-    return sendJson(await scanDocument(env, payload));
+    return sendJson(await scanDocument(env, payload, 'pantry'));
   }
 
   if (resource === 'items') {
@@ -1185,7 +1206,10 @@ async function getFinanceSummary(db, userId, url) {
   const selectedCurrency = normalizeCurrency(url.searchParams.get('currency') || profile.currency);
   const cashflow = await monthlyCashflow(db, userId, start, nextStart, selectedCurrency);
   const previousCashflow = await monthlyCashflow(db, userId, previousStart, start, selectedCurrency);
+  const savedMinor = await savedThisPeriod(db, userId, start, nextStart, selectedCurrency);
   const balance = await accountBalance(db, userId, selectedCurrency);
+  const netWorth = await getNetWorth(db, userId, selectedCurrency);
+  const accounts = await listAccounts(db, userId);
   const budgets = await listBudgets(db, userId, url, selectedCurrency);
   const goals = await listGoals(db, userId, selectedCurrency);
   const insights = await listInsights(db, userId);
@@ -1196,9 +1220,13 @@ async function getFinanceSummary(db, userId, url) {
   const categorySpend = await spendingByCategory(db, userId, start, nextStart, selectedCurrency);
 
   const netCashflowMinor = cashflow.incomeMinor - cashflow.expenseMinor;
+  // Savings rate is what share of income was actually set aside, not what
+  // happened to be left over. The unspent-but-unsaved remainder is reported
+  // separately as idle so nothing is hidden.
   const savingsRate = cashflow.incomeMinor > 0
-    ? Math.round((netCashflowMinor / cashflow.incomeMinor) * 1000) / 10
+    ? Math.round((savedMinor / cashflow.incomeMinor) * 1000) / 10
     : 0;
+  const idleMinor = netCashflowMinor - savedMinor;
 
   return {
     profile,
@@ -1211,12 +1239,17 @@ async function getFinanceSummary(db, userId, url) {
       expenseMinor: cashflow.expenseMinor,
       refundMinor: cashflow.refundMinor,
       netCashflowMinor,
+      savedMinor,
+      idleMinor,
       savingsRate,
       previousIncomeMinor: previousCashflow.incomeMinor,
       previousExpenseMinor: previousCashflow.expenseMinor,
       transactionCount: cashflow.transactionCount,
       budgetUsagePercent: budgetUsagePercent(budgets),
     },
+    netWorth,
+    accounts,
+    savingsVehicles: SAVINGS_VEHICLES,
     categorySpend,
     budgets,
     goals,
@@ -1286,13 +1319,46 @@ async function monthlyCashflow(db, userId, start, nextStart, currency) {
   };
 }
 
+/**
+ * What the user actually saved this period — money moved into a savings pot
+ * (SIP, FD, gold, insurance, chit fund...). Saving is an act, not a leftover:
+ * "income minus expenses" counts cash still idling in checking as savings,
+ * which overstates it. This is the amount deliberately set aside.
+ */
+async function savedThisPeriod(db, userId, start, nextStart, currency) {
+  const row = await db
+    .prepare(
+      `
+      SELECT COALESCE(SUM(t.amount_minor), 0) AS total
+      FROM finance_transactions t
+      JOIN finance_accounts a ON a.id = t.to_account_id
+      WHERE t.user_id = ?
+        AND t.type = 'transfer'
+        AND t.status != 'deleted'
+        AND t.occurred_on >= ?
+        AND t.occurred_on < ?
+        AND t.currency = ?
+        AND a.type = 'investment'
+    `,
+    )
+    .bind(userId, start, nextStart, currency)
+    .first();
+
+  return Number(row?.total || 0);
+}
+
+/**
+ * Spendable cash only — excludes investment accounts so "Total balance"
+ * reads as money actually available, not a number inflated by locked-up
+ * SIPs/stocks. Net worth (getNetWorth) is where invested value shows up.
+ */
 async function accountBalance(db, userId, currency) {
   const row = await db
     .prepare(
       `
       SELECT COALESCE(SUM(current_balance_minor), 0) AS balance_minor
       FROM finance_accounts
-      WHERE user_id = ? AND currency = ? AND is_archived = 0
+      WHERE user_id = ? AND currency = ? AND is_archived = 0 AND type != 'investment'
     `,
     )
     .bind(userId, currency)
@@ -1356,10 +1422,13 @@ async function listTransactions(db, userId, url, defaultLimit = 50) {
         c.name AS category_name,
         c.color AS category_color,
         a.name AS account_name,
+        ta.name AS to_account_name,
+        ta.type AS to_account_type,
         r.file_name AS receipt_file_name
       FROM finance_transactions t
       LEFT JOIN finance_categories c ON c.id = t.category_id
       LEFT JOIN finance_accounts a ON a.id = t.account_id
+      LEFT JOIN finance_accounts ta ON ta.id = t.to_account_id
       LEFT JOIN finance_receipts r ON r.id = t.receipt_id
       WHERE ${where.join(' AND ')}
       ORDER BY t.occurred_on DESC, t.created_at DESC
@@ -1372,15 +1441,72 @@ async function listTransactions(db, userId, url, defaultLimit = 50) {
   return (result.results || []).map(mapTransaction);
 }
 
+/**
+ * Validates a transfer's destination account: must exist, belong to the user, differ from
+ * the source, and share the source's currency — a transfer moves an amount as-is with no
+ * exchange-rate conversion, so INR <-> USD would silently move the wrong value otherwise.
+ */
+async function resolveTransferAccount(db, userId, toAccountId, accountId, currency) {
+  if (!toAccountId) {
+    throw new HttpError(400, 'A transfer needs a destination account.');
+  }
+
+  if (toAccountId === accountId) {
+    throw new HttpError(400, 'Transfer source and destination accounts must be different.');
+  }
+
+  const account = await getAccount(db, userId, toAccountId);
+
+  if (!account || account.isArchived) {
+    throw new HttpError(400, 'Destination account not found.');
+  }
+
+  if (account.currency !== currency) {
+    throw new HttpError(400, 'Transfers must be between accounts in the same currency.');
+  }
+
+  return toAccountId;
+}
+
 async function createTransaction(db, userId, payload) {
   const id = payload.id || crypto.randomUUID();
   const type = normalizeTransactionType(payload.type);
   const amountMinor = normalizeMoney(payload.amountMinor, payload.amount);
-  const currency = normalizeCurrency(payload.currency || 'INR');
+  let currency = normalizeCurrency(payload.currency || 'INR');
   const occurredOn = normalizeDate(payload.occurredOn || payload.date || today());
-  const categoryId = await resolveCategoryId(db, userId, type, payload.categoryId, payload.category);
-  const accountId = payload.accountId || (await defaultAccountId(db, userId, currency));
+  let accountId = payload.accountId || (await defaultAccountId(db, userId, currency));
+  // Transfers use the system "Transfer" category by default rather than
+  // asking the user to pick one — moving your own money isn't spending.
+  const categoryId = await resolveCategoryId(db, userId, type, payload.categoryId, payload.category || (type === 'transfer' ? 'Transfer' : undefined));
   const receiptId = payload.receiptId || null;
+
+  let toAccountId = null;
+  if (type === 'transfer') {
+    // Saving should never dead-end because the user hasn't set up accounts,
+    // so fall back to creating the everyday account they're saving out of.
+    if (!accountId) {
+      const fallback = await createAccount(db, userId, { name: 'Cash', type: 'cash', currency, openingBalance: 0 });
+      accountId = fallback.id;
+    }
+
+    const sourceAccount = await getAccount(db, userId, accountId);
+    if (!sourceAccount || sourceAccount.isArchived) {
+      throw new HttpError(400, 'Source account not found.');
+    }
+    // The transaction's currency follows the source account, not the page's
+    // currently-viewed currency tab — those are unrelated.
+    currency = sourceAccount.currency;
+    // `savingsTo` is the simple path: name where the money is being saved and
+    // the pot is created on demand. `toAccountId` is the explicit path, used
+    // when moving between two accounts the user already has.
+    toAccountId = payload.savingsTo
+      ? await resolveSavingsAccount(db, userId, payload.savingsTo, currency)
+      : await resolveTransferAccount(db, userId, payload.toAccountId, accountId, currency);
+
+    if (toAccountId === accountId) {
+      throw new HttpError(400, 'Transfer source and destination accounts must be different.');
+    }
+  }
 
   await db
     .prepare(
@@ -1389,6 +1515,7 @@ async function createTransaction(db, userId, payload) {
         id,
         user_id,
         account_id,
+        to_account_id,
         category_id,
         receipt_id,
         type,
@@ -1404,13 +1531,14 @@ async function createTransaction(db, userId, payload) {
         source,
         ai_category_confidence
       )
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `,
     )
     .bind(
       id,
       userId,
       accountId,
+      toAccountId,
       categoryId,
       receiptId,
       type,
@@ -1430,6 +1558,10 @@ async function createTransaction(db, userId, payload) {
 
   await applyAccountDelta(db, accountId, accountDelta(type, amountMinor));
 
+  if (type === 'transfer' && toAccountId) {
+    await applyAccountDelta(db, toAccountId, amountMinor);
+  }
+
   return getTransaction(db, userId, id);
 }
 
@@ -1440,8 +1572,27 @@ async function updateTransaction(db, userId, id, payload) {
     throw new HttpError(404, 'Transaction not found');
   }
 
+  const nextType = payload.type ? normalizeTransactionType(payload.type) : existing.type;
+  let nextToAccountId = null;
+  if (nextType === 'transfer') {
+    nextToAccountId = payload.savingsTo
+      ? await resolveSavingsAccount(db, userId, payload.savingsTo, existing.currency)
+      : await resolveTransferAccount(
+        db,
+        userId,
+        payload.toAccountId !== undefined ? payload.toAccountId : existing.toAccountId,
+        existing.accountId,
+        existing.currency,
+      );
+
+    if (nextToAccountId === existing.accountId) {
+      throw new HttpError(400, 'Transfer source and destination accounts must be different.');
+    }
+  }
+
   const allowed = {
-    type: payload.type ? normalizeTransactionType(payload.type) : undefined,
+    type: payload.type ? nextType : undefined,
+    to_account_id: nextType === 'transfer' ? nextToAccountId : (existing.type === 'transfer' ? null : undefined),
     occurred_on: payload.occurredOn || payload.date ? normalizeDate(payload.occurredOn || payload.date) : undefined,
     amount_minor: payload.amountMinor !== undefined || payload.amount !== undefined
       ? normalizeMoney(payload.amountMinor, payload.amount)
@@ -1482,7 +1633,14 @@ async function updateTransaction(db, userId, id, payload) {
   const updated = await getTransaction(db, userId, id);
 
   await applyAccountDelta(db, existing.accountId, -accountDelta(existing.type, existing.amountMinor));
+  if (existing.type === 'transfer' && existing.toAccountId) {
+    await applyAccountDelta(db, existing.toAccountId, -existing.amountMinor);
+  }
+
   await applyAccountDelta(db, updated.accountId, accountDelta(updated.type, updated.amountMinor));
+  if (updated.type === 'transfer' && updated.toAccountId) {
+    await applyAccountDelta(db, updated.toAccountId, updated.amountMinor);
+  }
 
   return updated;
 }
@@ -1503,6 +1661,9 @@ async function softDeleteTransaction(db, userId, id) {
 
   if (existing) {
     await applyAccountDelta(db, existing.accountId, -accountDelta(existing.type, existing.amountMinor));
+    if (existing.type === 'transfer' && existing.toAccountId) {
+      await applyAccountDelta(db, existing.toAccountId, -existing.amountMinor);
+    }
   }
 }
 
@@ -1515,10 +1676,13 @@ async function getTransaction(db, userId, id) {
         c.name AS category_name,
         c.color AS category_color,
         a.name AS account_name,
+        ta.name AS to_account_name,
+        ta.type AS to_account_type,
         r.file_name AS receipt_file_name
       FROM finance_transactions t
       LEFT JOIN finance_categories c ON c.id = t.category_id
       LEFT JOIN finance_accounts a ON a.id = t.account_id
+      LEFT JOIN finance_accounts ta ON ta.id = t.to_account_id
       LEFT JOIN finance_receipts r ON r.id = t.receipt_id
       WHERE t.id = ? AND t.user_id = ? AND t.status != 'deleted'
     `,
@@ -3075,7 +3239,301 @@ const EXPENSE_SCAN_CATEGORIES = [
   'Miscellaneous',
 ];
 
-async function scanDocument(env, payload) {
+const RECEIPT_SUMMARY_PROPERTIES = {
+  merchant: { type: 'STRING' },
+  total: { type: 'NUMBER' },
+  currency: { type: 'STRING' },
+  date: { type: 'STRING' },
+  category: { type: 'STRING' },
+};
+
+/**
+ * Bill mode: every printed charge line, plus statement detection. Deliberately
+ * does NOT ask for the pantry grocery list — asking one call for both lists made
+ * the model duplicate its work, which blew the output budget on long receipts and
+ * returned nothing at all. One job per call keeps it fast and complete.
+ */
+function billScanRequest() {
+  const categories = EXPENSE_SCAN_CATEGORIES.join(', ');
+
+  return {
+    prompt: [
+      'You are reading an uploaded bill, receipt, invoice, or account statement.',
+      'If it is a multi-page document, read every page.',
+      '',
+      'If it is a single bill, receipt or invoice, fill in "receipt" and leave "transactions" empty.',
+      'receipt.merchant (store or biller name), receipt.total (the grand total as printed),',
+      'receipt.currency (ISO code like INR, USD; default INR), receipt.date (YYYY-MM-DD),',
+      `receipt.category (best overall category, one of: ${categories}),`,
+      'and receipt.lineItems = EVERY charge line printed on the bill, in order, one entry per',
+      'printed line — whatever the bill is for: groceries, a restaurant tab, pharmacy, clothing,',
+      'electronics, fuel, a hotel folio, a utility or telecom bill, a hospital invoice, repairs,',
+      'subscriptions, anything. Do NOT summarise, do NOT merge lines, and NEVER return only the',
+      'total. If the bill prints 20 lines, return 20 line items.',
+      'For each line: description (the item or charge as printed, without the price),',
+      'quantity (units on that line if shown, else 1),',
+      'amount (that line\'s money as printed — the line total, not the unit price),',
+      `and category (best category for that specific line, one of: ${categories}).`,
+      'Include tax, service charge, tip, delivery and similar fee lines as their own line items.',
+      'Include discount or savings lines too, with a negative amount.',
+      'Do NOT include summary rows as line items — no subtotal, gross, grand total, net payable,',
+      'amount due, balance or "items count" rows. Those are totals of the other lines, and',
+      'including them would double-count the bill. The overall figure belongs in receipt.total only.',
+      'The line item amounts should add up to receipt.total.',
+      'If there is no bill or total in the file, set receipt.total to 0 and leave merchant empty.',
+      '',
+      'If instead the file is a PAYMENT-APP or BANK STATEMENT listing many separate payments',
+      '(PhonePe, Google Pay, Paytm, UPI history, a bank passbook or a card statement), leave',
+      '"receipt" empty and return EVERY payment in "transactions". Do NOT total them up.',
+      'For each: date (YYYY-MM-DD, take the year from the statement), description (the counterparty —',
+      'the name after "Paid to" or "Received from"), direction ("debit" when money left the account,',
+      '"credit" when money came in), amount (a positive number, no currency symbol),',
+      `and category (one of: ${categories}) for debits only.`,
+      'Read every page and include transactions from all of them.',
+    ].join(' '),
+    schema: {
+      type: 'OBJECT',
+      properties: {
+        receipt: {
+          type: 'OBJECT',
+          properties: {
+            ...RECEIPT_SUMMARY_PROPERTIES,
+            lineItems: {
+              type: 'ARRAY',
+              items: {
+                type: 'OBJECT',
+                properties: {
+                  description: { type: 'STRING' },
+                  quantity: { type: 'NUMBER' },
+                  amount: { type: 'NUMBER' },
+                  category: { type: 'STRING' },
+                },
+                required: ['description', 'amount'],
+              },
+            },
+          },
+        },
+        transactions: {
+          type: 'ARRAY',
+          items: {
+            type: 'OBJECT',
+            properties: {
+              date: { type: 'STRING' },
+              description: { type: 'STRING' },
+              direction: { type: 'STRING' },
+              amount: { type: 'NUMBER' },
+              category: { type: 'STRING' },
+            },
+            required: ['date', 'description', 'direction', 'amount'],
+          },
+        },
+      },
+    },
+  };
+}
+
+/** Pantry mode: what's in the kitchen, plus enough of a summary to log the spend. */
+function pantryScanRequest() {
+  return {
+    prompt: [
+      'You are a kitchen assistant analyzing an uploaded photo, receipt or PDF.',
+      'If it is a multi-page document, read every page.',
+      '',
+      '"items": every distinct edible or household grocery item visible.',
+      `For each item: name (short, singular), category (one of: ${PANTRY_SCAN_CATEGORIES.join(', ')}),`,
+      'quantity (number, estimate count/packages, default 1),',
+      'unit (one of: item, lb, oz, kg, g, l, ml, dozen, pack, can, bottle, box, bag, bunch),',
+      'and unitPrice (the price for that line if shown, else 0).',
+      'For a plain photo of vegetables with no prices, still list the items with unitPrice 0.',
+      '',
+      '"receipt": if the file is a shop receipt, also give merchant (store name),',
+      'total (the grand total paid), currency (ISO code, default INR), date (YYYY-MM-DD),',
+      `and category (one of: ${EXPENSE_SCAN_CATEGORIES.join(', ')}).`,
+      'If it is just a photo with no bill, set total to 0 and leave merchant empty.',
+    ].join(' '),
+    schema: {
+      type: 'OBJECT',
+      properties: {
+        items: {
+          type: 'ARRAY',
+          items: {
+            type: 'OBJECT',
+            properties: {
+              name: { type: 'STRING' },
+              category: { type: 'STRING' },
+              quantity: { type: 'NUMBER' },
+              unit: { type: 'STRING' },
+              unitPrice: { type: 'NUMBER' },
+            },
+            required: ['name'],
+          },
+        },
+        receipt: { type: 'OBJECT', properties: RECEIPT_SUMMARY_PROPERTIES },
+      },
+    },
+  };
+}
+
+/**
+ * Gemini models used to read bills, in order of preference.
+ *
+ * Pinned deliberately rather than using "gemini-flash-latest": that alias had
+ * drifted onto gemini-3.6-flash, whose free tier allows only 20 requests PER DAY,
+ * so scanning died after a handful of bills. The free quota is metered
+ * per-model, so listing several gives independent daily allowances — when one is
+ * spent the next takes over instead of the user hitting a dead end.
+ *
+ * Measured on real bills (grocery/restaurant/pharmacy/utility): 3.5-flash read
+ * every line of all four with the amounts adding up exactly, in 6-9s. The
+ * flash-lite tiers were far cheaper but returned no line items at all, so they
+ * are deliberately not listed. Re-check with scripts before changing this.
+ */
+const GEMINI_SCAN_MODELS = [
+  'gemini-3.5-flash',
+  'gemini-3-flash-preview',
+  'gemini-flash-latest',
+];
+
+/** Pulls the JSON object out of a model reply, tolerating ```json fences. */
+function parseModelJson(rawText) {
+  const text = String(rawText || '').trim();
+
+  if (!text) {
+    return null;
+  }
+
+  const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/);
+  const candidate = fenced ? fenced[1].trim() : text;
+  const parsed = parseJson(candidate, null);
+
+  return parsed && typeof parsed === 'object' ? parsed : null;
+}
+
+/** Seconds Google says to wait, from the RetryInfo on a 429. */
+function quotaRetrySeconds(detail) {
+  const match = String(detail || '').match(/"retryDelay"\s*:\s*"(\d+(?:\.\d+)?)s"/);
+  return match ? Number(match[1]) : null;
+}
+
+async function readWithGemini(env, { prompt, schema, base64, mimeType, model }) {
+  const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(env.GEMINI_API_KEY)}`;
+
+  const response = await fetch(endpoint, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      contents: [{ parts: [{ text: prompt }, { inline_data: { mime_type: mimeType, data: base64 } }] }],
+      generationConfig: {
+        responseMimeType: 'application/json',
+        // These models reason before answering, and that reasoning is charged
+        // against the output budget. At 8192 a long receipt spent the whole
+        // allowance thinking and returned nothing at all.
+        maxOutputTokens: 65536,
+        responseSchema: schema,
+      },
+    }),
+  });
+
+  if (!response.ok) {
+    const detail = await response.text().catch(() => '');
+    throw new ScanProviderError(
+      `${model} returned ${response.status}`,
+      response.status,
+      detail,
+      response.status === 429 ? quotaRetrySeconds(detail) : null,
+    );
+  }
+
+  const data = await response.json().catch(() => null);
+  const text = (data?.candidates?.[0]?.content?.parts || [])
+    .map((part) => part.text)
+    .filter(Boolean)
+    .join('');
+  const parsed = parseModelJson(text);
+
+  if (!parsed) {
+    const finishReason = data?.candidates?.[0]?.finishReason || 'unknown';
+    const blockReason = data?.promptFeedback?.blockReason;
+    throw new ScanProviderError(
+      `Gemini returned no usable JSON (finish: ${finishReason}${blockReason ? `, blocked: ${blockReason}` : ''})`,
+      finishReason === 'MAX_TOKENS' ? 'MAX_TOKENS' : 502,
+    );
+  }
+
+  return parsed;
+}
+
+class ScanProviderError extends Error {
+  constructor(message, status, detail, retryAfterSeconds = null) {
+    super(message);
+    this.status = status;
+    this.detail = detail;
+    this.retryAfterSeconds = retryAfterSeconds;
+  }
+}
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/**
+ * Reads the file with Gemini, walking the model list until one succeeds.
+ *
+ * Two things stand between a user and the "usage limit" error, and both are
+ * handled here: a short per-minute throttle, which is waited out once using the
+ * delay Google itself returns; and an exhausted per-day allowance, which is
+ * permanent for that model, so the next model's separate allowance is used
+ * instead of making the user wait until tomorrow.
+ */
+async function readWithVisionModel(env, request) {
+  if (!env?.GEMINI_API_KEY) {
+    throw new HttpError(400, 'AI scanning is not configured. Add GEMINI_API_KEY to .dev.vars and restart the dev server.');
+  }
+
+  const configured = env.GEMINI_MODEL ? [env.GEMINI_MODEL] : [];
+  const models = [...new Set([...configured, ...GEMINI_SCAN_MODELS])];
+  const failures = [];
+  let exhaustedEverything = true;
+
+  for (const model of models) {
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      try {
+        return await readWithGemini(env, { ...request, model });
+      } catch (error) {
+        const retryAfter = error instanceof ScanProviderError ? error.retryAfterSeconds : null;
+
+        // A short wait means a per-minute throttle, which clears on its own.
+        // Anything longer is the daily allowance — move to the next model.
+        if (attempt === 0 && retryAfter !== null && retryAfter <= 20) {
+          await sleep(Math.ceil(retryAfter * 1000) + 250);
+          continue;
+        }
+
+        if (!(error instanceof ScanProviderError) || error.status !== 429) {
+          exhaustedEverything = false;
+        }
+
+        failures.push(error instanceof ScanProviderError
+          ? `${error.message}${error.detail ? ` — ${String(error.detail).slice(0, 160)}` : ''}`
+          : `${model}: ${error.message}`);
+        console.error(`Scan failed on ${model}: ${error.message}`);
+        break;
+      }
+    }
+  }
+
+  const combined = failures.join(' | ');
+
+  if (exhaustedEverything && /\b429\b/.test(combined)) {
+    throw new HttpError(429, "Today's free AI scanning limit has been used up. It resets within a day — until then you can add the bill manually below.");
+  }
+
+  if (combined.includes('MAX_TOKENS')) {
+    throw new HttpError(502, 'This bill has more detail than the scanner could return in one pass. Try cropping it or scanning one page at a time.');
+  }
+
+  throw new HttpError(502, `The file could not be read. ${combined.slice(0, 300)}`);
+}
+
+async function scanDocument(env, payload, mode = 'bill') {
   const apiKey = env && env.GEMINI_API_KEY;
 
   if (!apiKey) {
@@ -3103,136 +3561,8 @@ async function scanDocument(env, payload) {
     throw new HttpError(400, 'Unsupported file type. Upload an image (JPG, PNG, HEIC) or a PDF.');
   }
 
-  const model = (env && env.GEMINI_MODEL) || 'gemini-flash-latest';
-  const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(apiKey)}`;
-
-  const prompt = [
-    'You are a finance and kitchen assistant analyzing an uploaded file.',
-    'The file may be: a store/grocery receipt, an invoice, a credit-card or utility bill, or a photo of grocery/pantry items.',
-    'If it is a multi-page document, read every page.',
-    '',
-    'Return two things:',
-    '1) "items": every distinct edible or household grocery item visible.',
-    `For each item: name (short, singular), category (one of: ${PANTRY_SCAN_CATEGORIES.join(', ')}),`,
-    'quantity (number, estimate count/packages, default 1), unit (one of: item, lb, oz, kg, g, l, ml, dozen, pack, can, bottle, box, bag, bunch),',
-    'and unitPrice (the price for that line if shown, else 0).',
-    'For a plain photo of vegetables with no prices, still list the items with unitPrice 0.',
-    '',
-    '2) "receipt": the bill/spend summary when the file is a receipt, invoice, or bill (otherwise leave fields empty/0).',
-    'receipt.merchant (store or biller name), receipt.total (the grand total paid, a number),',
-    'receipt.currency (ISO code like INR, USD; default INR), receipt.date (YYYY-MM-DD of the transaction),',
-    `receipt.category (best expense category, one of: ${EXPENSE_SCAN_CATEGORIES.join(', ')}),`,
-    'and receipt.lineItems (array of { description, amount } for each charge line).',
-    'If there is no bill/total in the file, set receipt.total to 0 and leave merchant empty.',
-    '',
-    '3) "transactions": if the file is a PAYMENT-APP or BANK STATEMENT listing many separate',
-    'transactions (PhonePe, Google Pay, Paytm, UPI history, a bank passbook or card statement),',
-    'return EVERY transaction as its own entry. Do NOT total them up and do NOT merge them.',
-    'For each: date (YYYY-MM-DD, take the year from the statement), description (the counterparty —',
-    'the name after "Paid to" or "Received from"), direction ("debit" when money left the account,',
-    '"credit" when money came in), amount (a positive number, no currency symbol),',
-    `and category (best guess, one of: ${EXPENSE_SCAN_CATEGORIES.join(', ')}) for debits only.`,
-    'Read every page and include transactions from all of them.',
-    'If the file is a single receipt or bill rather than a statement, return an empty transactions array.',
-  ].join(' ');
-
-  const requestBody = {
-    contents: [
-      {
-        parts: [
-          { text: prompt },
-          { inline_data: { mime_type: mimeType, data: base64 } },
-        ],
-      },
-    ],
-    generationConfig: {
-      responseMimeType: 'application/json',
-      responseSchema: {
-        type: 'OBJECT',
-        properties: {
-          items: {
-            type: 'ARRAY',
-            items: {
-              type: 'OBJECT',
-              properties: {
-                name: { type: 'STRING' },
-                category: { type: 'STRING' },
-                quantity: { type: 'NUMBER' },
-                unit: { type: 'STRING' },
-                unitPrice: { type: 'NUMBER' },
-              },
-              required: ['name'],
-            },
-          },
-          receipt: {
-            type: 'OBJECT',
-            properties: {
-              merchant: { type: 'STRING' },
-              total: { type: 'NUMBER' },
-              currency: { type: 'STRING' },
-              date: { type: 'STRING' },
-              category: { type: 'STRING' },
-              lineItems: {
-                type: 'ARRAY',
-                items: {
-                  type: 'OBJECT',
-                  properties: {
-                    description: { type: 'STRING' },
-                    amount: { type: 'NUMBER' },
-                  },
-                },
-              },
-            },
-          },
-          transactions: {
-            type: 'ARRAY',
-            items: {
-              type: 'OBJECT',
-              properties: {
-                date: { type: 'STRING' },
-                description: { type: 'STRING' },
-                direction: { type: 'STRING' },
-                amount: { type: 'NUMBER' },
-                category: { type: 'STRING' },
-              },
-              required: ['date', 'description', 'direction', 'amount'],
-            },
-          },
-        },
-      },
-    },
-  };
-
-  let response;
-
-  try {
-    response = await fetch(endpoint, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify(requestBody),
-    });
-  } catch (error) {
-    throw new HttpError(502, `Could not reach the AI service: ${error instanceof Error ? error.message : String(error)}`);
-  }
-
-  if (!response.ok) {
-    const detail = await response.text().catch(() => '');
-    throw new HttpError(502, `AI scan failed (${response.status}). ${detail.slice(0, 300)}`);
-  }
-
-  const data = await response.json().catch(() => null);
-  const text = (data
-    && data.candidates
-    && data.candidates[0]
-    && data.candidates[0].content
-    && data.candidates[0].content.parts
-    ? data.candidates[0].content.parts.map((part) => part.text).filter(Boolean).join('')
-    : '') || '';
-  const parsed = parseJson(text, null);
-
-  if (!parsed || typeof parsed !== 'object') {
-    throw new HttpError(502, 'The AI response could not be understood. Please try another file.');
-  }
+  const { prompt, schema } = mode === 'pantry' ? pantryScanRequest() : billScanRequest();
+  const parsed = await readWithVisionModel(env, { prompt, schema, base64, mimeType });
 
   const rawItems = Array.isArray(parsed.items) ? parsed.items : [];
   const items = rawItems
@@ -3306,6 +3636,13 @@ function normalizeStatementDate(value) {
   return Number.isNaN(date.getTime()) ? null : iso;
 }
 
+/**
+ * Rows that restate the sum of other rows rather than being a charge of their
+ * own. Anchored so a genuine item like "Total Fitness protein bar" or a
+ * "Subtotal cream 50g" product name is not mistaken for a summary row.
+ */
+const SUMMARY_LINE_PATTERN = /^(sub[\s-]?total|total|grand[\s-]?total|gross(\s+(amount|total))?|net(\s+(payable|amount|total))?|amount\s+(due|payable)|balance(\s+due)?|items?\s+count|no\.?\s+of\s+items)\b[\s:.]*$/i;
+
 function normalizeScanReceipt(raw) {
   if (!raw || typeof raw !== 'object') {
     return null;
@@ -3318,13 +3655,26 @@ function normalizeScanReceipt(raw) {
     return null;
   }
 
+  // Every printed line is kept, including zero-amount and negative (discount)
+  // lines — the user decides what counts, so nothing is silently dropped here.
+  // Summary rows are the one exception: they total the other lines, so letting
+  // one through would double-count the bill. Some models list them despite
+  // being told not to, so they are filtered here as well.
   const lineItems = (Array.isArray(raw.lineItems) ? raw.lineItems : [])
-    .filter((line) => line && (line.description || line.amount))
-    .slice(0, 100)
-    .map((line) => ({
-      description: String(line.description || '').trim().slice(0, 160),
-      amountMinor: toMinor(line.amount),
-    }));
+    .filter((line) => line && String(line.description || '').trim())
+    .filter((line) => !SUMMARY_LINE_PATTERN.test(String(line.description).trim()))
+    .slice(0, 200)
+    .map((line) => {
+      const amount = Number(line.amount);
+      const magnitudeMinor = toMinor(Math.abs(Number.isFinite(amount) ? amount : 0));
+
+      return {
+        description: String(line.description).trim().slice(0, 160),
+        quantity: sanitizeScanQuantity(line.quantity),
+        amountMinor: Number.isFinite(amount) && amount < 0 ? -magnitudeMinor : magnitudeMinor,
+        category: normalizeScanExpenseCategory(line.category || raw.category),
+      };
+    });
 
   return {
     merchant,
@@ -4095,6 +4445,217 @@ async function defaultAccountId(db, userId, currency = 'INR') {
   return account?.id || null;
 }
 
+// ---------------------------------------------------------------------------
+// Finance accounts — where money actually sits: wallets, banks, and now
+// investment accounts (SIPs, stocks, insurance-linked funds). Deliberately
+// scoped to assets a user owns; debt stays in finance_liabilities so a loan
+// is never represented (and double-counted) in two places at once.
+// ---------------------------------------------------------------------------
+
+const ACCOUNT_TYPES = ['cash', 'bank', 'wallet', 'investment', 'other'];
+
+/**
+ * The ways people actually save out of their income. Offered as ready-made
+ * choices so "I put 25k into my SIP" is one step — the matching savings pot
+ * is created on first use instead of making the user set up accounts first.
+ */
+const SAVINGS_VEHICLES = [
+  'SIP / Mutual fund',
+  'Stocks',
+  'Fixed / Recurring deposit',
+  'PPF / EPF',
+  'Gold',
+  'Life / Term insurance',
+  'Chit fund',
+  'Emergency fund',
+  'Other savings',
+];
+
+/**
+ * Find-or-create the savings pot a contribution goes into, by name. This is
+ * what keeps saving a single action: the pot is an investment-type account
+ * under the hood, so net worth and history work, but the user never has to
+ * create one up front.
+ */
+async function resolveSavingsAccount(db, userId, name, currency) {
+  const label = requiredText(name, 'Choose where the money is being saved.');
+
+  const existing = await db
+    .prepare(
+      `
+      SELECT id
+      FROM finance_accounts
+      WHERE user_id = ? AND currency = ? AND is_archived = 0
+        AND type = 'investment' AND LOWER(name) = LOWER(?)
+      LIMIT 1
+    `,
+    )
+    .bind(userId, currency, label)
+    .first();
+
+  if (existing?.id) {
+    return existing.id;
+  }
+
+  const created = await createAccount(db, userId, {
+    name: label,
+    type: 'investment',
+    currency,
+    openingBalance: 0,
+  });
+
+  return created.id;
+}
+
+async function listAccounts(db, userId) {
+  const result = await db
+    .prepare('SELECT * FROM finance_accounts WHERE user_id = ? AND is_archived = 0 ORDER BY created_at ASC')
+    .bind(userId)
+    .all();
+
+  return (result.results || []).map(mapAccount);
+}
+
+async function getAccount(db, userId, id) {
+  const row = await db
+    .prepare('SELECT * FROM finance_accounts WHERE id = ? AND user_id = ?')
+    .bind(id, userId)
+    .first();
+
+  return row ? mapAccount(row) : null;
+}
+
+async function createAccount(db, userId, payload) {
+  const id = payload.id || crypto.randomUUID();
+  const type = normalizeEnum(payload.type || 'bank', ACCOUNT_TYPES, 'Account type must be cash, bank, wallet, investment, or other.');
+  const currency = normalizeCurrency(payload.currency || 'INR');
+  const openingBalanceMinor = normalizeMoney(payload.openingBalanceMinor, payload.openingBalance ?? 0);
+
+  await db
+    .prepare(
+      `
+      INSERT INTO finance_accounts (id, user_id, name, type, currency, opening_balance_minor, current_balance_minor, institution, last_four)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `,
+    )
+    .bind(
+      id,
+      userId,
+      requiredText(payload.name, 'Account name is required.'),
+      type,
+      currency,
+      openingBalanceMinor,
+      openingBalanceMinor,
+      payload.institution || null,
+      payload.lastFour || null,
+    )
+    .run();
+
+  return getAccount(db, userId, id);
+}
+
+async function updateAccount(db, userId, id, payload) {
+  const existing = await getAccount(db, userId, id);
+
+  if (!existing) {
+    throw new HttpError(404, 'Account not found.');
+  }
+
+  const allowed = {
+    name: payload.name,
+    type: payload.type !== undefined ? normalizeEnum(payload.type, ACCOUNT_TYPES, 'Account type must be cash, bank, wallet, investment, or other.') : undefined,
+    institution: payload.institution,
+    last_four: payload.lastFour,
+    // Bank/cash/wallet balances should only move via transactions, but an
+    // investment account has no price feed here — its value only ever
+    // changes because the user tells us what it's worth now.
+    current_balance_minor: payload.currentBalanceMinor !== undefined || payload.currentBalance !== undefined
+      ? normalizeMoney(payload.currentBalanceMinor, payload.currentBalance)
+      : undefined,
+  };
+
+  const updates = Object.entries(allowed).filter(([, value]) => value !== undefined);
+
+  if (updates.length) {
+    await db
+      .prepare(
+        `UPDATE finance_accounts SET ${updates.map(([key]) => `${key} = ?`).join(', ')}, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND user_id = ?`,
+      )
+      .bind(...updates.map(([, value]) => value), id, userId)
+      .run();
+  }
+
+  return getAccount(db, userId, id);
+}
+
+async function archiveAccount(db, userId, id) {
+  const existing = await getAccount(db, userId, id);
+
+  if (!existing) {
+    throw new HttpError(404, 'Account not found.');
+  }
+
+  await db
+    .prepare('UPDATE finance_accounts SET is_archived = 1, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND user_id = ?')
+    .bind(id, userId)
+    .run();
+}
+
+function mapAccount(row) {
+  return {
+    id: row.id,
+    name: row.name,
+    type: row.type,
+    currency: row.currency || 'INR',
+    openingBalanceMinor: Number(row.opening_balance_minor || 0),
+    currentBalanceMinor: Number(row.current_balance_minor || 0),
+    institution: row.institution,
+    lastFour: row.last_four,
+    isArchived: Boolean(row.is_archived),
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
+/**
+ * Assets minus outstanding liabilities. Investment accounts count as assets
+ * (they're money the user owns, just not liquid); finance_liabilities is the
+ * one place debt lives, so it's the only thing subtracted.
+ */
+async function getNetWorth(db, userId, currency) {
+  const assetsRow = await db
+    .prepare(
+      `
+      SELECT COALESCE(SUM(current_balance_minor), 0) AS total
+      FROM finance_accounts
+      WHERE user_id = ? AND currency = ? AND is_archived = 0
+        AND type IN ('cash', 'bank', 'wallet', 'investment', 'other')
+    `,
+    )
+    .bind(userId, currency)
+    .first();
+
+  const liabilitiesRow = await db
+    .prepare(
+      `
+      SELECT COALESCE(SUM(MAX(original_amount_minor - paid_amount_minor, 0)), 0) AS total
+      FROM finance_liabilities
+      WHERE user_id = ? AND currency = ? AND status != 'archived'
+    `,
+    )
+    .bind(userId, currency)
+    .first();
+
+  const assetsMinor = Number(assetsRow?.total || 0);
+  const liabilitiesMinor = Number(liabilitiesRow?.total || 0);
+
+  return {
+    assetsMinor,
+    liabilitiesMinor,
+    netWorthMinor: assetsMinor - liabilitiesMinor,
+  };
+}
+
 async function applyAccountDelta(db, accountId, deltaMinor) {
   if (!accountId) {
     return;
@@ -4129,6 +4690,9 @@ function mapTransaction(row) {
     id: row.id,
     accountId: row.account_id,
     accountName: row.account_name,
+    toAccountId: row.to_account_id,
+    toAccountName: row.to_account_name,
+    toAccountType: row.to_account_type,
     categoryId: row.category_id,
     categoryName: row.category_name,
     categoryColor: row.category_color,

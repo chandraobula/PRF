@@ -1,0 +1,21 @@
+-- Real investment/savings accounts + double-entry transfers.
+--
+-- Previously an SIP, insurance premium, or stock purchase had nowhere sane to
+-- go: logging it as an "expense" silently deflated the calculated savings
+-- rate, because there was no way to say "this money didn't leave the
+-- household, it moved into something that grows." finance_accounts already
+-- allowed type='investment' and finance_transactions already allowed
+-- type='transfer', but nothing wired them together — a transfer only ever
+-- debited its one account, with no destination leg.
+--
+-- This adds the missing destination-account column so a transfer can credit
+-- one account while debiting another in a single row, cleanly excluded from
+-- income/expense/savings-rate math (as transfers already are) while still
+-- being visible in the ledger and reflected in account balances.
+--
+-- Apply locally with:
+--   node scripts/wrangler-local.mjs d1 execute DB --local --persist-to .wrangler/state --file=db/migrations/011_finance_transfers.sql --yes
+-- Apply to production with:
+--   npx wrangler d1 execute DB --remote --file=db/migrations/011_finance_transfers.sql
+
+ALTER TABLE finance_transactions ADD COLUMN to_account_id TEXT REFERENCES finance_accounts(id) ON DELETE SET NULL;
