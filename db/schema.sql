@@ -662,6 +662,9 @@ CREATE TABLE IF NOT EXISTS user_preferences (
   region TEXT NOT NULL DEFAULT 'IN',
   timezone TEXT NOT NULL DEFAULT 'Asia/Kolkata',
   currency TEXT NOT NULL DEFAULT 'INR',
+  -- 'default' until someone picks: first login auto-detects over a 'default'
+  -- row, and a choice made in Settings ('manual') is never auto-overwritten.
+  currency_source TEXT NOT NULL DEFAULT 'default',
   notify_daily_briefing INTEGER NOT NULL DEFAULT 1,
   notify_bills INTEGER NOT NULL DEFAULT 1,
   notify_focus_sessions INTEGER NOT NULL DEFAULT 0,

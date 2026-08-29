@@ -18,10 +18,10 @@ const ACCOUNT_TYPES = [
 
 const CURRENCIES = ['INR', 'USD'];
 
-const emptyAccount = () => ({
+const emptyAccount = (currency = 'INR') => ({
   name: '',
   type: 'bank',
-  currency: 'INR',
+  currency,
   openingBalance: '',
   institution: '',
   lastFour: '',
@@ -30,7 +30,7 @@ const emptyAccount = () => ({
 export default function AccountsPanel({ accounts, currency, onChanged }) {
   const [editorOpen, setEditorOpen] = useState(false);
   const [editing, setEditing] = useState(null);
-  const [form, setForm] = useState(emptyAccount);
+  const [form, setForm] = useState(() => emptyAccount(currency));
   const [isSaving, setIsSaving] = useState(false);
   const [error, setError] = useState('');
   const [pendingDelete, setPendingDelete] = useState(null);
@@ -43,7 +43,7 @@ export default function AccountsPanel({ accounts, currency, onChanged }) {
 
   const openCreate = () => {
     setEditing(null);
-    setForm(emptyAccount());
+    setForm(emptyAccount(currency));
     setError('');
     setEditorOpen(true);
   };

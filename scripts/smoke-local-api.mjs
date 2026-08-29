@@ -100,6 +100,27 @@ try {
     },
   });
 
+  // Currency preference. A brand-new account has never had one chosen, so the
+  // browser's timezone decides it once; after that a deliberate choice sticks
+  // and detection must be a no-op on every later login.
+  const seededPrefs = await request('/api/preferences');
+  const detectedPrefs = await request('/api/preferences/detect', {
+    method: 'POST',
+    status: 200,
+    body: { timezone: 'America/New_York', locale: 'en-US' },
+  });
+  const detectedFinance = await request('/api/finance/summary?currency=USD');
+  const chosenPrefs = await request('/api/preferences', {
+    method: 'PATCH',
+    status: 200,
+    body: { currency: 'INR' },
+  });
+  const reDetectedPrefs = await request('/api/preferences/detect', {
+    method: 'POST',
+    status: 200,
+    body: { timezone: 'America/New_York', locale: 'en-US' },
+  });
+
   const categories = await request('/api/finance/categories');
   const groceries = categories.categories.find((category) => category.type === 'expense' && category.name === 'Groceries')
     || categories.categories.find((category) => category.type === 'expense');
@@ -225,6 +246,13 @@ try {
   console.log(JSON.stringify({
     ok: true,
     userCreated: Boolean(registered.user?.id),
+    currencySeedSource: seededPrefs.preferences.currencySource,
+    currencyDetected: `${detectedPrefs.preferences.currency}/${detectedPrefs.preferences.currencySource}`,
+    currencyDetectedRegion: detectedPrefs.preferences.region,
+    financeProfileSynced: detectedFinance.profile.currency === 'USD',
+    currencyChosen: `${chosenPrefs.preferences.currency}/${chosenPrefs.preferences.currencySource}`,
+    currencyKeptAfterRedetect: reDetectedPrefs.preferences.currency === 'INR'
+      && reDetectedPrefs.preferences.currencySource === 'manual',
     receiptUpdated: receiptEdit.receipt?.notes === 'Smoke bill metadata updated',
     receipts: receipts.receipts.length,
     liabilityBalanceAfterPayment: liabilityPayment.liability.currentBalance,

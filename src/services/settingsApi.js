@@ -28,6 +28,15 @@ export function updatePreferences(payload) {
   });
 }
 
+// Reports the browser's timezone/locale so the server can pick a default
+// currency on first login. Ignored server-side once the user has chosen one.
+export function detectPreferences({ timezone, locale }) {
+  return apiRequest('/preferences/detect', {
+    method: 'POST',
+    body: JSON.stringify({ timezone, locale }),
+  });
+}
+
 // --- Integrations ---
 export function listIntegrations() {
   return apiRequest('/integrations');

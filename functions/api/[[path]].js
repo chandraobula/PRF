@@ -1055,6 +1055,18 @@ async function deleteOwnAccount(db, userId) {
 }
 
 async function handlePreferencesRoute({ db, request, route, user }) {
+  // The browser is the only thing that knows the user's real timezone, so it
+  // posts what it sees here on first login and the server decides what that
+  // means. Deliberately a no-op once a currency has been chosen.
+  if (route[0] === 'detect' && route.length === 1) {
+    if (request.method !== 'POST') {
+      throw new HttpError(405, 'Method not allowed');
+    }
+
+    const payload = await readJson(request);
+    return sendJson({ preferences: await detectUserPreferences(db, user.userId, payload) });
+  }
+
   if (route.length) {
     throw new HttpError(404, 'Not found');
   }
@@ -1093,13 +1105,17 @@ function mapUserPreferences(row) {
     region: row.region,
     timezone: row.timezone,
     currency: row.currency,
+    currencySource: row.currency_source || 'default',
     notifyDailyBriefing: Boolean(row.notify_daily_briefing),
     notifyBills: Boolean(row.notify_bills),
     notifyFocusSessions: Boolean(row.notify_focus_sessions),
   };
 }
 
-async function updateUserPreferences(db, userId, payload) {
+// A PATCH only ever arrives from the Settings screen, so a currency in the
+// payload is a deliberate choice — recorded as 'manual' so first-login
+// detection leaves it alone from then on.
+async function updateUserPreferences(db, userId, payload, source = 'manual') {
   const columns = {
     theme: payload.theme === undefined ? undefined : validateEnum(payload.theme, SETTINGS_THEMES, 'theme'),
     reduce_motion: payload.reduceMotion === undefined ? undefined : (payload.reduceMotion ? 1 : 0),
@@ -1108,6 +1124,7 @@ async function updateUserPreferences(db, userId, payload) {
     region: payload.region === undefined ? undefined : String(payload.region).trim().slice(0, 60),
     timezone: payload.timezone === undefined ? undefined : String(payload.timezone).trim().slice(0, 60),
     currency: payload.currency === undefined ? undefined : normalizeCurrency(payload.currency),
+    currency_source: payload.currency === undefined ? undefined : source,
     notify_daily_briefing: payload.notifyDailyBriefing === undefined ? undefined : (payload.notifyDailyBriefing ? 1 : 0),
     notify_bills: payload.notifyBills === undefined ? undefined : (payload.notifyBills ? 1 : 0),
     notify_focus_sessions: payload.notifyFocusSessions === undefined ? undefined : (payload.notifyFocusSessions ? 1 : 0),
@@ -1127,9 +1144,87 @@ async function updateUserPreferences(db, userId, payload) {
       )
       .bind(...updates.map(([, value]) => value), userId)
       .run();
+
+    // Finance Hub reads its currency off finance_profiles, so a change made in
+    // Language & region has to land there too or the two screens disagree.
+    if (columns.currency !== undefined) {
+      await syncFinanceProfileCurrency(db, userId, columns.currency);
+    }
   }
 
   return getUserPreferences(db, userId);
+}
+
+async function syncFinanceProfileCurrency(db, userId, currency) {
+  const secondary = currency === 'INR' ? 'USD' : 'INR';
+
+  await db
+    .prepare(
+      `UPDATE finance_profiles
+       SET currency = ?, secondary_currency = ?, enabled_currencies_json = ?, updated_at = CURRENT_TIMESTAMP
+       WHERE user_id = ?`,
+    )
+    .bind(currency, secondary, JSON.stringify([currency, secondary]), userId)
+    .run();
+}
+
+// Timezones that mean rupees. Everything else falls through to USD, which is
+// the only other currency the ledger supports — see normalizeCurrency.
+const INR_TIMEZONES = new Set(['Asia/Kolkata', 'Asia/Calcutta']);
+
+// Regions offered in Settings, so a detected region always matches an option
+// in that dropdown rather than writing a value the select can't display.
+const DETECTABLE_REGIONS = new Set(['IN', 'US', 'GB', 'AE', 'SG']);
+
+const TIMEZONE_REGIONS = {
+  'Asia/Kolkata': 'IN',
+  'Asia/Calcutta': 'IN',
+  'Asia/Dubai': 'AE',
+  'Asia/Singapore': 'SG',
+  'Europe/London': 'GB',
+};
+
+// Country the browser signals point at, preferring the locale's explicit region
+// subtag ('en-US') and falling back to the timezone when the locale has none.
+function detectRegion(timezone, locale) {
+  const fromLocale = String(locale || '').split(/[-_]/)[1];
+
+  if (fromLocale && DETECTABLE_REGIONS.has(fromLocale.toUpperCase())) {
+    return fromLocale.toUpperCase();
+  }
+
+  if (TIMEZONE_REGIONS[timezone]) {
+    return TIMEZONE_REGIONS[timezone];
+  }
+
+  return timezone && timezone.startsWith('America/') ? 'US' : null;
+}
+
+// Applied only to a row nobody has ever chosen a currency on, so a returning
+// user's INR/USD choice survives every subsequent login untouched.
+async function detectUserPreferences(db, userId, payload) {
+  const current = await getUserPreferences(db, userId);
+
+  if (current.currencySource !== 'default') {
+    return current;
+  }
+
+  const timezone = String(payload?.timezone || '').trim().slice(0, 60);
+  const locale = String(payload?.locale || '').trim().slice(0, 40);
+
+  if (!timezone) {
+    return current;
+  }
+
+  const currency = INR_TIMEZONES.has(timezone) ? 'INR' : 'USD';
+  const region = detectRegion(timezone, locale);
+
+  return updateUserPreferences(
+    db,
+    userId,
+    { currency, timezone, ...(region ? { region } : {}) },
+    'detected',
+  );
 }
 
 function validateEnum(value, allowed, label) {

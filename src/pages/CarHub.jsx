@@ -3,6 +3,7 @@ import { Link } from 'react-router-dom';
 import { BatteryCharging, Car, CheckCircle2, Loader2, Navigation, Plus, Save, Thermometer, Trash2, Wrench, X } from 'lucide-react';
 import { cn } from '../lib/utils';
 import { formatMoney } from '../services/financeApi';
+import { useCurrency } from '../lib/preferences';
 import {
   addMaintenanceItem,
   addVehicle,
@@ -41,6 +42,7 @@ const emptyMaintenance = {
 };
 
 export default function CarHub() {
+  const currency = useCurrency();
   const [summary, setSummary] = useState(null);
   const [vehicleForm, setVehicleForm] = useState(emptyVehicle);
   const [maintenanceForm, setMaintenanceForm] = useState(emptyMaintenance);
@@ -213,9 +215,9 @@ export default function CarHub() {
                     {summary.ownership.currentValueMinor != null && (
                       <div className="text-right">
                         <p className="text-xs text-text-muted">Current value</p>
-                        <p className="font-display text-xl font-bold text-on-surface">{formatMoney(summary.ownership.currentValueMinor, 'INR')}</p>
+                        <p className="font-display text-xl font-bold text-on-surface">{formatMoney(summary.ownership.currentValueMinor, currency)}</p>
                         {summary.ownership.purchasePriceMinor != null && (
-                          <p className="text-xs text-text-muted">of {formatMoney(summary.ownership.purchasePriceMinor, 'INR')} paid</p>
+                          <p className="text-xs text-text-muted">of {formatMoney(summary.ownership.purchasePriceMinor, currency)} paid</p>
                         )}
                       </div>
                     )}

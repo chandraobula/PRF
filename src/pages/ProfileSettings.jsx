@@ -7,6 +7,7 @@ import { getProfile, updateProfile, deleteAccount, getPreferences, updatePrefere
 import { setTheme } from '../lib/theme';
 import { setReduceMotion } from '../lib/motion';
 import { setTextSize } from '../lib/textSize';
+import { CURRENCY_LABELS, SUPPORTED_CURRENCIES, usePreferences } from '../lib/preferences';
 
 const sections = [
   { id: 'profile', icon: User, label: 'Profile', description: 'Name, photo and email' },
@@ -34,7 +35,11 @@ const REGIONS = [
 
 const TIMEZONES = ['Asia/Kolkata', 'Asia/Dubai', 'Asia/Singapore', 'Europe/London', 'America/New_York', 'America/Los_Angeles', 'UTC'];
 
-const CURRENCIES = ['INR', 'USD', 'EUR', 'GBP', 'AED', 'SGD'];
+// First login detects the device's real timezone, which is often outside the
+// shortlist above — surface it as an option so the select shows what is stored.
+function timezoneOptions(current) {
+  return current && !TIMEZONES.includes(current) ? [current, ...TIMEZONES] : TIMEZONES;
+}
 
 function Toggle({ checked, onChange, label }) {
   return <button type="button" role="switch" aria-checked={checked} aria-label={label} onClick={() => onChange(!checked)} className={cn('relative w-12 h-7 shrink-0 rounded-full transition-colors', checked ? 'bg-secondary' : 'bg-surface-container-highest')}><span className={cn('absolute left-1 top-1 w-5 h-5 rounded-full bg-surface-card shadow-sm transition-transform', checked ? 'translate-x-5' : 'translate-x-0')} /></button>;
@@ -60,6 +65,7 @@ export default function ProfileSettings() {
   const [profileMessage, setProfileMessage] = useState(null);
   const [prefs, setPrefs] = useState(null);
   const [prefsError, setPrefsError] = useState(null);
+  const { refreshPreferences } = usePreferences();
 
   useEffect(() => {
     let cancelled = false;
@@ -128,6 +134,9 @@ export default function ProfileSettings() {
     try {
       const result = await updatePreferences(partial);
       setPrefs(result.preferences);
+      // Currency lives on every money screen, so push the change out of this
+      // page instead of waiting for the next full reload.
+      refreshPreferences().catch(() => {});
     } catch (error) {
       setPrefsError(error.message || 'Could not save that change.');
       getPreferences().then((res) => setPrefs(res.preferences)).catch(() => {});
@@ -262,14 +271,20 @@ export default function ProfileSettings() {
         } />
         <PreferenceRow title="Time zone" action={
           <select value={prefs.timezone} onChange={(e) => persistPrefs({ timezone: e.target.value })} className="settings-select">
-            {TIMEZONES.map((tz) => <option key={tz} value={tz}>{tz}</option>)}
+            {timezoneOptions(prefs.timezone).map((tz) => <option key={tz} value={tz}>{tz}</option>)}
           </select>
         } />
-        <PreferenceRow title="Currency" action={
-          <select value={prefs.currency} onChange={(e) => persistPrefs({ currency: e.target.value })} className="settings-select">
-            {CURRENCIES.map((c) => <option key={c} value={c}>{c}</option>)}
-          </select>
-        } />
+        <PreferenceRow
+          title="Currency"
+          description={prefs.currencySource === 'detected'
+            ? 'Set from your time zone on first sign-in. Change it and it stays changed.'
+            : 'Used across the Finance Hub, dashboard and subscriptions.'}
+          action={
+            <select value={prefs.currency} onChange={(e) => persistPrefs({ currency: e.target.value })} className="settings-select">
+              {SUPPORTED_CURRENCIES.map((c) => <option key={c} value={c}>{CURRENCY_LABELS[c] || c}</option>)}
+            </select>
+          }
+        />
       </div>
     </section>,
     connections: <section className="settings-card"><div className="settings-card-header"><h2>Connections</h2><p>Manage linked services and developer access.</p></div><div className="divide-y divide-border-subtle"><PreferenceRow title="Connected services" description="Calendar, email and productivity apps" onClick={() => navigate('/services')} /><PreferenceRow title="API keys" description="Create and revoke developer keys" badge="Coming soon" /></div></section>,

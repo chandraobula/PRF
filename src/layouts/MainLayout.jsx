@@ -11,6 +11,7 @@ import { cn } from '../lib/utils';
 import ThemeToggle from '../components/ThemeToggle';
 import { getCurrentAccount, logoutAccount } from '../services/authApi';
 import { notifyUnauthorized, isAdmin } from '../lib/session';
+import { PreferencesProvider } from '../lib/preferences';
 
 const navItems = [
   { icon: Home, label: 'Dashboard', path: '/dashboard' },
@@ -89,7 +90,17 @@ function isAdminSubItemActive(item, pathname) {
   return pathname === item.path;
 }
 
+// Every signed-in screen sits under here, so this is where the user's
+// preferences (currency above all) are loaded once and shared.
 export default function MainLayout() {
+  return (
+    <PreferencesProvider>
+      <MainLayoutShell />
+    </PreferencesProvider>
+  );
+}
+
+function MainLayoutShell() {
   const location = useLocation();
   const navigate = useNavigate();
   const [moreOpen, setMoreOpen] = useState(false);

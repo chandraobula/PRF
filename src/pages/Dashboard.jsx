@@ -11,6 +11,7 @@ import { getCarSummary } from '../services/carApi';
 import { getPantrySummary } from '../services/pantryApi';
 import { getMealPlan } from '../services/mealPlanApi';
 import ContextBar from '../components/ContextBar';
+import { useCurrency } from '../lib/preferences';
 
 const quickActions = [
   { label: 'Log expense', icon: WalletCards, color: 'bg-emerald-500/10 text-emerald-600 dark:text-emerald-300', path: '/finance' },
@@ -20,6 +21,7 @@ const quickActions = [
 ];
 
 export default function Dashboard() {
+  const preferredCurrency = useCurrency();
   const [currentUser, setCurrentUser] = useState(null);
   const [finance, setFinance] = useState(null);
   const [car, setCar] = useState(null);
@@ -36,7 +38,7 @@ export default function Dashboard() {
       
       const [authRes, finRes, carRes, panRes, mealRes] = await Promise.allSettled([
         getCurrentAccount(),
-        getFinanceDashboard(),
+        getFinanceDashboard(preferredCurrency),
         getCarSummary(),
         getPantrySummary(),
         getMealPlan(todayStr, todayStr)
@@ -52,14 +54,14 @@ export default function Dashboard() {
     }
     loadAll();
     return () => { active = false; };
-  }, []);
+  }, [preferredCurrency]);
 
   const hour = new Date().getHours();
   const greeting = hour < 12 ? 'Good morning' : hour < 18 ? 'Good afternoon' : 'Good evening';
   const name = currentUser?.displayName?.split(' ')[0] || 'there';
 
   const financeSummary = finance?.summary || {};
-  const currency = financeSummary.currency || 'INR';
+  const currency = financeSummary.currency || preferredCurrency;
   const recentTx = finance?.recentTransactions || [];
   const vehicles = car?.vehicles || [];
   const activeVehicle = vehicles.find(v => v.id === car?.activeVehicle?.id) || car?.activeVehicle || vehicles[0];

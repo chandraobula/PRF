@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 import { AlertTriangle, CalendarClock, Check, Loader2, Plus, Radar, RefreshCw, Trash2, X } from 'lucide-react';
 import { cn } from '../lib/utils';
 import { formatMoney } from '../services/financeApi';
+import { useCurrency } from '../lib/preferences';
 import {
   addSubscription,
   deleteSubscription,
@@ -11,16 +12,20 @@ import {
 } from '../services/subscriptionsApi';
 
 const emptySub = { name: '', provider: '', category: 'Streaming', amount: '', currency: 'INR', cadence: 'monthly', nextRenewalOn: '', notes: '' };
+
+// A new subscription is priced in whatever the user actually pays in.
+const blankSub = (currency) => ({ ...emptySub, currency });
 const CADENCES = ['weekly', 'monthly', 'quarterly', 'yearly'];
 const cadenceLabel = { weekly: '/wk', monthly: '/mo', quarterly: '/qtr', yearly: '/yr', custom: '' };
 
 export default function Subscriptions() {
+  const currency = useCurrency();
   const [summary, setSummary] = useState(null);
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState('');
   const [formOpen, setFormOpen] = useState(false);
   const [editingId, setEditingId] = useState('');
-  const [form, setForm] = useState(emptySub);
+  const [form, setForm] = useState(() => blankSub(currency));
   const [isSaving, setIsSaving] = useState(false);
   const [detecting, setDetecting] = useState(false);
   const [candidates, setCandidates] = useState(null);
@@ -39,20 +44,20 @@ export default function Subscriptions() {
 
   useEffect(() => { load(); }, []);
 
-  const openAdd = () => { setEditingId(''); setForm(emptySub); setError(''); setFormOpen(true); };
+  const openAdd = () => { setEditingId(''); setForm(blankSub(currency)); setError(''); setFormOpen(true); };
 
   const openEdit = (sub) => {
     setEditingId(sub.id);
     setForm({
       name: sub.name || '', provider: sub.provider || '', category: sub.category || 'Other',
-      amount: String(sub.amountMinor / 100), currency: sub.currency || 'INR', cadence: sub.cadence || 'monthly',
+      amount: String(sub.amountMinor / 100), currency: sub.currency || currency, cadence: sub.cadence || 'monthly',
       nextRenewalOn: sub.nextRenewalOn || '', notes: sub.notes || '',
     });
     setError('');
     setFormOpen(true);
   };
 
-  const closeForm = () => { setFormOpen(false); setEditingId(''); setForm(emptySub); };
+  const closeForm = () => { setFormOpen(false); setEditingId(''); setForm(blankSub(currency)); };
 
   const submit = async (event) => {
     event.preventDefault();
@@ -122,8 +127,8 @@ export default function Subscriptions() {
       {error && <div className="rounded-xl bg-error/10 px-4 py-3 text-sm font-semibold text-error">{error}</div>}
 
       <section className="grid grid-cols-3 gap-3">
-        <StatCard label="Monthly" value={summary ? formatMoney(summary.monthlyEstimateMinor, 'INR') : '—'} />
-        <StatCard label="Yearly" value={summary ? formatMoney(summary.yearlyEstimateMinor, 'INR') : '—'} />
+        <StatCard label="Monthly" value={summary ? formatMoney(summary.monthlyEstimateMinor, currency) : '—'} />
+        <StatCard label="Yearly" value={summary ? formatMoney(summary.yearlyEstimateMinor, currency) : '—'} />
         <StatCard label="Active" value={summary ? String(summary.activeCount) : '—'} />
       </section>
 

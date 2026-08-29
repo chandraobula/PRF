@@ -17,6 +17,7 @@ import {
   updateShoppingItem,
 } from '../services/pantryApi';
 import { addFinanceReceipt } from '../services/financeApi';
+import { useCurrency } from '../lib/preferences';
 
 const readFileAsDataUrl = (file) => new Promise((resolve, reject) => {
   const reader = new FileReader();
@@ -48,6 +49,7 @@ const categoryIcon = (category = '') => {
 const emptyList = [];
 
 export default function Pantry() {
+  const currency = useCurrency();
   const [summary, setSummary] = useState(null);
   const [form, setForm] = useState(emptyItem);
   const [shoppingForm, setShoppingForm] = useState({ name: '', quantity: '1', unit: 'item', category: 'Groceries' });
@@ -64,7 +66,7 @@ export default function Pantry() {
   const [scanItems, setScanItems] = useState(null);
   const [scanReceipt, setScanReceipt] = useState(null);
   const [logExpense, setLogExpense] = useState(false);
-  const [expenseForm, setExpenseForm] = useState({ merchant: '', amount: '', category: 'Food', date: '', currency: 'INR' });
+  const [expenseForm, setExpenseForm] = useState({ merchant: '', amount: '', category: 'Food', date: '', currency });
   const [savingScan, setSavingScan] = useState(false);
   const scanInputRef = useRef(null);
 
@@ -274,7 +276,7 @@ export default function Pantry() {
           amount: String(receipt.totalMinor / 100),
           category: receipt.category || 'Food',
           date: receipt.date || new Date().toISOString().slice(0, 10),
-          currency: receipt.currency || 'INR',
+          currency: receipt.currency || currency,
         });
       } else {
         setLogExpense(false);
@@ -325,7 +327,7 @@ export default function Pantry() {
         await addFinanceReceipt({
           merchant: expenseForm.merchant || 'Groceries',
           amount: Number(expenseForm.amount),
-          currency: expenseForm.currency || 'INR',
+          currency: expenseForm.currency || currency,
           category: expenseForm.category || 'Food',
           occurredOn: expenseForm.date || new Date().toISOString().slice(0, 10),
           paymentMethod: 'card',

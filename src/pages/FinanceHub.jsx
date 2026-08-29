@@ -30,6 +30,7 @@ import {
   Flame,
 } from 'lucide-react';
 import { cn } from '../lib/utils';
+import { usePreferences } from '../lib/preferences';
 import BillScanner from '../components/Finance/BillScanner';
 import InterestTracker from '../components/Finance/InterestTracker';
 import ImportTransactions from '../components/Finance/ImportTransactions';
@@ -91,6 +92,7 @@ const shiftMonth = (iso, delta) => {
 };
 
 export default function FinanceHub() {
+  const { currency: preferredCurrency, isLoading: prefsLoading } = usePreferences();
   const [activeTab, setActiveTab] = useState('overview');
   const [finance, setFinance] = useState(null);
   const [isLoading, setIsLoading] = useState(true);
@@ -98,7 +100,9 @@ export default function FinanceHub() {
   const [apiError, setApiError] = useState('');
   const [query, setQuery] = useState('');
   const [form, setForm] = useState(emptyForm);
-  const [selectedCurrency, setSelectedCurrency] = useState('INR');
+  // Null until the user's default currency is known, so the hub never loads a
+  // month in INR and then reloads it in USD a moment later.
+  const [selectedCurrency, setSelectedCurrency] = useState(null);
   const [asOf, setAsOf] = useState(() => new Date().toISOString().slice(0, 10));
   const [quickAddOpen, setQuickAddOpen] = useState(false);
   const [editingTxId, setEditingTxId] = useState(null);
@@ -108,7 +112,19 @@ export default function FinanceHub() {
   const [analytics, setAnalytics] = useState(null);
   const [analyticsLoading, setAnalyticsLoading] = useState(false);
 
+  // The switcher below is a per-visit view toggle; the default it opens on is
+  // the saved preference, so nobody has to re-pick their currency each login.
+  useEffect(() => {
+    if (!prefsLoading) {
+      setSelectedCurrency((current) => current || preferredCurrency);
+    }
+  }, [prefsLoading, preferredCurrency]);
+
   const loadFinance = useCallback(async () => {
+    if (!selectedCurrency) {
+      return;
+    }
+
     setIsLoading(true);
     setApiError('');
 
@@ -165,7 +181,7 @@ export default function FinanceHub() {
   // Analytics is its own request so the Overview tab isn't held up by six months
   // of aggregation the user may never open.
   useEffect(() => {
-    if (activeTab !== 'insights') {
+    if (activeTab !== 'insights' || !selectedCurrency) {
       return undefined;
     }
 
@@ -180,11 +196,11 @@ export default function FinanceHub() {
     return () => { active = false; };
   }, [activeTab, selectedCurrency, asOf]);
 
-  const currency = finance?.summary?.currency || selectedCurrency;
-  // INR always leads regardless of the order stored on the profile, so accounts
-  // created before INR became the default still show it first in the switcher.
+  const currency = finance?.summary?.currency || selectedCurrency || preferredCurrency;
+  // The user's own currency leads the switcher regardless of the order stored
+  // on the profile, so the one they actually spend in is the obvious default.
   const enabledCurrencies = [...(finance?.profile?.enabledCurrencies || ['INR', 'USD'])]
-    .sort((a, b) => (a === 'INR' ? -1 : b === 'INR' ? 1 : 0));
+    .sort((a, b) => (a === preferredCurrency ? -1 : b === preferredCurrency ? 1 : 0));
   const categories = finance?.categories || [];
   const categoriesForForm = categories.filter((category) => (
     form.type === 'income'
