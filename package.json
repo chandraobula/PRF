@@ -10,6 +10,8 @@
     "dev:cloudflare": "node scripts/wrangler-local.mjs pages dev dist --binding AUTH_MODE=public --binding SESSION_DAYS=30 --persist-to .wrangler/state --ip 127.0.0.1 --port 8788 --live-reload --show-interactive-dev-session=false",
     "db:local:setup": "node scripts/setup-local-db.mjs",
     "db:local:seed:demo": "node scripts/wrangler-local.mjs d1 execute DB --local --persist-to .wrangler/state --file=db/seed.sql --yes",
+    "test": "vitest run",
+    "test:watch": "vitest",
     "test:local:api": "npm run build && node scripts/smoke-local-api.mjs",
     "build": "vite build",
     "lint": "oxlint",
@@ -34,6 +36,7 @@
     "tailwindcss": "^3.4.19",
     "vite": "^8.1.1",
     "vite-plugin-pwa": "^1.3.0",
+    "vitest": "^4.1.11",
     "wrangler": "^4.112.0"
   }
 }
