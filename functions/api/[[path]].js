@@ -1,3 +1,54 @@
+import { HttpError } from '../../shared/api/errors.js';
+import {
+  moneyFromPayload,
+  normalizeAmount,
+  normalizeCurrency,
+  normalizeMoney,
+  requiredMoneyFromPayload,
+  toMinor,
+} from '../../shared/api/money.js';
+import {
+  normalizeDate,
+  normalizeEmail,
+  normalizeEnum,
+  normalizeLiabilityType,
+  normalizeMaintenanceStatus,
+  normalizeMealSlot,
+  normalizeMealStatus,
+  normalizeMerchantKey,
+  normalizePantryStatus,
+  normalizePriority,
+  normalizeQuantity,
+  normalizeRoute,
+  normalizeShoppingSource,
+  normalizeShoppingStatus,
+  normalizeTransactionType,
+  normalizeVehicleStatus,
+  parseJson,
+  requiredText,
+  today,
+  validateEnum,
+} from '../../shared/api/normalize.js';
+import {
+  normalizeStickyColor,
+  normalizeStickyFont,
+  normalizeStickyRotation,
+  sanitizeStickyHtml,
+} from '../../shared/api/sticky.js';
+import { detectRegion } from '../../shared/api/region.js';
+import {
+  EXPENSE_SCAN_CATEGORIES,
+  MISC_INCOME_CATEGORY,
+  PANTRY_SCAN_CATEGORIES,
+  normalizeScanCategory,
+  normalizeScanReceipt,
+  normalizeScanTransactions,
+  parseModelJson,
+  sanitizeScanQuantity,
+} from '../../shared/api/scan.js';
+
+export { MISC_INCOME_CATEGORY };
+
 const DEFAULT_USER_ID = 'demo-user';
 const DEFAULT_USER_EMAIL = 'demo@lifeos.local';
 
@@ -42,7 +93,6 @@ const defaultIncomeCategories = [
 // because category ids are namespaced per user.
 const PRIMARY_INCOME_CATEGORY_NAMES = ['Salary', 'Freelance'];
 
-export const MISC_INCOME_CATEGORY = 'Miscellaneous income';
 
 export async function onRequest(context) {
   const { request, env } = context;
@@ -153,47 +203,6 @@ export async function onRequest(context) {
 // Sticky notes — the Work Hub board
 // ---------------------------------------------------------------------------
 
-const STICKY_COLORS = ['yellow', 'pink', 'blue', 'green', 'purple', 'orange'];
-const STICKY_FONTS = ['hand', 'print', 'clean'];
-const STICKY_MAX_BODY = 8000;
-
-// Sticky note bodies are rich text, so they are stored as HTML. Only these tags
-// survive, and every attribute is dropped — see sanitizeStickyHtml.
-const STICKY_ALLOWED_TAGS = new Set([
-  'b', 'strong', 'i', 'em', 'u', 's', 'strike', 'del', 'mark',
-  'br', 'div', 'p', 'ul', 'ol', 'li',
-]);
-
-/**
- * Allowlist sanitiser for sticky-note HTML.
- *
- * Rather than trying to scrub dangerous attributes, every tag is re-emitted from
- * scratch with no attributes at all — so there is nowhere for `onerror`,
- * `href="javascript:"` or a style expression to live. Disallowed tags are
- * dropped but their text content is kept.
- */
-function sanitizeStickyHtml(value) {
-  let html = String(value == null ? '' : value).slice(0, STICKY_MAX_BODY);
-
-  // Elements whose *content* must go too, not just their tags.
-  html = html.replace(/<(script|style|iframe|object|embed|noscript|template)\b[\s\S]*?<\/\1\s*>/gi, '');
-  html = html.replace(/<(script|style|iframe|object|embed|noscript|template)\b[^>]*>/gi, '');
-
-  // Comments can hide conditional markup.
-  html = html.replace(/<!--[\s\S]*?-->/g, '');
-
-  html = html.replace(/<\/?([a-zA-Z][a-zA-Z0-9-]*)\b[^>]*>/g, (match, rawTag) => {
-    const tag = rawTag.toLowerCase();
-    if (!STICKY_ALLOWED_TAGS.has(tag)) return '';
-    if (match.startsWith('</')) return `</${tag}>`;
-    return tag === 'br' ? '<br>' : `<${tag}>`;
-  });
-
-  // Anything left that looks like a stray angle bracket is literal text.
-  html = html.replace(/<(?![/a-zA-Z])/g, '&lt;');
-
-  return html.slice(0, STICKY_MAX_BODY);
-}
 
 async function handleStickyNotesRoute({ db, request, url, route, user }) {
   const [id] = route;
@@ -358,22 +367,6 @@ function mapStickyNote(row) {
   };
 }
 
-function normalizeStickyColor(value) {
-  const text = String(value || '').toLowerCase();
-  return STICKY_COLORS.includes(text) ? text : 'yellow';
-}
-
-function normalizeStickyFont(value) {
-  const text = String(value || '').toLowerCase();
-  return STICKY_FONTS.includes(text) ? text : 'hand';
-}
-
-function normalizeStickyRotation(value) {
-  const numeric = Number(value);
-  if (!Number.isFinite(numeric)) return 0;
-  // Clamp the tilt so a note can never end up unreadable.
-  return Math.max(-4, Math.min(4, Math.round(numeric * 100) / 100));
-}
 
 async function handleFinanceRoute({ db, request, url, route, user, env }) {
   const [resource, id] = route;
@@ -1172,33 +1165,6 @@ async function syncFinanceProfileCurrency(db, userId, currency) {
 // the only other currency the ledger supports — see normalizeCurrency.
 const INR_TIMEZONES = new Set(['Asia/Kolkata', 'Asia/Calcutta']);
 
-// Regions offered in Settings, so a detected region always matches an option
-// in that dropdown rather than writing a value the select can't display.
-const DETECTABLE_REGIONS = new Set(['IN', 'US', 'GB', 'AE', 'SG']);
-
-const TIMEZONE_REGIONS = {
-  'Asia/Kolkata': 'IN',
-  'Asia/Calcutta': 'IN',
-  'Asia/Dubai': 'AE',
-  'Asia/Singapore': 'SG',
-  'Europe/London': 'GB',
-};
-
-// Country the browser signals point at, preferring the locale's explicit region
-// subtag ('en-US') and falling back to the timezone when the locale has none.
-function detectRegion(timezone, locale) {
-  const fromLocale = String(locale || '').split(/[-_]/)[1];
-
-  if (fromLocale && DETECTABLE_REGIONS.has(fromLocale.toUpperCase())) {
-    return fromLocale.toUpperCase();
-  }
-
-  if (TIMEZONE_REGIONS[timezone]) {
-    return TIMEZONE_REGIONS[timezone];
-  }
-
-  return timezone && timezone.startsWith('America/') ? 'US' : null;
-}
 
 // Applied only to a row nobody has ever chosen a currency on, so a returning
 // user's INR/USD choice survives every subsequent login untouched.
@@ -1227,12 +1193,6 @@ async function detectUserPreferences(db, userId, payload) {
   );
 }
 
-function validateEnum(value, allowed, label) {
-  if (!allowed.has(value)) {
-    throw new HttpError(400, `Invalid ${label}.`);
-  }
-  return value;
-}
 
 async function handleIntegrationsRoute({ db, request, route, user }) {
   const [service] = route;
@@ -3303,36 +3263,6 @@ async function createPantryItemsBulk(db, userId, items) {
   return created;
 }
 
-const PANTRY_SCAN_CATEGORIES = [
-  'Produce',
-  'Dairy',
-  'Meat & Seafood',
-  'Bakery',
-  'Beverages',
-  'Frozen',
-  'Pantry',
-  'Snacks',
-  'Household',
-  'Miscellaneous',
-];
-
-const EXPENSE_SCAN_CATEGORIES = [
-  'Food',
-  'Shopping',
-  'Travel',
-  'Fuel',
-  'Health',
-  'Entertainment',
-  'Education',
-  'Utilities',
-  'Rent',
-  'Family',
-  'Pets',
-  'Taxes',
-  'Charity',
-  'Personal Care',
-  'Miscellaneous',
-];
 
 const RECEIPT_SUMMARY_PROPERTIES = {
   merchant: { type: 'STRING' },
@@ -3489,20 +3419,6 @@ const GEMINI_SCAN_MODELS = [
   'gemini-flash-latest',
 ];
 
-/** Pulls the JSON object out of a model reply, tolerating ```json fences. */
-function parseModelJson(rawText) {
-  const text = String(rawText || '').trim();
-
-  if (!text) {
-    return null;
-  }
-
-  const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/);
-  const candidate = fenced ? fenced[1].trim() : text;
-  const parsed = parseJson(candidate, null);
-
-  return parsed && typeof parsed === 'object' ? parsed : null;
-}
 
 /** Seconds Google says to wait, from the RetryInfo on a 429. */
 function quotaRetrySeconds(detail) {
@@ -3679,149 +3595,6 @@ async function scanDocument(env, payload, mode = 'bill') {
   return { items, receipt, transactions };
 }
 
-/**
- * Statement rows stay as individual entries — one per payment — so the user sees
- * who they paid and when, rather than a single meaningless total. Credits are
- * kept separate so they can land in miscellaneous income instead of salary.
- */
-function normalizeScanTransactions(raw) {
-  if (!Array.isArray(raw)) {
-    return [];
-  }
-
-  return raw
-    .map((entry) => {
-      if (!entry || typeof entry !== 'object') return null;
-
-      const amountMinor = toMinor(entry.amount);
-      const description = String(entry.description || '').trim().slice(0, 160);
-      const occurredOn = normalizeStatementDate(entry.date);
-
-      if (!amountMinor || amountMinor <= 0 || !occurredOn) return null;
-
-      const isCredit = String(entry.direction || '').toLowerCase().startsWith('cr');
-
-      return {
-        occurredOn,
-        description: description || (isCredit ? 'Received' : 'Payment'),
-        direction: isCredit ? 'credit' : 'debit',
-        amountMinor,
-        category: isCredit ? MISC_INCOME_CATEGORY : normalizeScanExpenseCategory(entry.category),
-      };
-    })
-    .filter(Boolean)
-    .sort((a, b) => (a.occurredOn < b.occurredOn ? 1 : -1))
-    .slice(0, 500);
-}
-
-/**
- * Strict statement-row date. Unlike normalizeScanDate this returns null instead
- * of falling back to today — a row whose date we cannot read must be dropped,
- * not silently filed under the wrong day.
- */
-function normalizeStatementDate(value) {
-  const text = String(value || '').trim();
-  const match = text.match(/^(\d{4})-(\d{1,2})-(\d{1,2})/);
-
-  if (!match) return null;
-
-  const iso = `${match[1]}-${match[2].padStart(2, '0')}-${match[3].padStart(2, '0')}`;
-  const date = new Date(`${iso}T00:00:00Z`);
-
-  return Number.isNaN(date.getTime()) ? null : iso;
-}
-
-/**
- * Rows that restate the sum of other rows rather than being a charge of their
- * own. Anchored so a genuine item like "Total Fitness protein bar" or a
- * "Subtotal cream 50g" product name is not mistaken for a summary row.
- */
-const SUMMARY_LINE_PATTERN = /^(sub[\s-]?total|total|grand[\s-]?total|gross(\s+(amount|total))?|net(\s+(payable|amount|total))?|amount\s+(due|payable)|balance(\s+due)?|items?\s+count|no\.?\s+of\s+items)\b[\s:.]*$/i;
-
-function normalizeScanReceipt(raw) {
-  if (!raw || typeof raw !== 'object') {
-    return null;
-  }
-
-  const totalMinor = toMinor(raw.total);
-  const merchant = String(raw.merchant || '').trim().slice(0, 160);
-
-  if (!merchant && totalMinor <= 0) {
-    return null;
-  }
-
-  // Every printed line is kept, including zero-amount and negative (discount)
-  // lines — the user decides what counts, so nothing is silently dropped here.
-  // Summary rows are the one exception: they total the other lines, so letting
-  // one through would double-count the bill. Some models list them despite
-  // being told not to, so they are filtered here as well.
-  const lineItems = (Array.isArray(raw.lineItems) ? raw.lineItems : [])
-    .filter((line) => line && String(line.description || '').trim())
-    .filter((line) => !SUMMARY_LINE_PATTERN.test(String(line.description).trim()))
-    .slice(0, 200)
-    .map((line) => {
-      const amount = Number(line.amount);
-      const magnitudeMinor = toMinor(Math.abs(Number.isFinite(amount) ? amount : 0));
-
-      return {
-        description: String(line.description).trim().slice(0, 160),
-        quantity: sanitizeScanQuantity(line.quantity),
-        amountMinor: Number.isFinite(amount) && amount < 0 ? -magnitudeMinor : magnitudeMinor,
-        category: normalizeScanExpenseCategory(line.category || raw.category),
-      };
-    });
-
-  return {
-    merchant,
-    totalMinor,
-    currency: normalizeCurrency(raw.currency || 'INR'),
-    date: normalizeScanDate(raw.date),
-    category: normalizeScanExpenseCategory(raw.category),
-    lineItems,
-  };
-}
-
-function normalizeScanCategory(value) {
-  const text = String(value || '').trim();
-  const match = PANTRY_SCAN_CATEGORIES.find((category) => category.toLowerCase() === text.toLowerCase());
-  return match || 'Miscellaneous';
-}
-
-function normalizeScanExpenseCategory(value) {
-  const text = String(value || '').trim();
-  const match = EXPENSE_SCAN_CATEGORIES.find((category) => category.toLowerCase() === text.toLowerCase());
-  return match || 'Miscellaneous';
-}
-
-function normalizeScanDate(value) {
-  const text = String(value || '').trim().slice(0, 10);
-
-  if (/^\d{4}-\d{2}-\d{2}$/.test(text)) {
-    return text;
-  }
-
-  return today();
-}
-
-function sanitizeScanQuantity(value) {
-  const numeric = Number(value);
-
-  if (!Number.isFinite(numeric) || numeric <= 0) {
-    return 1;
-  }
-
-  return Math.round(numeric * 100) / 100;
-}
-
-function toMinor(value) {
-  const numeric = Number(value);
-
-  if (!Number.isFinite(numeric) || numeric <= 0) {
-    return 0;
-  }
-
-  return Math.round(numeric * 100);
-}
 
 async function listMealPlan(db, userId, from, to) {
   const result = await db
@@ -3932,13 +3705,6 @@ async function deleteMealPlanEntry(db, userId, id) {
     .run();
 }
 
-function normalizeMealSlot(value) {
-  return normalizeEnum(value, ['breakfast', 'lunch', 'dinner', 'snack'], 'Invalid meal slot.');
-}
-
-function normalizeMealStatus(value) {
-  return normalizeEnum(value, ['planned', 'cooked', 'skipped', 'leftover'], 'Invalid meal status.');
-}
 
 function mapMealEntry(row) {
   return {
@@ -5111,13 +4877,6 @@ function budgetUsagePercent(budgets) {
   return limit > 0 ? Math.round((spent / limit) * 1000) / 10 : 0;
 }
 
-function normalizeRoute(pathname) {
-  return pathname
-    .replace(/^\/api\/?/, '')
-    .split('/')
-    .map((part) => part.trim())
-    .filter(Boolean);
-}
 
 // ---------------------------------------------------------------------------
 // Admin — platform management (owner / admin only)
@@ -5869,9 +5628,6 @@ function cadenceDays(cadence) {
   return { weekly: 7, monthly: 30, quarterly: 91, yearly: 365 }[cadence] || 30;
 }
 
-function normalizeMerchantKey(value) {
-  return String(value || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
-}
 
 function mapSubscription(row) {
   return {
@@ -6348,15 +6104,6 @@ async function sha256Base64Url(value) {
   return bytesToBase64Url(new Uint8Array(digest));
 }
 
-function normalizeEmail(email) {
-  const normalized = String(email || '').trim().toLowerCase();
-
-  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalized)) {
-    throw new HttpError(400, 'Enter a valid email address.');
-  }
-
-  return normalized;
-}
 
 function readCookie(request, name) {
   const cookie = request.headers.get('cookie') || '';
@@ -6412,139 +6159,6 @@ function base64UrlToBytes(value) {
   return bytes;
 }
 
-function normalizeTransactionType(type) {
-  const normalized = String(type || '').toLowerCase();
-  const allowed = new Set(['income', 'expense', 'transfer', 'refund']);
-
-  if (!allowed.has(normalized)) {
-    throw new HttpError(400, 'Transaction type must be income, expense, transfer, or refund.');
-  }
-
-  return normalized;
-}
-
-function normalizeLiabilityType(type) {
-  const normalized = String(type || '').toLowerCase();
-  const allowed = new Set(['loan', 'credit_card', 'emi', 'mortgage', 'other']);
-
-  if (!allowed.has(normalized)) {
-    throw new HttpError(400, 'Loan type must be loan, credit_card, emi, mortgage, or other.');
-  }
-
-  return normalized;
-}
-
-function normalizePantryStatus(status) {
-  return normalizeEnum(status, ['active', 'used', 'expired', 'deleted'], 'Invalid pantry status.');
-}
-
-function normalizeShoppingStatus(status) {
-  return normalizeEnum(status, ['open', 'purchased', 'dismissed', 'deleted'], 'Invalid shopping status.');
-}
-
-function normalizeShoppingSource(source) {
-  return normalizeEnum(source, ['manual', 'low_stock', 'recipe', 'system'], 'Invalid shopping source.');
-}
-
-function normalizeVehicleStatus(status) {
-  return normalizeEnum(status, ['parked', 'driving', 'charging', 'service', 'inactive', 'deleted'], 'Invalid vehicle status.');
-}
-
-function normalizeMaintenanceStatus(status) {
-  return normalizeEnum(status, ['open', 'scheduled', 'done', 'dismissed', 'deleted'], 'Invalid maintenance status.');
-}
-
-function normalizePriority(priority) {
-  return normalizeEnum(priority, ['low', 'normal', 'high'], 'Invalid priority.');
-}
-
-function normalizeEnum(value, allowed, message) {
-  const normalized = String(value || '').trim().toLowerCase();
-
-  if (!allowed.includes(normalized)) {
-    throw new HttpError(400, message);
-  }
-
-  return normalized;
-}
-
-function normalizeCurrency(currency) {
-  const normalized = String(currency || 'INR').trim().toUpperCase();
-
-  if (!['USD', 'INR'].includes(normalized)) {
-    throw new HttpError(400, 'Currency must be USD or INR.');
-  }
-
-  return normalized;
-}
-
-function normalizeMoney(amountMinor, amount) {
-  if (amountMinor !== undefined && amountMinor !== null && amountMinor !== '') {
-    return normalizeAmount(amountMinor, true);
-  }
-
-  return normalizeAmount(amount, false);
-}
-
-function moneyFromPayload(payload, minorKeys, amountKeys) {
-  for (const key of minorKeys) {
-    if (payload[key] !== undefined && payload[key] !== null && payload[key] !== '') {
-      return normalizeAmount(payload[key], true);
-    }
-  }
-
-  for (const key of amountKeys) {
-    if (payload[key] !== undefined && payload[key] !== null && payload[key] !== '') {
-      return normalizeAmount(payload[key], false);
-    }
-  }
-
-  return undefined;
-}
-
-function requiredMoneyFromPayload(payload, minorKeys, amountKeys, message) {
-  const value = moneyFromPayload(payload, minorKeys, amountKeys);
-
-  if (value === undefined) {
-    throw new HttpError(400, message || 'Amount is required.');
-  }
-
-  return value;
-}
-
-function normalizeAmount(value, alreadyMinor) {
-  if (value === undefined || value === null || value === '') {
-    throw new HttpError(400, 'Amount is required.');
-  }
-
-  const numeric = Number(value);
-
-  if (!Number.isFinite(numeric) || numeric < 0) {
-    throw new HttpError(400, 'Amount must be a positive number.');
-  }
-
-  return alreadyMinor ? Math.round(numeric) : Math.round(numeric * 100);
-}
-
-function requiredText(value, message) {
-  const text = String(value || '').trim();
-
-  if (!text) {
-    throw new HttpError(400, message);
-  }
-
-  return text;
-}
-
-function normalizeQuantity(value) {
-  const numeric = Number(value);
-
-  if (!Number.isFinite(numeric) || numeric < 0) {
-    throw new HttpError(400, 'Quantity must be a positive number.');
-  }
-
-  return numeric;
-}
 
 function clampInteger(value, min, max) {
   const numeric = Math.round(Number(value));
@@ -6596,19 +6210,6 @@ async function updateById(db, tableName, userId, id, fields) {
     .run();
 }
 
-function normalizeDate(value) {
-  if (!value) {
-    throw new HttpError(400, 'Date is required.');
-  }
-
-  const date = new Date(`${String(value).slice(0, 10)}T00:00:00Z`);
-
-  if (Number.isNaN(date.getTime())) {
-    throw new HttpError(400, 'Date must be a valid YYYY-MM-DD value.');
-  }
-
-  return date.toISOString().slice(0, 10);
-}
 
 function monthBounds(value) {
   const date = new Date(`${String(value).slice(0, 10)}T00:00:00Z`);
@@ -6649,17 +6250,6 @@ function nextPaymentDateFromDueDay(value) {
   return paymentDate.toISOString().slice(0, 10);
 }
 
-function today() {
-  return new Date().toISOString().slice(0, 10);
-}
-
-function parseJson(value, fallback) {
-  try {
-    return value ? JSON.parse(value) : fallback;
-  } catch {
-    return fallback;
-  }
-}
 
 function csvCell(value) {
   const text = String(value ?? '');
@@ -6695,12 +6285,6 @@ function sendJson(payload, status = 200, headers = {}) {
   });
 }
 
-class HttpError extends Error {
-  constructor(status, message) {
-    super(message);
-    this.status = status;
-  }
-}
 
 // ---------------------------------------------------------------------------
 // AI Dev Planner & Comprehension Tool (admin only)
