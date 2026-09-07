@@ -120,24 +120,29 @@ export default function FinanceHub() {
     }
   }, [prefsLoading, preferredCurrency]);
 
-  const loadFinance = useCallback(async () => {
+  const loadFinance = useCallback(async ({ background = false } = {}) => {
     if (!selectedCurrency) {
       return;
     }
 
-    setIsLoading(true);
+    if (!background) setIsLoading(true);
     setApiError('');
 
     try {
       const data = await getFinanceDashboard(selectedCurrency, asOf);
       setFinance(data);
     } catch (error) {
-      setFinance(null);
+      if (!background) setFinance(null);
       setApiError(error.message || 'Finance API is not available.');
     } finally {
-      setIsLoading(false);
+      if (!background) setIsLoading(false);
     }
   }, [selectedCurrency, asOf]);
+
+  const refreshFinance = useCallback(
+    () => loadFinance({ background: true }),
+    [loadFinance],
+  );
 
   useEffect(() => {
     loadFinance();
@@ -272,7 +277,7 @@ export default function FinanceHub() {
       });
       setQuickAddOpen(false);
       setEditingTxId(null);
-      await loadFinance();
+      refreshFinance();
     } catch (error) {
       setApiError(error.message || 'Could not save transaction.');
     } finally {
@@ -302,7 +307,7 @@ export default function FinanceHub() {
   const removeTransaction = async (id) => {
     try {
       await deleteFinanceTransaction(id);
-      await loadFinance();
+      refreshFinance();
     } catch (err) {
       setApiError(err.message || 'Could not delete transaction.');
     }
@@ -339,7 +344,7 @@ export default function FinanceHub() {
             budgets={finance.budgets || []}
             currency={currency}
             categories={categories}
-            onChanged={loadFinance}
+            onChanged={refreshFinance}
           />
         );
       case 'goals':
@@ -348,7 +353,7 @@ export default function FinanceHub() {
             goals={finance.goals || []}
             habits={finance.habits || []}
             currency={currency}
-            onChanged={loadFinance}
+            onChanged={refreshFinance}
           />
         );
       case 'accounts':
@@ -356,7 +361,7 @@ export default function FinanceHub() {
           <AccountsPanel
             accounts={finance.accounts || []}
             currency={currency}
-            onChanged={loadFinance}
+            onChanged={refreshFinance}
           />
         );
       case 'reports':
@@ -366,7 +371,7 @@ export default function FinanceHub() {
           <BillScanner
             currency={currency}
             expenseCategories={categories.filter((category) => category.type === 'expense')}
-            onImported={loadFinance}
+            onImported={refreshFinance}
           />
         );
       case 'liabilities':
@@ -460,7 +465,7 @@ export default function FinanceHub() {
           currency={currency}
           onClose={() => setImportOpen(false)}
           onImported={() => {
-            loadFinance();
+            refreshFinance();
             setAnalytics(null);
           }}
         />

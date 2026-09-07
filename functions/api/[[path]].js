@@ -51,6 +51,7 @@ export { MISC_INCOME_CATEGORY };
 
 const DEFAULT_USER_ID = 'demo-user';
 const DEFAULT_USER_EMAIL = 'demo@lifeos.local';
+const provisionedUsers = new Set();
 
 const jsonHeaders = {
   'content-type': 'application/json; charset=utf-8',
@@ -124,16 +125,35 @@ export async function onRequest(context) {
     }
 
     if (route[0] === 'auth') {
-      return await handleAuthRoute({ db: env.DB, request, route: route.slice(1), env });
+      return await handleAuthRoute({
+        db: env.DB,
+        request,
+        route: route.slice(1),
+        env,
+        waitUntil: context.waitUntil ? context.waitUntil.bind(context) : null,
+      });
     }
 
-    const auth = await authenticateRequest(request, env.DB, env);
+    const auth = await authenticateRequest(request, env.DB, env, {
+      waitUntil: context.waitUntil ? context.waitUntil.bind(context) : null,
+    });
 
     if (auth.error) {
       return sendJson({ error: auth.error }, 401);
     }
 
-    await ensureUser(env.DB, auth);
+    // Password users are fully provisioned during registration. Access/demo
+    // identities are created lazily, once per warm isolate, instead of making
+    // every API request issue dozens of INSERT OR IGNORE writes.
+    if (auth.mode !== 'public' && !provisionedUsers.has(auth.userId)) {
+      await ensureUser(env.DB, auth);
+      provisionedUsers.add(auth.userId);
+    }
+
+    if (route[0] === 'dashboard') {
+      assertMethod(request, 'GET');
+      return sendJson(await getDashboard(env.DB, auth, url));
+    }
 
     if (route[0] === 'finance') {
       return await handleFinanceRoute({ db: env.DB, request, url, route: route.slice(1), user: auth, env });
@@ -364,6 +384,32 @@ function mapStickyNote(row) {
     isPinned: Number(row.is_pinned || 0) === 1,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
+  };
+}
+
+async function getDashboard(db, user, url) {
+  const dashboardDate = url.searchParams.get('date')
+    ? normalizeDate(url.searchParams.get('date'))
+    : today();
+
+  const [finance, car, pantry, entries] = await Promise.all([
+    getFinanceSummary(db, user.userId, url),
+    getCarSummary(db, user.userId),
+    getPantrySummary(db, user.userId),
+    listMealPlan(db, user.userId, dashboardDate, dashboardDate),
+  ]);
+
+  return {
+    user: {
+      id: user.userId,
+      email: user.email,
+      displayName: user.displayName,
+      role: user.role || 'user',
+    },
+    finance,
+    car,
+    pantry,
+    meals: { entries },
   };
 }
 
@@ -708,7 +754,7 @@ async function handleCarRoute({ db, request, route, user }) {
   return sendJson({ error: 'Not found' }, 404);
 }
 
-async function handleAuthRoute({ db, request, route, env }) {
+async function handleAuthRoute({ db, request, route, env, waitUntil }) {
   const [resource] = route;
 
   if (resource === 'register' && request.method === 'POST') {
@@ -805,16 +851,23 @@ async function handleAuthRoute({ db, request, route, env }) {
   }
 
   if (resource === 'me' && request.method === 'GET') {
-    const auth = await authenticateRequest(request, db, env, { allowDemo: false });
+    const auth = await authenticateRequest(request, db, env, { allowDemo: false, waitUntil });
 
     if (auth.error) {
       return sendJson({ authenticated: false });
     }
 
-    const userRow = await db
-      .prepare('SELECT has_completed_onboarding FROM users WHERE id = ?')
-      .bind(auth.userId)
-      .first();
+    if (auth.mode === 'access' && !provisionedUsers.has(auth.userId)) {
+      await ensureUser(db, auth);
+      provisionedUsers.add(auth.userId);
+    }
+
+    const userRow = auth.hasCompletedOnboarding === undefined
+      ? await db
+        .prepare('SELECT has_completed_onboarding FROM users WHERE id = ?')
+        .bind(auth.userId)
+        .first()
+      : null;
 
     return sendJson({
       authenticated: true,
@@ -824,7 +877,8 @@ async function handleAuthRoute({ db, request, route, env }) {
         displayName: auth.displayName,
         mode: auth.mode,
         role: auth.role || 'user',
-        hasCompletedOnboarding: Boolean(userRow?.has_completed_onboarding),
+        hasCompletedOnboarding: auth.hasCompletedOnboarding
+          ?? Boolean(userRow?.has_completed_onboarding),
       },
     });
   }
@@ -848,18 +902,15 @@ async function handleAuthRoute({ db, request, route, env }) {
 }
 
 async function ensureUser(db, user) {
-  await db
-    .prepare(
+  const statements = [
+    db.prepare(
       `
       INSERT OR IGNORE INTO users (id, email, display_name)
       VALUES (?, ?, ?)
-    `,
+      `,
     )
-    .bind(user.userId, user.email, user.displayName)
-    .run();
-
-  await db
-    .prepare(
+      .bind(user.userId, user.email, user.displayName),
+    db.prepare(
       `
       INSERT OR IGNORE INTO finance_profiles (
         user_id,
@@ -871,60 +922,46 @@ async function ensureUser(db, user) {
         dashboard_widgets_json
       )
       VALUES (?, 'INR', 'USD', '["INR","USD"]', 'YYYY-MM-DD', 1, '["cash_flow","budgets","goals","insights","recent_transactions"]')
-    `,
+      `,
     )
-    .bind(user.userId)
-    .run();
-
-  await db
-    .prepare('INSERT OR IGNORE INTO user_preferences (user_id) VALUES (?)')
-    .bind(user.userId)
-    .run();
-
-  await db
-    .prepare(
+      .bind(user.userId),
+    db.prepare('INSERT OR IGNORE INTO user_preferences (user_id) VALUES (?)')
+      .bind(user.userId),
+    db.prepare(
       `
       INSERT OR IGNORE INTO finance_accounts (id, user_id, name, type, currency, opening_balance_minor, current_balance_minor)
       VALUES (?, ?, 'USD Wallet', 'wallet', 'USD', 0, 0)
-    `,
+      `,
     )
-    .bind(`acct-${user.userId}-usd`, user.userId)
-    .run();
-
-  await db
-    .prepare(
+      .bind(`acct-${user.userId}-usd`, user.userId),
+    db.prepare(
       `
       INSERT OR IGNORE INTO finance_accounts (id, user_id, name, type, currency, opening_balance_minor, current_balance_minor)
       VALUES (?, ?, 'INR Wallet', 'wallet', 'INR', 0, 0)
-    `,
+      `,
     )
-    .bind(`acct-${user.userId}-inr`, user.userId)
-    .run();
+      .bind(`acct-${user.userId}-inr`, user.userId),
+  ];
 
-  for (const category of defaultIncomeCategories) {
-    await ensureCategory(db, user.userId, category, 'income');
-  }
+  const categories = [
+    ...defaultIncomeCategories.map((category) => [category, 'income']),
+    ...defaultExpenseCategories.map((category) => [category, 'expense']),
+    [['cat-transfer', 'Transfer', '#0058be', 'Repeat2', 10], 'transfer'],
+  ];
 
-  for (const category of defaultExpenseCategories) {
-    await ensureCategory(db, user.userId, category, 'expense');
-  }
-
-  await ensureCategory(db, user.userId, ['cat-transfer', 'Transfer', '#0058be', 'Repeat2', 10], 'transfer');
-}
-
-async function ensureCategory(db, userId, category, type) {
-  const [id, name, color, icon, sortOrder] = category;
-
-  await db
-    .prepare(
+  for (const [category, type] of categories) {
+    const [id, name, color, icon, sortOrder] = category;
+    statements.push(db.prepare(
       `
       INSERT OR IGNORE INTO finance_categories
         (id, user_id, name, type, color, icon, sort_order, is_system)
       VALUES (?, ?, ?, ?, ?, ?, ?, 1)
-    `,
+      `,
     )
-    .bind(idForUser(id, userId), userId, name, type, color, icon, sortOrder)
-    .run();
+      .bind(idForUser(id, user.userId), user.userId, name, type, color, icon, sortOrder));
+  }
+
+  await db.batch(statements);
 }
 
 // ---------------------------------------------------------------------------
@@ -1259,20 +1296,37 @@ async function getFinanceSummary(db, userId, url) {
   const { start, nextStart, previousStart } = monthBounds(asOf);
   const profile = await getProfile(db, userId);
   const selectedCurrency = normalizeCurrency(url.searchParams.get('currency') || profile.currency);
-  const cashflow = await monthlyCashflow(db, userId, start, nextStart, selectedCurrency);
-  const previousCashflow = await monthlyCashflow(db, userId, previousStart, start, selectedCurrency);
-  const savedMinor = await savedThisPeriod(db, userId, start, nextStart, selectedCurrency);
-  const balance = await accountBalance(db, userId, selectedCurrency);
-  const netWorth = await getNetWorth(db, userId, selectedCurrency);
-  const accounts = await listAccounts(db, userId);
-  const budgets = await listBudgets(db, userId, url, selectedCurrency);
-  const goals = await listGoals(db, userId, selectedCurrency);
-  const insights = await listInsights(db, userId);
-  const habits = await listHabits(db, userId);
-  const notifications = await listNotifications(db, userId);
-  const categories = await listCategories(db, userId);
-  const recentTransactions = await listTransactions(db, userId, url, 6);
-  const categorySpend = await spendingByCategory(db, userId, start, nextStart, selectedCurrency);
+  const [
+    cashflow,
+    previousCashflow,
+    savedMinor,
+    balance,
+    netWorth,
+    accounts,
+    budgets,
+    goals,
+    insights,
+    habits,
+    notifications,
+    categories,
+    recentTransactions,
+    categorySpend,
+  ] = await Promise.all([
+    monthlyCashflow(db, userId, start, nextStart, selectedCurrency),
+    monthlyCashflow(db, userId, previousStart, start, selectedCurrency),
+    savedThisPeriod(db, userId, start, nextStart, selectedCurrency),
+    accountBalance(db, userId, selectedCurrency),
+    getNetWorth(db, userId, selectedCurrency),
+    listAccounts(db, userId),
+    listBudgets(db, userId, url, selectedCurrency),
+    listGoals(db, userId, selectedCurrency),
+    listInsights(db, userId),
+    listHabits(db, userId),
+    listNotifications(db, userId),
+    listCategories(db, userId),
+    listTransactions(db, userId, url, 6),
+    spendingByCategory(db, userId, start, nextStart, selectedCurrency),
+  ]);
 
   const netCashflowMinor = cashflow.incomeMinor - cashflow.expenseMinor;
   // Savings rate is what share of income was actually set aside, not what
@@ -1442,6 +1496,10 @@ async function listTransactions(db, userId, url, defaultLimit = 50) {
     values.push(filters.categoryId);
   }
 
+  if (filters.receiptOnly) {
+    where.push("(t.source = 'receipt' OR t.receipt_id IS NOT NULL)");
+  }
+
   if (filters.startDate) {
     where.push('t.occurred_on >= ?');
     values.push(filters.startDate);
@@ -1529,10 +1587,13 @@ async function createTransaction(db, userId, payload) {
   const amountMinor = normalizeMoney(payload.amountMinor, payload.amount);
   let currency = normalizeCurrency(payload.currency || 'INR');
   const occurredOn = normalizeDate(payload.occurredOn || payload.date || today());
-  let accountId = payload.accountId || (await defaultAccountId(db, userId, currency));
-  // Transfers use the system "Transfer" category by default rather than
-  // asking the user to pick one — moving your own money isn't spending.
-  const categoryId = await resolveCategoryId(db, userId, type, payload.categoryId, payload.category || (type === 'transfer' ? 'Transfer' : undefined));
+  const [resolvedAccountId, categoryId] = await Promise.all([
+    payload.accountId ? Promise.resolve(payload.accountId) : defaultAccountId(db, userId, currency),
+    // Transfers use the system "Transfer" category by default rather than
+    // asking the user to pick one — moving your own money isn't spending.
+    resolveCategoryId(db, userId, type, payload.categoryId, payload.category || (type === 'transfer' ? 'Transfer' : undefined)),
+  ]);
+  let accountId = resolvedAccountId;
   const receiptId = payload.receiptId || null;
 
   let toAccountId = null;
@@ -1563,8 +1624,7 @@ async function createTransaction(db, userId, payload) {
     }
   }
 
-  await db
-    .prepare(
+  const statements = [db.prepare(
       `
       INSERT INTO finance_transactions (
         id,
@@ -1587,7 +1647,7 @@ async function createTransaction(db, userId, payload) {
         ai_category_confidence
       )
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `,
+      `,
     )
     .bind(
       id,
@@ -1608,14 +1668,13 @@ async function createTransaction(db, userId, payload) {
       JSON.stringify(payload.tags || []),
       payload.source || 'manual',
       payload.aiCategoryConfidence ?? null,
-    )
-    .run();
+    )];
 
-  await applyAccountDelta(db, accountId, accountDelta(type, amountMinor));
-
-  if (type === 'transfer' && toAccountId) {
-    await applyAccountDelta(db, toAccountId, amountMinor);
-  }
+  appendAccountDeltaStatements(db, statements, new Map([
+    [accountId, accountDelta(type, amountMinor)],
+    ...(type === 'transfer' && toAccountId ? [[toAccountId, amountMinor]] : []),
+  ]));
+  await db.batch(statements);
 
   return getTransaction(db, userId, id);
 }
@@ -1674,52 +1733,49 @@ async function updateTransaction(db, userId, id, payload) {
   const assignments = updates.map(([key]) => `${key} = ?`);
   const values = updates.map(([, value]) => value);
 
-  await db
-    .prepare(
+  const updateStatement = db.prepare(
       `
       UPDATE finance_transactions
       SET ${assignments.join(', ')}, updated_at = CURRENT_TIMESTAMP
       WHERE id = ? AND user_id = ?
     `,
     )
-    .bind(...values, id, userId)
-    .run();
+    .bind(...values, id, userId);
 
-  const updated = await getTransaction(db, userId, id);
+  const nextAmountMinor = allowed.amount_minor ?? existing.amountMinor;
+  const deltas = new Map();
+  addAccountDelta(deltas, existing.accountId, -accountDelta(existing.type, existing.amountMinor));
+  if (existing.type === 'transfer') addAccountDelta(deltas, existing.toAccountId, -existing.amountMinor);
+  addAccountDelta(deltas, existing.accountId, accountDelta(nextType, nextAmountMinor));
+  if (nextType === 'transfer') addAccountDelta(deltas, nextToAccountId, nextAmountMinor);
 
-  await applyAccountDelta(db, existing.accountId, -accountDelta(existing.type, existing.amountMinor));
-  if (existing.type === 'transfer' && existing.toAccountId) {
-    await applyAccountDelta(db, existing.toAccountId, -existing.amountMinor);
-  }
+  const statements = [updateStatement];
+  appendAccountDeltaStatements(db, statements, deltas);
+  await db.batch(statements);
 
-  await applyAccountDelta(db, updated.accountId, accountDelta(updated.type, updated.amountMinor));
-  if (updated.type === 'transfer' && updated.toAccountId) {
-    await applyAccountDelta(db, updated.toAccountId, updated.amountMinor);
-  }
-
-  return updated;
+  return getTransaction(db, userId, id);
 }
 
 async function softDeleteTransaction(db, userId, id) {
   const existing = await getTransaction(db, userId, id);
 
-  await db
-    .prepare(
+  const statements = [db.prepare(
       `
       UPDATE finance_transactions
       SET status = 'deleted', updated_at = CURRENT_TIMESTAMP
       WHERE id = ? AND user_id = ?
     `,
     )
-    .bind(id, userId)
-    .run();
+    .bind(id, userId)];
 
   if (existing) {
-    await applyAccountDelta(db, existing.accountId, -accountDelta(existing.type, existing.amountMinor));
-    if (existing.type === 'transfer' && existing.toAccountId) {
-      await applyAccountDelta(db, existing.toAccountId, -existing.amountMinor);
-    }
+    const deltas = new Map();
+    addAccountDelta(deltas, existing.accountId, -accountDelta(existing.type, existing.amountMinor));
+    if (existing.type === 'transfer') addAccountDelta(deltas, existing.toAccountId, -existing.amountMinor);
+    appendAccountDeltaStatements(db, statements, deltas);
   }
+
+  await db.batch(statements);
 }
 
 async function getTransaction(db, userId, id) {
@@ -1856,15 +1912,6 @@ async function createBudget(db, userId, payload) {
 }
 
 async function updateBudget(db, userId, id, payload) {
-  const existing = await db
-    .prepare('SELECT * FROM finance_budgets WHERE id = ? AND user_id = ?')
-    .bind(id, userId)
-    .first();
-
-  if (!existing) {
-    throw new HttpError(404, 'Budget not found');
-  }
-
   const categoryId = payload.categoryId !== undefined
     ? payload.categoryId || null
     : (payload.category ? await resolveCategoryId(db, userId, 'expense', null, payload.category) : undefined);
@@ -1888,7 +1935,7 @@ async function updateBudget(db, userId, id, payload) {
   const updates = Object.entries(allowed).filter(([, value]) => value !== undefined);
 
   if (updates.length) {
-    await db
+    const result = await db
       .prepare(
         `
         UPDATE finance_budgets
@@ -1898,9 +1945,15 @@ async function updateBudget(db, userId, id, payload) {
       )
       .bind(...updates.map(([, value]) => value), id, userId)
       .run();
+
+    if (result.meta && result.meta.changes === 0) {
+      throw new HttpError(404, 'Budget not found');
+    }
   }
 
-  return getBudget(db, userId, id);
+  const budget = await getBudget(db, userId, id);
+  if (!budget) throw new HttpError(404, 'Budget not found');
+  return budget;
 }
 
 async function deleteBudget(db, userId, id) {
@@ -1977,7 +2030,7 @@ async function listGoals(db, userId, selectedCurrency) {
 async function createGoal(db, userId, payload) {
   const id = payload.id || crypto.randomUUID();
 
-  await db
+  const row = await db
     .prepare(
       `
       INSERT INTO finance_goals (
@@ -1993,6 +2046,7 @@ async function createGoal(db, userId, payload) {
         recommendation
       )
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      RETURNING *
     `,
     )
     .bind(
@@ -2007,14 +2061,9 @@ async function createGoal(db, userId, payload) {
       payload.priority || 3,
       payload.recommendation || null,
     )
-    .run();
-
-  const row = await db
-    .prepare('SELECT * FROM finance_goals WHERE id = ? AND user_id = ?')
-    .bind(id, userId)
     .first();
 
-  return row ? mapGoal(row) : null;
+  return mapGoal(row);
 }
 
 async function updateGoal(db, userId, id, payload) {
@@ -2035,20 +2084,22 @@ async function updateGoal(db, userId, id, payload) {
   const updates = Object.entries(allowed).filter(([, value]) => value !== undefined);
 
   if (updates.length) {
-    await db
+    const row = await db
       .prepare(
         `
         UPDATE finance_goals
         SET ${updates.map(([key]) => `${key} = ?`).join(', ')}, updated_at = CURRENT_TIMESTAMP
         WHERE id = ? AND user_id = ?
+        RETURNING *
       `,
       )
       .bind(...updates.map(([, value]) => value), id, userId)
-      .run();
+      .first();
+
+    if (!row) throw new HttpError(404, 'Goal not found');
+    return mapGoal(row);
   }
 
-  // Read the row back directly — listGoals hides archived goals, so archiving
-  // one through this endpoint would otherwise return undefined.
   const row = await db
     .prepare('SELECT * FROM finance_goals WHERE id = ? AND user_id = ?')
     .bind(id, userId)
@@ -2078,15 +2129,6 @@ async function deleteGoal(db, userId, id) {
  * starting balance and lose one of the contributions.
  */
 async function contributeToGoal(db, userId, id, payload) {
-  const existing = await db
-    .prepare('SELECT * FROM finance_goals WHERE id = ? AND user_id = ?')
-    .bind(id, userId)
-    .first();
-
-  if (!existing) {
-    throw new HttpError(404, 'Goal not found');
-  }
-
   const rawAmount = payload.amountMinor !== undefined && payload.amountMinor !== null && payload.amountMinor !== ''
     ? normalizeAmount(payload.amountMinor, true)
     : normalizeAmount(payload.amount, false);
@@ -2097,31 +2139,28 @@ async function contributeToGoal(db, userId, id, payload) {
 
   const direction = payload.direction === 'withdraw' ? -1 : 1;
   const delta = rawAmount * direction;
-  const target = Number(existing.target_amount_minor || 0);
 
-  await db
+  const row = await db
     .prepare(
       `
       UPDATE finance_goals
-      SET saved_amount_minor = MAX(0, MIN(?, saved_amount_minor + ?)),
+      SET saved_amount_minor = MAX(0, MIN(target_amount_minor, saved_amount_minor + ?)),
           status = CASE
-            WHEN MAX(0, MIN(?, saved_amount_minor + ?)) >= ? AND ? > 0 THEN 'completed'
+            WHEN MAX(0, MIN(target_amount_minor, saved_amount_minor + ?)) >= target_amount_minor
+              AND target_amount_minor > 0 THEN 'completed'
             WHEN status = 'completed' THEN 'active'
             ELSE status
           END,
           updated_at = CURRENT_TIMESTAMP
       WHERE id = ? AND user_id = ?
+      RETURNING *
     `,
     )
-    .bind(target, delta, target, delta, target, target, id, userId)
-    .run();
-
-  const row = await db
-    .prepare('SELECT * FROM finance_goals WHERE id = ? AND user_id = ?')
-    .bind(id, userId)
+    .bind(delta, delta, id, userId)
     .first();
 
-  return row ? mapGoal(row) : null;
+  if (!row) throw new HttpError(404, 'Goal not found');
+  return mapGoal(row);
 }
 
 async function listInsights(db, userId) {
@@ -2622,6 +2661,7 @@ function spendingPace(trend, asOf, start, nextStart) {
 // ---------------------------------------------------------------------------
 
 const IMPORT_MAX_ROWS = 2000;
+const IMPORT_BATCH_SIZE = 90;
 
 async function importTransactions(db, userId, payload) {
   const rows = Array.isArray(payload?.transactions) ? payload.transactions : [];
@@ -2636,30 +2676,8 @@ async function importTransactions(db, userId, payload) {
 
   const currency = normalizeCurrency(payload.currency || 'INR');
   const skipDuplicates = payload.skipDuplicates !== false;
-
-  // One read of the existing keys beats a per-row SELECT inside the loop.
-  const existing = new Set();
-  if (skipDuplicates) {
-    const known = await db
-      .prepare(
-        `
-        SELECT occurred_on, amount_minor, type,
-               LOWER(COALESCE(NULLIF(TRIM(merchant), ''), NULLIF(TRIM(payee), ''), '')) AS name
-        FROM finance_transactions
-        WHERE user_id = ? AND status != 'deleted' AND currency = ?
-      `,
-      )
-      .bind(userId, currency)
-      .all();
-
-    for (const row of known.results || []) {
-      existing.add(`${row.occurred_on}|${row.amount_minor}|${row.type}|${row.name}`);
-    }
-  }
-
-  let imported = 0;
-  let skipped = 0;
   const errors = [];
+  const normalizedRows = [];
 
   for (let index = 0; index < rows.length; index += 1) {
     const row = rows[index];
@@ -2674,25 +2692,19 @@ async function importTransactions(db, userId, payload) {
         throw new Error('Amount must be greater than zero');
       }
 
-      const key = `${occurredOn}|${amountMinor}|${type}|${name.toLowerCase()}`;
-      if (skipDuplicates && existing.has(key)) {
-        skipped += 1;
-        continue;
+      if (type === 'transfer') {
+        throw new Error('Transfers need source and destination accounts and cannot be bulk imported');
       }
 
-      await createTransaction(db, userId, {
+      normalizedRows.push({
+        sourceIndex: index,
         type,
         amountMinor,
         occurredOn,
-        currency,
-        merchant: name || null,
-        category: row.category || null,
+        name,
+        categoryName: String(row.category || '').trim(),
         notes: row.notes || null,
-        source: 'import',
       });
-
-      existing.add(key);
-      imported += 1;
     } catch (error) {
       // Report the row number the user sees in their spreadsheet (1-based + header).
       if (errors.length < 25) {
@@ -2701,17 +2713,96 @@ async function importTransactions(db, userId, payload) {
     }
   }
 
-  return { imported, skipped, failed: errors.length, errors };
+  if (!normalizedRows.length) {
+    return { imported: 0, skipped: 0, failed: errors.length, errors };
+  }
+
+  const dates = normalizedRows.map((row) => row.occurredOn).sort();
+  const knownPromise = skipDuplicates
+    ? db.prepare(
+      `
+      SELECT occurred_on, amount_minor, type,
+             LOWER(COALESCE(NULLIF(TRIM(merchant), ''), NULLIF(TRIM(payee), ''), '')) AS name
+      FROM finance_transactions
+      WHERE user_id = ? AND status != 'deleted' AND currency = ?
+        AND occurred_on >= ? AND occurred_on <= ?
+    `,
+    ).bind(userId, currency, dates[0], dates[dates.length - 1]).all()
+    : Promise.resolve({ results: [] });
+
+  const [known, accountId, categoryResult] = await Promise.all([
+    knownPromise,
+    defaultAccountId(db, userId, currency),
+    db.prepare('SELECT id, name, type FROM finance_categories WHERE user_id = ? AND is_archived = 0')
+      .bind(userId)
+      .all(),
+  ]);
+
+  const existing = new Set((known.results || []).map(
+    (row) => `${row.occurred_on}|${row.amount_minor}|${row.type}|${row.name}`,
+  ));
+  const categories = new Map((categoryResult.results || []).map(
+    (row) => [`${row.type}|${String(row.name).toLowerCase()}`, row.id],
+  ));
+  const accepted = [];
+  let skipped = 0;
+
+  for (const row of normalizedRows) {
+    const key = `${row.occurredOn}|${row.amountMinor}|${row.type}|${row.name.toLowerCase()}`;
+    if (skipDuplicates && existing.has(key)) {
+      skipped += 1;
+      continue;
+    }
+    existing.add(key);
+    accepted.push(row);
+  }
+
+  for (let offset = 0; offset < accepted.length; offset += IMPORT_BATCH_SIZE) {
+    const chunk = accepted.slice(offset, offset + IMPORT_BATCH_SIZE);
+    const statements = chunk.map((row) => db.prepare(
+      `
+      INSERT INTO finance_transactions (
+        id, user_id, account_id, to_account_id, category_id, receipt_id,
+        type, status, occurred_on, amount_minor, currency, merchant, payee,
+        payment_method, notes, tags_json, source, ai_category_confidence
+      )
+      VALUES (?, ?, ?, NULL, ?, NULL, ?, 'posted', ?, ?, ?, ?, ?, NULL, ?, '[]', 'import', NULL)
+    `,
+    ).bind(
+      crypto.randomUUID(),
+      userId,
+      accountId,
+      categories.get(`${row.type === 'refund' ? 'expense' : row.type}|${row.categoryName.toLowerCase()}`) || null,
+      row.type,
+      row.occurredOn,
+      row.amountMinor,
+      currency,
+      row.name || null,
+      row.name || null,
+      row.notes,
+    ));
+
+    const chunkDelta = chunk.reduce(
+      (sum, row) => sum + accountDelta(row.type, row.amountMinor),
+      0,
+    );
+    appendAccountDeltaStatements(db, statements, new Map([[accountId, chunkDelta]]));
+    await db.batch(statements);
+  }
+
+  return { imported: accepted.length, skipped, failed: errors.length, errors };
 }
 
 async function buildMonthlyReport(db, userId, url) {
   const asOf = url.searchParams.get('asOf') || today();
   const currency = normalizeCurrency(url.searchParams.get('currency') || 'INR');
   const { start, nextStart } = monthBounds(asOf);
-  const cashflow = await monthlyCashflow(db, userId, start, nextStart, currency);
-  const categorySpend = await spendingByCategory(db, userId, start, nextStart, currency);
-  const goals = await listGoals(db, userId, currency);
-  const budgets = await listBudgets(db, userId, url, currency);
+  const [cashflow, categorySpend, goals, budgets] = await Promise.all([
+    monthlyCashflow(db, userId, start, nextStart, currency),
+    spendingByCategory(db, userId, start, nextStart, currency),
+    listGoals(db, userId, currency),
+    listBudgets(db, userId, url, currency),
+  ]);
 
   return {
     type: 'monthly',
@@ -2730,9 +2821,9 @@ async function buildMonthlyReport(db, userId, url) {
 async function listReceiptTransactions(db, userId, url) {
   const receiptUrl = new URL(url.toString());
   receiptUrl.searchParams.set('type', 'expense');
+  receiptUrl.searchParams.set('receiptOnly', 'true');
 
-  const transactions = await listTransactions(db, userId, receiptUrl, 100);
-  return transactions.filter((transaction) => transaction.source === 'receipt' || transaction.receiptId);
+  return listTransactions(db, userId, receiptUrl, 100);
 }
 
 async function createReceiptTransaction(db, userId, payload) {
@@ -2807,7 +2898,7 @@ async function createLiability(db, userId, payload) {
       ? nextPaymentDateFromDueDay(payload.dueDay)
       : null;
 
-  await db
+  const row = await db
     .prepare(
       `
       INSERT INTO finance_liabilities (
@@ -2825,6 +2916,7 @@ async function createLiability(db, userId, payload) {
         status
       )
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active')
+      RETURNING *
     `,
     )
     .bind(
@@ -2840,9 +2932,9 @@ async function createLiability(db, userId, payload) {
       monthlyPaymentMinor,
       nextPaymentOn,
     )
-    .run();
+    .first();
 
-  return getLiability(db, userId, id);
+  return mapLiability(row);
 }
 
 async function updateLiability(db, userId, id, payload) {
@@ -2885,54 +2977,62 @@ async function updateLiability(db, userId, id, payload) {
   const updates = Object.entries(allowed).filter(([, value]) => value !== undefined);
 
   if (updates.length) {
-    await db
+    const row = await db
       .prepare(
         `
         UPDATE finance_liabilities
         SET ${updates.map(([key]) => `${key} = ?`).join(', ')}, updated_at = CURRENT_TIMESTAMP
         WHERE id = ? AND user_id = ?
+        RETURNING *
       `,
       )
       .bind(...updates.map(([, value]) => value), id, userId)
-      .run();
+      .first();
+
+    if (!row) throw new HttpError(404, 'Loan not found.');
+    return mapLiability(row);
   }
 
-  return getLiability(db, userId, id);
+  return existing;
 }
 
 async function recordLiabilityPayment(db, userId, id, payload) {
-  const liability = await getLiability(db, userId, id);
+  const hasPayment = payload.amountMinor !== undefined || payload.amount !== undefined;
+  const paymentMinor = hasPayment ? normalizeMoney(payload.amountMinor, payload.amount) : null;
+  const hasNextPayment = Boolean(payload.nextPaymentOn);
+  const nextPaymentOn = hasNextPayment ? normalizeDate(payload.nextPaymentOn) : null;
 
-  if (!liability) {
-    throw new HttpError(404, 'Loan not found.');
-  }
-
-  const paymentMinor = normalizeMoney(payload.amountMinor, payload.amount ?? liability.monthlyPaymentMinor);
-  const paidAmountMinor = Math.min(liability.originalAmountMinor, liability.paidAmountMinor + paymentMinor);
-  const status = paidAmountMinor >= liability.originalAmountMinor ? 'paid_off' : 'active';
-
-  await db
+  const row = await db
     .prepare(
       `
       UPDATE finance_liabilities
-      SET paid_amount_minor = ?, status = ?, next_payment_on = ?, updated_at = CURRENT_TIMESTAMP
-      WHERE id = ? AND user_id = ?
+      SET paid_amount_minor = MIN(original_amount_minor, paid_amount_minor + COALESCE(?, monthly_payment_minor)),
+          status = CASE
+            WHEN paid_amount_minor + COALESCE(?, monthly_payment_minor) >= original_amount_minor THEN 'paid_off'
+            ELSE 'active'
+          END,
+          next_payment_on = CASE WHEN ? = 1 THEN ? ELSE next_payment_on END,
+          updated_at = CURRENT_TIMESTAMP
+      WHERE id = ? AND user_id = ? AND status != 'archived'
+      RETURNING *
     `,
     )
     .bind(
-      paidAmountMinor,
-      status,
-      payload.nextPaymentOn ? normalizeDate(payload.nextPaymentOn) : liability.nextPaymentOn,
+      paymentMinor,
+      paymentMinor,
+      hasNextPayment ? 1 : 0,
+      nextPaymentOn,
       id,
       userId,
     )
-    .run();
+    .first();
 
-  return getLiability(db, userId, id);
+  if (!row) throw new HttpError(404, 'Loan not found.');
+  return mapLiability(row);
 }
 
 async function deleteLiability(db, userId, id) {
-  await db
+  const result = await db
     .prepare(
       `
       UPDATE finance_liabilities
@@ -2942,6 +3042,8 @@ async function deleteLiability(db, userId, id) {
     )
     .bind(id, userId)
     .run();
+
+  if (result.meta && result.meta.changes === 0) throw new HttpError(404, 'Loan not found.');
 }
 
 async function getLiability(db, userId, id) {
@@ -2961,9 +3063,11 @@ async function getLiability(db, userId, id) {
 }
 
 async function getPantrySummary(db, userId) {
-  const items = await listPantryItems(db, userId);
-  const shoppingItems = await listShoppingItems(db, userId);
-  const recipes = await listPantryRecipes(db, userId);
+  const [items, shoppingItems, recipes] = await Promise.all([
+    listPantryItems(db, userId),
+    listShoppingItems(db, userId),
+    listPantryRecipes(db, userId),
+  ]);
   const lowStockItems = items.filter((item) => item.quantity <= item.lowStockThreshold);
   const expiringItems = items.filter((item) => item.expiresOn && daysBetween(today(), item.expiresOn) <= 7);
 
@@ -3887,8 +3991,10 @@ async function geminiGenerateJson(env, promptText, schema) {
 }
 
 async function getCarSummary(db, userId) {
-  const vehicles = await listVehicles(db, userId);
-  const maintenanceItems = await listMaintenanceItems(db, userId);
+  const [vehicles, maintenanceItems] = await Promise.all([
+    listVehicles(db, userId),
+    listMaintenanceItems(db, userId),
+  ]);
   const activeVehicle = vehicles[0] || null;
 
   return {
@@ -4142,7 +4248,7 @@ async function getMaintenanceItem(db, userId, id) {
 async function createReceiptMetadata(db, userId, payload) {
   const id = payload.id || crypto.randomUUID();
 
-  await db
+  const row = await db
     .prepare(
       `
       INSERT INTO finance_receipts (
@@ -4157,6 +4263,7 @@ async function createReceiptMetadata(db, userId, payload) {
         extracted_json
       )
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      RETURNING *
     `,
     )
     .bind(
@@ -4170,17 +4277,6 @@ async function createReceiptMetadata(db, userId, payload) {
       payload.uploadStatus || 'metadata_only',
       JSON.stringify(payload.extracted || {}),
     )
-    .run();
-
-  const row = await db
-    .prepare(
-      `
-      SELECT *
-      FROM finance_receipts
-      WHERE id = ? AND user_id = ?
-    `,
-    )
-    .bind(id, userId)
     .first();
 
   return {
@@ -4250,53 +4346,26 @@ async function resolveCategoryId(db, userId, type, categoryId, categoryName) {
       `
       SELECT id
       FROM finance_categories
-      WHERE user_id = ? AND LOWER(name) = LOWER(?) AND type = ?
+      WHERE user_id = ? AND type = ? AND name = ? COLLATE NOCASE
       LIMIT 1
     `,
     )
-    .bind(userId, categoryName, type === 'refund' ? 'expense' : type)
+    .bind(userId, type === 'refund' ? 'expense' : type, categoryName)
     .first();
 
   return row?.id || null;
 }
 
 async function defaultAccountId(db, userId, currency = 'INR') {
-  const row = await db
-    .prepare(
-      `
-      SELECT default_account_id
-      FROM finance_profiles
-      WHERE user_id = ?
-    `,
-    )
-    .bind(userId)
-    .first();
-
-  if (row?.default_account_id) {
-    const defaultAccount = await db
-      .prepare(
-        `
-        SELECT id
-        FROM finance_accounts
-        WHERE id = ? AND user_id = ? AND currency = ? AND is_archived = 0
-        LIMIT 1
-      `,
-      )
-      .bind(row.default_account_id, userId, currency)
-      .first();
-
-    if (defaultAccount?.id) {
-      return defaultAccount.id;
-    }
-  }
-
   const account = await db
     .prepare(
       `
-      SELECT id
-      FROM finance_accounts
-      WHERE user_id = ? AND currency = ? AND is_archived = 0
-      ORDER BY created_at ASC
+      SELECT account.id
+      FROM finance_accounts account
+      LEFT JOIN finance_profiles profile ON profile.user_id = account.user_id
+      WHERE account.user_id = ? AND account.currency = ? AND account.is_archived = 0
+      ORDER BY CASE WHEN account.id = profile.default_account_id THEN 0 ELSE 1 END,
+               account.created_at ASC
       LIMIT 1
     `,
     )
@@ -4347,7 +4416,7 @@ async function resolveSavingsAccount(db, userId, name, currency) {
       SELECT id
       FROM finance_accounts
       WHERE user_id = ? AND currency = ? AND is_archived = 0
-        AND type = 'investment' AND LOWER(name) = LOWER(?)
+        AND type = 'investment' AND name = ? COLLATE NOCASE
       LIMIT 1
     `,
     )
@@ -4392,11 +4461,12 @@ async function createAccount(db, userId, payload) {
   const currency = normalizeCurrency(payload.currency || 'INR');
   const openingBalanceMinor = normalizeMoney(payload.openingBalanceMinor, payload.openingBalance ?? 0);
 
-  await db
+  const row = await db
     .prepare(
       `
       INSERT INTO finance_accounts (id, user_id, name, type, currency, opening_balance_minor, current_balance_minor, institution, last_four)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      RETURNING *
     `,
     )
     .bind(
@@ -4410,18 +4480,12 @@ async function createAccount(db, userId, payload) {
       payload.institution || null,
       payload.lastFour || null,
     )
-    .run();
+    .first();
 
-  return getAccount(db, userId, id);
+  return mapAccount(row);
 }
 
 async function updateAccount(db, userId, id, payload) {
-  const existing = await getAccount(db, userId, id);
-
-  if (!existing) {
-    throw new HttpError(404, 'Account not found.');
-  }
-
   const allowed = {
     name: payload.name,
     type: payload.type !== undefined ? normalizeEnum(payload.type, ACCOUNT_TYPES, 'Account type must be cash, bank, wallet, investment, or other.') : undefined,
@@ -4438,28 +4502,32 @@ async function updateAccount(db, userId, id, payload) {
   const updates = Object.entries(allowed).filter(([, value]) => value !== undefined);
 
   if (updates.length) {
-    await db
+    const row = await db
       .prepare(
-        `UPDATE finance_accounts SET ${updates.map(([key]) => `${key} = ?`).join(', ')}, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND user_id = ?`,
+        `UPDATE finance_accounts
+         SET ${updates.map(([key]) => `${key} = ?`).join(', ')}, updated_at = CURRENT_TIMESTAMP
+         WHERE id = ? AND user_id = ?
+         RETURNING *`,
       )
       .bind(...updates.map(([, value]) => value), id, userId)
-      .run();
+      .first();
+
+    if (!row) throw new HttpError(404, 'Account not found.');
+    return mapAccount(row);
   }
 
-  return getAccount(db, userId, id);
+  const existing = await getAccount(db, userId, id);
+  if (!existing) throw new HttpError(404, 'Account not found.');
+  return existing;
 }
 
 async function archiveAccount(db, userId, id) {
-  const existing = await getAccount(db, userId, id);
-
-  if (!existing) {
-    throw new HttpError(404, 'Account not found.');
-  }
-
-  await db
+  const result = await db
     .prepare('UPDATE finance_accounts SET is_archived = 1, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND user_id = ?')
     .bind(id, userId)
     .run();
+
+  if (result.meta && result.meta.changes === 0) throw new HttpError(404, 'Account not found.');
 }
 
 function mapAccount(row) {
@@ -4484,7 +4552,7 @@ function mapAccount(row) {
  * one place debt lives, so it's the only thing subtracted.
  */
 async function getNetWorth(db, userId, currency) {
-  const assetsRow = await db
+  const assetsPromise = db
     .prepare(
       `
       SELECT COALESCE(SUM(current_balance_minor), 0) AS total
@@ -4496,7 +4564,7 @@ async function getNetWorth(db, userId, currency) {
     .bind(userId, currency)
     .first();
 
-  const liabilitiesRow = await db
+  const liabilitiesPromise = db
     .prepare(
       `
       SELECT COALESCE(SUM(MAX(original_amount_minor - paid_amount_minor, 0)), 0) AS total
@@ -4506,6 +4574,8 @@ async function getNetWorth(db, userId, currency) {
     )
     .bind(userId, currency)
     .first();
+
+  const [assetsRow, liabilitiesRow] = await Promise.all([assetsPromise, liabilitiesPromise]);
 
   const assetsMinor = Number(assetsRow?.total || 0);
   const liabilitiesMinor = Number(liabilitiesRow?.total || 0);
@@ -4517,21 +4587,24 @@ async function getNetWorth(db, userId, currency) {
   };
 }
 
-async function applyAccountDelta(db, accountId, deltaMinor) {
-  if (!accountId) {
-    return;
-  }
+function addAccountDelta(deltas, accountId, deltaMinor) {
+  if (!accountId || !deltaMinor) return;
+  deltas.set(accountId, (deltas.get(accountId) || 0) + deltaMinor);
+}
 
-  await db
-    .prepare(
-      `
-      UPDATE finance_accounts
-      SET current_balance_minor = current_balance_minor + ?, updated_at = CURRENT_TIMESTAMP
-      WHERE id = ?
-    `,
-    )
-    .bind(deltaMinor, accountId)
-    .run();
+function appendAccountDeltaStatements(db, statements, deltas) {
+  for (const [accountId, deltaMinor] of deltas) {
+    if (!accountId || !deltaMinor) continue;
+    statements.push(db
+      .prepare(
+        `
+        UPDATE finance_accounts
+        SET current_balance_minor = current_balance_minor + ?, updated_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+      `,
+      )
+      .bind(deltaMinor, accountId));
+  }
 }
 
 function accountDelta(type, amountMinor) {
@@ -4861,6 +4934,7 @@ function transactionFilters(url, defaultLimit) {
     type: params.get('type'),
     currency: params.get('currency') ? normalizeCurrency(params.get('currency')) : null,
     categoryId: params.get('categoryId'),
+    receiptOnly: params.get('receiptOnly') === 'true',
     startDate: params.get('startDate'),
     endDate: params.get('endDate'),
     search: params.get('search') ? `%${params.get('search').toLowerCase().trim()}%` : null,
@@ -5989,7 +6063,13 @@ async function authenticateRequest(request, db, env, options = {}) {
     const row = await db
       .prepare(
         `
-        SELECT u.id, u.email, u.display_name, u.role
+        SELECT
+          u.id,
+          u.email,
+          u.display_name,
+          u.role,
+          u.has_completed_onboarding,
+          unixepoch(s.last_seen_at) AS last_seen_epoch
         FROM auth_sessions s
         JOIN users u ON u.id = s.user_id
         WHERE s.session_hash = ?
@@ -6007,20 +6087,39 @@ async function authenticateRequest(request, db, env, options = {}) {
         return { error: 'Your account has been suspended. Contact the administrator.' };
       }
 
-      // Sliding expiration: every authenticated request pushes the expiry out,
-      // so a continuously-active session never times out. Idle sessions still expire.
-      const days = Number(env.SESSION_DAYS || 30);
-      const newExpiry = new Date(Date.now() + days * 24 * 60 * 60 * 1000).toISOString();
-      await db
-        .prepare('UPDATE auth_sessions SET last_seen_at = CURRENT_TIMESTAMP, expires_at = ? WHERE session_hash = ?')
-        .bind(newExpiry, sessionHash)
-        .run();
+      // Preserve sliding expiry without turning every read request into a D1
+      // write. A five-minute touch window also coalesces a burst of parallel
+      // page requests. In Workers, keep the maintenance write off the response
+      // path with waitUntil.
+      const nowSeconds = Math.floor(Date.now() / 1000);
+      const shouldTouch = nowSeconds - Number(row.last_seen_epoch || 0) >= 5 * 60;
+      if (shouldTouch) {
+        const days = Number(env.SESSION_DAYS || 30);
+        const newExpiry = new Date(Date.now() + days * 24 * 60 * 60 * 1000).toISOString();
+        const touch = db
+          .prepare(
+            `UPDATE auth_sessions
+             SET last_seen_at = CURRENT_TIMESTAMP, expires_at = ?
+             WHERE session_hash = ?
+               AND last_seen_at <= datetime('now', '-5 minutes')`,
+          )
+          .bind(newExpiry, sessionHash)
+          .run()
+          .catch((error) => console.error('Could not refresh session activity:', error));
+
+        if (typeof options.waitUntil === 'function') {
+          options.waitUntil(touch);
+        } else {
+          await touch;
+        }
+      }
 
       return {
         userId: row.id,
         email: row.email,
         displayName: row.display_name || row.email.split('@')[0],
         role: row.role || 'user',
+        hasCompletedOnboarding: Boolean(row.has_completed_onboarding),
         mode: 'public',
       };
     }

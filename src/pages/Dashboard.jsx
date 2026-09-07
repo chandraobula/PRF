@@ -1,17 +1,14 @@
 import { useEffect, useState } from 'react';
 import { Link } from 'react-router-dom';
 import {
-  ArrowRight, Car, Coffee, Plus, Sparkles, WalletCards,
+  ArrowRight, Car, Coffee, Sparkles, WalletCards,
   CalendarDays, AlertCircle, TrendingUp, TrendingDown,
   Utensils, Loader2
 } from 'lucide-react';
-import { getCurrentAccount } from '../services/authApi';
-import { getFinanceDashboard, formatMoney } from '../services/financeApi';
-import { getCarSummary } from '../services/carApi';
-import { getPantrySummary } from '../services/pantryApi';
-import { getMealPlan } from '../services/mealPlanApi';
+import { formatMoney } from '../services/financeApi';
+import { getDashboard } from '../services/dashboardApi';
 import ContextBar from '../components/ContextBar';
-import { useCurrency } from '../lib/preferences';
+import { usePreferences } from '../lib/preferences';
 
 const quickActions = [
   { label: 'Log expense', icon: WalletCards, color: 'bg-emerald-500/10 text-emerald-600 dark:text-emerald-300', path: '/finance' },
@@ -21,7 +18,7 @@ const quickActions = [
 ];
 
 export default function Dashboard() {
-  const preferredCurrency = useCurrency();
+  const { currency: preferredCurrency, isLoading: arePreferencesLoading } = usePreferences();
   const [currentUser, setCurrentUser] = useState(null);
   const [finance, setFinance] = useState(null);
   const [car, setCar] = useState(null);
@@ -32,29 +29,29 @@ export default function Dashboard() {
   useEffect(() => {
     let active = true;
     async function loadAll() {
+      if (arePreferencesLoading) return;
       setIsLoading(true);
       const now = new Date();
       const todayStr = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
-      
-      const [authRes, finRes, carRes, panRes, mealRes] = await Promise.allSettled([
-        getCurrentAccount(),
-        getFinanceDashboard(preferredCurrency),
-        getCarSummary(),
-        getPantrySummary(),
-        getMealPlan(todayStr, todayStr)
-      ]);
 
-      if (!active) return;
-      if (authRes.status === 'fulfilled' && authRes.value?.user) setCurrentUser(authRes.value.user);
-      if (finRes.status === 'fulfilled') setFinance(finRes.value || null);
-      if (carRes.status === 'fulfilled') setCar(carRes.value || null);
-      if (panRes.status === 'fulfilled') setPantry(panRes.value || null);
-      if (mealRes.status === 'fulfilled') setMeals(mealRes.value?.entries || []);
-      setIsLoading(false);
+      try {
+        const result = await getDashboard(preferredCurrency, todayStr);
+        if (!active) return;
+        setCurrentUser(result.user || null);
+        setFinance(result.finance || null);
+        setCar(result.car || null);
+        setPantry(result.pantry || null);
+        setMeals(result.meals?.entries || []);
+      } catch {
+        // Authentication failures are handled by the shared request client.
+        // Keep the dashboard shell responsive for transient network errors.
+      } finally {
+        if (active) setIsLoading(false);
+      }
     }
     loadAll();
     return () => { active = false; };
-  }, [preferredCurrency]);
+  }, [preferredCurrency, arePreferencesLoading]);
 
   const hour = new Date().getHours();
   const greeting = hour < 12 ? 'Good morning' : hour < 18 ? 'Good afternoon' : 'Good evening';

@@ -25,8 +25,7 @@ export default function Splash() {
       }
     };
 
-    const timer = setTimeout(redirect, 2500);
-    return () => clearTimeout(timer);
+    redirect();
   }, [navigate]);
 
   return (

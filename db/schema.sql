@@ -441,8 +441,21 @@ CREATE INDEX IF NOT EXISTS idx_finance_transactions_user_date ON finance_transac
 CREATE INDEX IF NOT EXISTS idx_finance_transactions_user_type ON finance_transactions (user_id, type);
 CREATE INDEX IF NOT EXISTS idx_finance_transactions_user_currency ON finance_transactions (user_id, currency);
 CREATE INDEX IF NOT EXISTS idx_finance_transactions_user_category ON finance_transactions (user_id, category_id);
+CREATE INDEX IF NOT EXISTS idx_finance_transactions_active_currency_date
+  ON finance_transactions (user_id, currency, occurred_on DESC, created_at DESC)
+  WHERE status != 'deleted';
+CREATE INDEX IF NOT EXISTS idx_finance_accounts_user_currency_active
+  ON finance_accounts (user_id, currency, is_archived, created_at);
+CREATE INDEX IF NOT EXISTS idx_finance_categories_user_type_name
+  ON finance_categories (user_id, type, name COLLATE NOCASE);
 CREATE INDEX IF NOT EXISTS idx_finance_budgets_user_period ON finance_budgets (user_id, period_start, period_end);
+CREATE INDEX IF NOT EXISTS idx_finance_budgets_user_currency_period
+  ON finance_budgets (user_id, currency, period_start, period_end);
 CREATE INDEX IF NOT EXISTS idx_finance_goals_user_status ON finance_goals (user_id, status);
+CREATE INDEX IF NOT EXISTS idx_finance_goals_user_currency_status
+  ON finance_goals (user_id, currency, status, target_date);
+CREATE INDEX IF NOT EXISTS idx_finance_liabilities_user_currency_status
+  ON finance_liabilities (user_id, currency, status, next_payment_on);
 CREATE INDEX IF NOT EXISTS idx_finance_insights_user_created ON finance_ai_insights (user_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_finance_notifications_user_status ON finance_notifications (user_id, status, due_at);
 CREATE INDEX IF NOT EXISTS idx_auth_sessions_hash ON auth_sessions (session_hash);

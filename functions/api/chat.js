@@ -12,7 +12,9 @@ const corsHeaders = {
 // Models answer multi-part questions by calling one tool per round, so this has
 // to cover "audit my subscriptions, pantry and dates" style questions. D1 reads
 // are cheap; the real cost is one extra model round-trip.
-const MAX_TOOL_ROUNDS = 6;
+const MAX_TOOL_ROUNDS = 4;
+const MODEL_TTFB_TIMEOUT_MS = 10_000;
+const MAX_MODEL_ATTEMPTS = 3;
 
 // Models are tried in order. The first one that accepts the request wins, so a
 // model being retired, rate-limited or out of credit degrades instead of 500ing.
@@ -29,6 +31,13 @@ const DEFAULT_MODELS = [
   'nvidia/nemotron-nano-9b-v2:free',
   'nvidia/nemotron-3-super-120b-a12b:free',
   'inclusionai/ling-3.0-flash:free',
+];
+
+const DEFAULT_OPENAI_MODELS = ['gpt-4o-mini'];
+const DEFAULT_GEMINI_MODELS = [
+  'gemini-3.5-flash',
+  'gemini-3-flash-preview',
+  'gemini-flash-latest',
 ];
 
 // Status codes worth retrying on the next model in the chain.
@@ -142,10 +151,8 @@ export async function onRequestOptions() {
 // ---------------------------------------------------------------------------
 
 export async function onRequestPost({ request, env }) {
-  const apiKey = env.OPENROUTER_API_KEY;
-
-  if (!apiKey) {
-    return json({ error: 'OPENROUTER_API_KEY is not configured.' }, 500);
+  if (!env.OPENROUTER_API_KEY && !env.OPENAI_API_KEY && !env.GEMINI_API_KEY) {
+    return json({ error: 'The AI assistant is not configured yet.' }, 503);
   }
 
   if (!env.DB) {
@@ -173,12 +180,11 @@ export async function onRequestPost({ request, env }) {
 
     // 4. Run the tool-calling loop and stream the response
     const stream = runToolCallingLoop({
-      apiKey,
+      env,
       systemPrompt,
       messages,
       db: env.DB,
       userId: user.userId,
-      models: resolveModels(env),
       referer: new URL(request.url).origin,
     });
 
@@ -202,7 +208,7 @@ export async function onRequestPost({ request, env }) {
 // Tool-calling loop and Streaming
 // ---------------------------------------------------------------------------
 
-function runToolCallingLoop({ apiKey, systemPrompt, messages, db, userId, models, referer }) {
+function runToolCallingLoop({ env, systemPrompt, messages, db, userId, referer }) {
   const conversation = [
     { role: 'system', content: systemPrompt },
     ...messages,
@@ -228,8 +234,13 @@ function runToolCallingLoop({ apiKey, systemPrompt, messages, db, userId, models
       };
 
       let streamedAnything = false;
+      const unavailableModels = new Set();
 
       try {
+        // Flush an SSE event immediately so the client has visible progress
+        // while the provider is producing its first token.
+        send({ message: 'Thinking…', tools: [] }, 'status');
+
         for (let round = 1; round <= MAX_TOOL_ROUNDS; round += 1) {
           const isFinalRound = round === MAX_TOOL_ROUNDS;
 
@@ -244,24 +255,27 @@ function runToolCallingLoop({ apiKey, systemPrompt, messages, db, userId, models
             });
           }
 
-          const { response, model } = await callOpenRouter({
-            apiKey,
-            models,
+          const { turn, model, provider } = await runModelRound({
+            env,
             messages: conversation,
             toolChoice: isFinalRound ? 'none' : 'auto',
             referer,
-          });
-
-          if (round === 1) {
-            send({ model }, 'meta');
-          }
-
-          const turn = await readModelStream(response, {
             onContent: (text) => {
               streamedAnything = true;
               send({ content: text });
             },
+            onFallback: () => {
+              if (streamedAnything) {
+                send({}, 'reset');
+                streamedAnything = false;
+              }
+            },
+            unavailableModels,
           });
+
+          if (round === 1) {
+            send({ model, provider }, 'meta');
+          }
 
           // `tool_choice: 'none'` is advisory with some providers, so on the final
           // round any tool calls are dropped rather than trusted.
@@ -294,26 +308,35 @@ function runToolCallingLoop({ apiKey, systemPrompt, messages, db, userId, models
             tool_calls: turn.toolCalls,
           });
 
-          for (const call of turn.toolCalls) {
+          const toolResults = await Promise.all(turn.toolCalls.map(async (call) => {
             let toolArgs = {};
             try {
               toolArgs = JSON.parse(call.function.arguments || '{}');
             } catch {
               // Malformed arguments: run the tool with its defaults rather than failing.
             }
-            const toolResult = await executeTool(call.function.name, toolArgs, db, userId);
+            return executeTool(call.function.name, toolArgs, db, userId);
+          }));
+
+          turn.toolCalls.forEach((call, index) => {
             conversation.push({
               role: 'tool',
               tool_call_id: call.id,
               name: call.function.name,
-              content: JSON.stringify(toolResult),
+              content: JSON.stringify(toolResults[index]),
             });
-          }
+          });
         }
 
         finish();
       } catch (error) {
-        send({ message: error.message || 'The assistant is unavailable right now.' }, 'error');
+        console.error('All chat providers failed:', error);
+        if (streamedAnything) send({}, 'reset');
+        // Never expose provider outages, quota messages, or raw server errors
+        // to the user. The request still completes as a normal assistant turn.
+        send({
+          content: 'I could not reach an AI model reliably just now. Your LifeOS data is safe—please send the same message again in a moment.',
+        });
         finish();
       }
     },
@@ -488,23 +511,155 @@ function describeToolRun(toolCalls) {
 }
 
 // ---------------------------------------------------------------------------
-// OpenRouter API call
+// Model providers and fallback
 // ---------------------------------------------------------------------------
+
+export async function runModelRound({
+  env,
+  messages,
+  toolChoice,
+  referer,
+  onContent,
+  onFallback,
+  unavailableModels = new Set(),
+}) {
+  const attempts = [];
+
+  for (const model of env.OPENAI_API_KEY ? resolveOpenAIModels(env).slice(0, MAX_MODEL_ATTEMPTS) : []) {
+    attempts.push({
+      name: 'openai',
+      model,
+      run: () => callOpenAI({
+        apiKey: env.OPENAI_API_KEY,
+        models: [model],
+        messages,
+        toolChoice,
+      }),
+    });
+  }
+
+  for (const model of env.OPENROUTER_API_KEY ? resolveModels(env).slice(0, MAX_MODEL_ATTEMPTS) : []) {
+    attempts.push({
+      name: 'openrouter',
+      model,
+      run: () => callOpenRouter({
+        apiKey: env.OPENROUTER_API_KEY,
+        models: [model],
+        messages,
+        toolChoice,
+        referer,
+      }),
+    });
+  }
+
+  for (const model of env.GEMINI_API_KEY ? resolveGeminiModels(env).slice(0, MAX_MODEL_ATTEMPTS) : []) {
+    attempts.push({
+      name: 'gemini',
+      model,
+      run: () => callGemini({
+        apiKey: env.GEMINI_API_KEY,
+        models: [model],
+        messages,
+        toolChoice,
+      }),
+    });
+  }
+
+  const failures = [];
+
+  for (const provider of attempts) {
+    const attemptKey = `${provider.name}:${provider.model}`;
+    if (unavailableModels.has(attemptKey)) continue;
+
+    try {
+      const result = await provider.run();
+      const turn = result.turn || await readModelStream(result.response, { onContent });
+
+      if (!turn.content && !turn.toolCalls.length) {
+        throw new Error(`${provider.name} returned an empty response.`);
+      }
+
+      // Gemini's fallback endpoint is deliberately non-streaming. Emit its
+      // completed prose through the same callback used by streaming providers.
+      if (result.turn?.content) onContent(result.turn.content);
+
+      return { turn, model: result.model, provider: provider.name };
+    } catch (error) {
+      unavailableModels.add(attemptKey);
+      failures.push(`${provider.name}/${provider.model}: ${error instanceof Error ? error.message : String(error)}`);
+      console.error(`Chat model ${provider.name}/${provider.model} failed; trying fallback.`, error);
+      onFallback?.();
+    }
+  }
+
+  throw new Error(`No chat provider succeeded (${failures.join(' | ')})`);
+}
+
+function configuredModels(...values) {
+  return values
+    .flatMap((value) => String(value || '').split(','))
+    .map((value) => value.trim())
+    .filter(Boolean);
+}
 
 function resolveModels(env) {
   // OPENROUTER_MODEL accepts a single slug or a comma-separated fallback chain.
-  const configured = (env.OPENROUTER_MODEL || '')
-    .split(',')
-    .map((value) => value.trim())
-    .filter(Boolean);
+  const configured = configuredModels(env.OPENROUTER_MODELS, env.OPENROUTER_MODEL);
 
   return [...new Set([...configured, ...DEFAULT_MODELS])];
 }
 
+function resolveOpenAIModels(env) {
+  const configured = configuredModels(env.OPENAI_MODELS, env.OPENAI_MODEL);
+  return [...new Set([...configured, ...DEFAULT_OPENAI_MODELS])];
+}
+
+function resolveGeminiModels(env) {
+  const configured = configuredModels(env.GEMINI_CHAT_MODELS, env.GEMINI_MODEL);
+  return [...new Set([...configured, ...DEFAULT_GEMINI_MODELS])];
+}
+
+async function callOpenAI({ apiKey, models, messages, toolChoice }) {
+  return callOpenAICompatible({
+    provider: 'OpenAI',
+    endpoint: 'https://api.openai.com/v1/chat/completions',
+    apiKey,
+    models,
+    messages,
+    toolChoice,
+    extraHeaders: {
+      'X-Client-Request-Id': crypto.randomUUID(),
+    },
+  });
+}
+
 async function callOpenRouter({ apiKey, models, messages, toolChoice, referer }) {
+  return callOpenAICompatible({
+    provider: 'OpenRouter',
+    endpoint: 'https://openrouter.ai/api/v1/chat/completions',
+    apiKey,
+    models,
+    messages,
+    toolChoice,
+    extraHeaders: {
+      'HTTP-Referer': referer || 'https://lifeos.pages.dev',
+      'X-Title': 'Life OS',
+    },
+  });
+}
+
+async function callOpenAICompatible({
+  provider,
+  endpoint,
+  apiKey,
+  models,
+  messages,
+  toolChoice,
+  extraHeaders = {},
+}) {
   let lastError = null;
 
-  for (const model of models) {
+  for (const model of models.slice(0, MAX_MODEL_ATTEMPTS)) {
     const payload = {
       model,
       messages,
@@ -518,25 +673,23 @@ async function callOpenRouter({ apiKey, models, messages, toolChoice, referer })
 
     let response;
     try {
-      response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+      response = await fetch(endpoint, {
         method: 'POST',
         headers: {
           Authorization: `Bearer ${apiKey}`,
           'Content-Type': 'application/json',
-          // OpenRouter attributes usage with these; they are optional but recommended.
-          'HTTP-Referer': referer || 'https://lifeos.pages.dev',
-          'X-Title': 'Life OS',
+          ...extraHeaders,
         },
         body: JSON.stringify(payload),
         // Free-tier models occasionally stall with no response at all. Bound
         // just the time-to-first-byte so a hung model fails over to the next
         // one in the chain instead of leaving the user staring at nothing.
-        signal: AbortSignal.timeout(15000),
+        signal: AbortSignal.timeout(MODEL_TTFB_TIMEOUT_MS),
       });
     } catch (networkError) {
       lastError = networkError.name === 'TimeoutError' || networkError.name === 'AbortError'
         ? new Error(`${model} did not respond in time.`)
-        : new Error(`Could not reach OpenRouter (${networkError.message}).`);
+        : new Error(`Could not reach ${provider} (${networkError.message}).`);
       continue;
     }
 
@@ -545,23 +698,161 @@ async function callOpenRouter({ apiKey, models, messages, toolChoice, referer })
     }
 
     const detail = await response.text().catch(() => '');
-    lastError = new Error(friendlyOpenRouterError(response.status, detail, model));
-    console.error(`OpenRouter ${response.status} for ${model}: ${detail.slice(0, 500)}`);
+    const requestId = response.headers.get('x-request-id');
+    lastError = new Error(friendlyProviderError(provider, response.status, detail, model, requestId));
+    console.error(`${provider} ${response.status} for ${model}${requestId ? ` (${requestId})` : ''}`);
 
     if (!FALLBACK_STATUSES.has(response.status)) {
       break; // 401/403/400 will fail identically on every model.
     }
   }
 
-  throw lastError || new Error('No OpenRouter model is available.');
+  throw lastError || new Error(`No ${provider} model is available.`);
 }
 
-function friendlyOpenRouterError(status, detail, model) {
-  if (status === 401) return 'The OpenRouter API key is invalid or expired.';
-  if (status === 402) return 'This OpenRouter account is out of credits.';
-  if (status === 429) return 'Rate limit reached on OpenRouter. Please try again in a moment.';
-  if (status === 404) return `The model "${model}" is no longer available on OpenRouter.`;
-  return `OpenRouter error ${status}: ${String(detail).slice(0, 200)}`;
+function friendlyProviderError(provider, status, detail, model, requestId) {
+  const suffix = requestId ? ` Request ${requestId}.` : '';
+  if (status === 401 || status === 403) return `${provider} rejected its API credentials.${suffix}`;
+  if (status === 402) return `${provider} has no available credits.${suffix}`;
+  if (status === 429) return `${provider} rate-limited model ${model}.${suffix}`;
+  if (status === 404) return `Model ${model} is not available on ${provider}.${suffix}`;
+  return `${provider} returned ${status} for ${model}: ${String(detail).slice(0, 160)}${suffix}`;
+}
+
+async function callGemini({ apiKey, models, messages, toolChoice }) {
+  let lastError = null;
+  const { systemInstruction, contents } = toGeminiConversation(messages);
+  const functionDeclarations = TOOLS.map(({ function: definition }) => ({
+    name: definition.name,
+    description: definition.description,
+    parameters: definition.parameters,
+  }));
+
+  for (const model of models.slice(0, MAX_MODEL_ATTEMPTS)) {
+    const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(apiKey)}`;
+    let response;
+
+    try {
+      response = await fetch(endpoint, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          systemInstruction,
+          contents,
+          tools: [{ functionDeclarations }],
+          toolConfig: {
+            functionCallingConfig: { mode: toolChoice === 'none' ? 'NONE' : 'AUTO' },
+          },
+          generationConfig: {
+            temperature: 0.3,
+            maxOutputTokens: 1600,
+          },
+        }),
+        signal: AbortSignal.timeout(MODEL_TTFB_TIMEOUT_MS),
+      });
+    } catch (error) {
+      lastError = error.name === 'TimeoutError' || error.name === 'AbortError'
+        ? new Error(`${model} did not respond in time.`)
+        : new Error(`Could not reach Gemini (${error.message}).`);
+      continue;
+    }
+
+    if (!response.ok) {
+      const detail = await response.text().catch(() => '');
+      lastError = new Error(friendlyProviderError('Gemini', response.status, detail, model));
+      console.error(`Gemini ${response.status} for ${model}`);
+      if (!FALLBACK_STATUSES.has(response.status)) break;
+      continue;
+    }
+
+    const data = await response.json().catch(() => null);
+    const parts = data?.candidates?.[0]?.content?.parts || [];
+    const content = parts.map((part) => part.text || '').join('');
+    const toolCalls = parts
+      .filter((part) => part.functionCall?.name)
+      .map((part) => ({
+        id: `call_${crypto.randomUUID()}`,
+        type: 'function',
+        function: {
+          name: part.functionCall.name,
+          arguments: JSON.stringify(part.functionCall.args || {}),
+        },
+      }));
+
+    if (!content && !toolCalls.length) {
+      const reason = data?.candidates?.[0]?.finishReason || data?.promptFeedback?.blockReason || 'empty response';
+      lastError = new Error(`Gemini ${model} returned no answer (${reason}).`);
+      continue;
+    }
+
+    return { turn: { content, toolCalls }, model };
+  }
+
+  throw lastError || new Error('No Gemini model is available.');
+}
+
+export function toGeminiConversation(messages) {
+  const systemText = messages
+    .filter((message) => message.role === 'system')
+    .map((message) => message.content)
+    .filter(Boolean)
+    .join('\n\n');
+  const contents = [];
+
+  const append = (role, parts) => {
+    if (!parts.length) return;
+    const previous = contents[contents.length - 1];
+    if (previous?.role === role) {
+      previous.parts.push(...parts);
+    } else {
+      contents.push({ role, parts });
+    }
+  };
+
+  for (const message of messages) {
+    if (message.role === 'system') continue;
+
+    if (message.role === 'tool') {
+      append('user', [{
+        functionResponse: {
+          name: message.name,
+          response: parseToolResponse(message.content),
+        },
+      }]);
+      continue;
+    }
+
+    if (message.role === 'assistant') {
+      const parts = [];
+      if (message.content) parts.push({ text: message.content });
+      for (const call of message.tool_calls || []) {
+        parts.push({
+          functionCall: {
+            name: call.function.name,
+            args: parseToolResponse(call.function.arguments),
+          },
+        });
+      }
+      append('model', parts);
+      continue;
+    }
+
+    if (message.content) append('user', [{ text: message.content }]);
+  }
+
+  return {
+    systemInstruction: { parts: [{ text: systemText }] },
+    contents,
+  };
+}
+
+function parseToolResponse(value) {
+  try {
+    const parsed = JSON.parse(value || '{}');
+    return parsed && typeof parsed === 'object' ? parsed : { result: parsed };
+  } catch {
+    return { result: String(value || '') };
+  }
 }
 
 /**
@@ -652,8 +943,9 @@ async function queryFinanceSummary(db, userId) {
   const now = today();
   const { start, nextStart } = monthBounds(now);
 
-  // Monthly cashflow
-  const cashflow = await db
+  // These reads are independent; dispatch them together so a tool call pays
+  // one database wait rather than three serial waits.
+  const cashflowPromise = db
     .prepare(
       `SELECT
         COALESCE(SUM(CASE WHEN type = 'income' THEN amount_minor ELSE 0 END), 0) AS income_minor,
@@ -667,13 +959,7 @@ async function queryFinanceSummary(db, userId) {
     .bind(userId, start, nextStart)
     .first();
 
-  const income = Number(cashflow?.income_minor || 0);
-  const expense = Math.max(0, Number(cashflow?.expense_minor || 0) - Number(cashflow?.refund_minor || 0));
-  const net = income - expense;
-  const savingsRate = income > 0 ? Math.round((net / income) * 100) : 0;
-
-  // Spending by category
-  const categoryResult = await db
+  const categoryPromise = db
     .prepare(
       `SELECT c.name, SUM(t.amount_minor) AS spent
       FROM finance_transactions t
@@ -686,19 +972,27 @@ async function queryFinanceSummary(db, userId) {
     .bind(userId, start, nextStart)
     .all();
 
-  const categories = (categoryResult.results || []).map((r) => ({
-    category: r.name || 'Uncategorized',
-    spent: formatMoney(Number(r.spent || 0)),
-  }));
-
-  // Account balance
-  const balRow = await db
+  const balancePromise = db
     .prepare(
       `SELECT COALESCE(SUM(current_balance_minor), 0) AS bal
       FROM finance_accounts WHERE user_id = ? AND is_archived = 0`,
     )
     .bind(userId)
     .first();
+
+  const [cashflow, categoryResult, balRow] = await Promise.all([
+    cashflowPromise,
+    categoryPromise,
+    balancePromise,
+  ]);
+  const income = Number(cashflow?.income_minor || 0);
+  const expense = Math.max(0, Number(cashflow?.expense_minor || 0) - Number(cashflow?.refund_minor || 0));
+  const net = income - expense;
+  const savingsRate = income > 0 ? Math.round((net / income) * 100) : 0;
+  const categories = (categoryResult.results || []).map((r) => ({
+    category: r.name || 'Uncategorized',
+    spent: formatMoney(Number(r.spent || 0)),
+  }));
 
   return {
     month: `${start} to ${nextStart}`,
@@ -754,7 +1048,7 @@ async function queryRecentTransactions(db, userId, args = {}) {
 async function queryPantrySummary(db, userId) {
   const now = today();
 
-  const itemsResult = await db
+  const itemsPromise = db
     .prepare(
       `SELECT name, category, quantity, unit, location, low_stock_threshold, expires_on, notes
       FROM pantry_items
@@ -764,6 +1058,16 @@ async function queryPantrySummary(db, userId) {
     .bind(userId)
     .all();
 
+  const shoppingPromise = db
+    .prepare(
+      `SELECT name, quantity, unit, category FROM pantry_shopping_items
+      WHERE user_id = ? AND status = 'open'
+      ORDER BY created_at DESC`,
+    )
+    .bind(userId)
+    .all();
+
+  const [itemsResult, shoppingResult] = await Promise.all([itemsPromise, shoppingPromise]);
   const items = (itemsResult.results || []).map((r) => ({
     name: r.name,
     category: r.category,
@@ -775,15 +1079,6 @@ async function queryPantrySummary(db, userId) {
     isExpiringSoon: r.expires_on ? daysBetween(now, r.expires_on) <= 7 : false,
     daysUntilExpiry: r.expires_on ? daysBetween(now, r.expires_on) : null,
   }));
-
-  const shoppingResult = await db
-    .prepare(
-      `SELECT name, quantity, unit, category FROM pantry_shopping_items
-      WHERE user_id = ? AND status = 'open'
-      ORDER BY created_at DESC`,
-    )
-    .bind(userId)
-    .all();
 
   return {
     totalItems: items.length,
@@ -921,7 +1216,7 @@ async function queryNotes(db, userId) {
 async function queryCarSummary(db, userId) {
   const now = today();
 
-  const vehicleResult = await db
+  const vehiclePromise = db
     .prepare(
       `SELECT name, make, model, year, odometer_miles, battery_percent,
               insurance_expires_on, registration_expires_on, warranty_expires_on
@@ -931,6 +1226,18 @@ async function queryCarSummary(db, userId) {
     .bind(userId)
     .all();
 
+  const maintenancePromise = db
+    .prepare(
+      `SELECT m.title, m.due_date, m.priority, m.status, m.notes, v.name AS vehicle_name
+      FROM vehicle_maintenance_items m
+      LEFT JOIN vehicles v ON v.id = m.vehicle_id
+      WHERE m.user_id = ? AND m.status IN ('open', 'scheduled')
+      ORDER BY m.due_date ASC`,
+    )
+    .bind(userId)
+    .all();
+
+  const [vehicleResult, maintenanceResult] = await Promise.all([vehiclePromise, maintenancePromise]);
   const vehicles = (vehicleResult.results || []).map((r) => ({
     name: r.name,
     make: r.make,
@@ -944,17 +1251,6 @@ async function queryCarSummary(db, userId) {
     insuranceDaysLeft: r.insurance_expires_on ? daysBetween(now, r.insurance_expires_on) : null,
     registrationDaysLeft: r.registration_expires_on ? daysBetween(now, r.registration_expires_on) : null,
   }));
-
-  const maintenanceResult = await db
-    .prepare(
-      `SELECT m.title, m.due_date, m.priority, m.status, m.notes, v.name AS vehicle_name
-      FROM vehicle_maintenance_items m
-      LEFT JOIN vehicles v ON v.id = m.vehicle_id
-      WHERE m.user_id = ? AND m.status IN ('open', 'scheduled')
-      ORDER BY m.due_date ASC`,
-    )
-    .bind(userId)
-    .all();
 
   return {
     vehicleCount: vehicles.length,

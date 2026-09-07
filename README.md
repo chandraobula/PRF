@@ -1,5 +1,19 @@
 # React + Vite
 
+## AI provider fallback
+
+The chat API automatically tries every configured provider and model until one
+returns a usable answer. Configure secrets only on the server/Cloudflare:
+
+- `OPENAI_API_KEY` with optional comma-separated `OPENAI_MODELS`
+- `OPENROUTER_API_KEY` with optional comma-separated `OPENROUTER_MODELS`
+- `GEMINI_API_KEY` with optional comma-separated `GEMINI_CHAT_MODELS`
+
+The fallback order is OpenAI, OpenRouter, then Gemini. Legacy singular settings
+(`OPENAI_MODEL`, `OPENROUTER_MODEL`, and `GEMINI_MODEL`) are also supported.
+Failed models are skipped for the rest of the same user request, including
+failures that happen after a streaming response has already started.
+
 This template provides a minimal setup to get React working in Vite with HMR and some Oxlint rules.
 
 Currently, two official plugins are available:

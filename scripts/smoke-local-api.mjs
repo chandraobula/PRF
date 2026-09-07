@@ -125,6 +125,101 @@ try {
   const groceries = categories.categories.find((category) => category.type === 'expense' && category.name === 'Groceries')
     || categories.categories.find((category) => category.type === 'expense');
 
+  // Exercise the Finance Hub's hottest CRUD paths and verify that batched
+  // transaction writes keep the account balance exact across edits/deletes.
+  const account = await request('/api/finance/accounts', {
+    method: 'POST',
+    body: { name: 'Smoke Checking', type: 'bank', currency: 'USD', openingBalance: 1000 },
+  });
+  const income = await request('/api/finance/transactions', {
+    method: 'POST',
+    body: {
+      accountId: account.account.id,
+      type: 'income',
+      amount: 100,
+      currency: 'USD',
+      occurredOn: '2026-07-18',
+      merchant: 'Smoke Payroll',
+    },
+  });
+  const editedIncome = await request(`/api/finance/transactions/${income.transaction.id}`, {
+    method: 'PATCH',
+    status: 200,
+    body: { amount: 125, merchant: 'Smoke Payroll Updated' },
+  });
+  const expense = await request('/api/finance/transactions', {
+    method: 'POST',
+    body: {
+      accountId: account.account.id,
+      categoryId: groceries?.id,
+      type: 'expense',
+      amount: 25,
+      currency: 'USD',
+      occurredOn: '2026-07-19',
+      merchant: 'Smoke Grocery',
+    },
+  });
+  await request(`/api/finance/transactions/${expense.transaction.id}`, {
+    method: 'DELETE',
+    status: 200,
+  });
+
+  const budget = await request('/api/finance/budgets', {
+    method: 'POST',
+    body: {
+      name: 'Smoke Groceries',
+      categoryId: groceries?.id,
+      currency: 'USD',
+      periodStart: '2026-07-01',
+      periodEnd: '2026-07-31',
+      limit: 500,
+    },
+  });
+  const editedBudget = await request(`/api/finance/budgets/${budget.budget.id}`, {
+    method: 'PATCH',
+    status: 200,
+    body: { limit: 550 },
+  });
+
+  const goal = await request('/api/finance/goals', {
+    method: 'POST',
+    body: { name: 'Smoke Reserve', targetAmount: 1000, currency: 'USD', priority: 1 },
+  });
+  const contributedGoal = await request(`/api/finance/goals/${goal.goal.id}/contribute`, {
+    method: 'POST',
+    status: 200,
+    body: { amount: 100 },
+  });
+  const editedGoal = await request(`/api/finance/goals/${goal.goal.id}`, {
+    method: 'PATCH',
+    status: 200,
+    body: { name: 'Smoke Emergency Reserve' },
+  });
+
+  const imported = await request('/api/finance/import', {
+    method: 'POST',
+    status: 200,
+    body: {
+      currency: 'USD',
+      transactions: [
+        { type: 'expense', amount: 10, date: '2026-07-20', merchant: 'Smoke Import A', category: 'Groceries' },
+        { type: 'income', amount: 20, date: '2026-07-21', merchant: 'Smoke Import B' },
+        { type: 'expense', amount: 10, date: '2026-07-20', merchant: 'Smoke Import A', category: 'Groceries' },
+      ],
+    },
+  });
+  const financeAccounts = await request('/api/finance/accounts');
+  const checkedAccount = financeAccounts.accounts.find((item) => item.id === account.account.id);
+  const importAccount = financeAccounts.accounts.find((item) => item.name === 'USD Wallet');
+
+  assert(editedIncome.transaction.amountMinor === 12500, 'Transaction update returned the wrong amount.');
+  assert(editedBudget.budget.limitMinor === 55000, 'Budget update returned the wrong limit.');
+  assert(contributedGoal.goal.savedAmountMinor === 10000, 'Goal contribution returned the wrong balance.');
+  assert(editedGoal.goal.name === 'Smoke Emergency Reserve', 'Goal update was not persisted.');
+  assert(imported.imported === 2 && imported.skipped === 1, 'Bulk import duplicate handling is incorrect.');
+  assert(checkedAccount?.currentBalanceMinor === 112500, 'Batched transaction balance updates are incorrect.');
+  assert(importAccount?.currentBalanceMinor === 1000, 'Bulk-import account balance update is incorrect.');
+
   const receipt = await request('/api/finance/receipts', {
     method: 'POST',
     body: {
@@ -242,6 +337,7 @@ try {
     body: { status: 'done' },
   });
   const carSummary = await request('/api/car/summary');
+  const dashboard = await request('/api/dashboard?currency=USD&date=2026-07-18');
 
   console.log(JSON.stringify({
     ok: true,
@@ -253,6 +349,11 @@ try {
     currencyChosen: `${chosenPrefs.preferences.currency}/${chosenPrefs.preferences.currencySource}`,
     currencyKeptAfterRedetect: reDetectedPrefs.preferences.currency === 'INR'
       && reDetectedPrefs.preferences.currencySource === 'manual',
+    financeCrudBalance: checkedAccount.currentBalanceMinor,
+    financeImportBalance: importAccount.currentBalanceMinor,
+    financeImport: `${imported.imported} imported/${imported.skipped} skipped`,
+    budgetLimit: editedBudget.budget.limitMinor,
+    goalSaved: contributedGoal.goal.savedAmountMinor,
     receiptUpdated: receiptEdit.receipt?.notes === 'Smoke bill metadata updated',
     receipts: receipts.receipts.length,
     liabilityBalanceAfterPayment: liabilityPayment.liability.currentBalance,
@@ -264,6 +365,11 @@ try {
     vehicleStatus: vehicleEdit.vehicle.status,
     carVehicles: carSummary.vehicles.length,
     maintenanceStatus: completedMaintenance.maintenanceItem.status,
+    dashboardLoaded: Boolean(dashboard.user?.id)
+      && dashboard.finance?.summary?.currency === 'USD'
+      && Array.isArray(dashboard.car?.vehicles)
+      && Array.isArray(dashboard.pantry?.items)
+      && Array.isArray(dashboard.meals?.entries),
   }, null, 2));
 } catch (error) {
   console.error(error.message);
@@ -292,6 +398,10 @@ function run(command, args) {
       reject(new Error(`${path.basename(command)} exited with ${code}`));
     });
   });
+}
+
+function assert(condition, message) {
+  if (!condition) throw new Error(message);
 }
 
 async function waitForApi(serverProcess) {

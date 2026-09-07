@@ -111,7 +111,7 @@ export default function BudgetsPanel({
       if (editing) await updateFinanceBudget(editing.id, payload);
       else await addFinanceBudget(payload);
       setEditorOpen(false);
-      await onChanged?.();
+      onChanged?.();
     } catch (saveError) {
       setError(saveError.message || 'Could not save this budget.');
     } finally {
@@ -123,7 +123,7 @@ export default function BudgetsPanel({
     try {
       await deleteFinanceBudget(pendingDelete.id);
       setPendingDelete(null);
-      await onChanged?.();
+      onChanged?.();
     } catch (deleteError) {
       setError(deleteError.message || 'Could not delete this budget.');
       setPendingDelete(null);

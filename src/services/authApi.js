@@ -1,29 +1,59 @@
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || '/api';
+const ACCOUNT_CACHE_MS = 30_000;
+
+let currentAccountCache = null;
+let currentAccountPromise = null;
 
 export async function registerAccount({ displayName, email, password }) {
-  return authRequest('/auth/register', {
+  const result = await authRequest('/auth/register', {
     method: 'POST',
     body: JSON.stringify({ displayName, email, password }),
   });
+  cacheCurrentAccount(result);
+  return result;
 }
 
 export async function loginAccount({ email, password }) {
-  return authRequest('/auth/login', {
+  const result = await authRequest('/auth/login', {
     method: 'POST',
     body: JSON.stringify({ email, password }),
   });
+  cacheCurrentAccount(result);
+  return result;
 }
 
 export async function getCurrentAccount() {
+  if (currentAccountCache && Date.now() - currentAccountCache.cachedAt < ACCOUNT_CACHE_MS) {
+    return currentAccountCache.value;
+  }
+
+  if (currentAccountPromise) return currentAccountPromise;
+
+  currentAccountPromise = authRequest('/auth/me')
+    .then((result) => {
+      cacheCurrentAccount(result);
+      return result;
+    })
+    .catch(() => ({ authenticated: false }))
+    .finally(() => {
+      currentAccountPromise = null;
+    });
+
   try {
-    return await authRequest('/auth/me');
+    return await currentAccountPromise;
   } catch {
     return { authenticated: false };
   }
 }
 
 export async function logoutAccount() {
+  currentAccountCache = null;
+  currentAccountPromise = null;
   return authRequest('/auth/logout', { method: 'POST' });
+}
+
+function cacheCurrentAccount(value) {
+  currentAccountCache = { value, cachedAt: Date.now() };
 }
 
 async function authRequest(path, options = {}) {

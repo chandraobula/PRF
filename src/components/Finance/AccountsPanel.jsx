@@ -89,7 +89,7 @@ export default function AccountsPanel({ accounts, currency, onChanged }) {
         });
       }
       setEditorOpen(false);
-      await onChanged?.();
+      onChanged?.();
     } catch (saveError) {
       setError(saveError.message || 'Could not save this account.');
     } finally {
@@ -101,7 +101,7 @@ export default function AccountsPanel({ accounts, currency, onChanged }) {
     try {
       await deleteFinanceAccount(pendingDelete.id);
       setPendingDelete(null);
-      await onChanged?.();
+      onChanged?.();
     } catch (deleteError) {
       setError(deleteError.message || 'Could not remove this account.');
       setPendingDelete(null);
@@ -169,7 +169,7 @@ export default function AccountsPanel({ accounts, currency, onChanged }) {
         <UpdateValueDialog
           account={valuingAccount}
           onClose={() => setValuingAccount(null)}
-          onDone={async () => { setValuingAccount(null); await onChanged?.(); }}
+          onDone={() => { setValuingAccount(null); onChanged?.(); }}
         />
       )}
 

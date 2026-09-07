@@ -85,7 +85,7 @@ export default function GoalsPanel({ goals, habits = [], currency, onChanged }) 
       if (editing) await updateFinanceGoal(editing.id, payload);
       else await addFinanceGoal(payload);
       setEditorOpen(false);
-      await onChanged?.();
+      onChanged?.();
     } catch (saveError) {
       setError(saveError.message || 'Could not save this goal.');
     } finally {
@@ -97,7 +97,7 @@ export default function GoalsPanel({ goals, habits = [], currency, onChanged }) 
     try {
       await deleteFinanceGoal(pendingDelete.id);
       setPendingDelete(null);
-      await onChanged?.();
+      onChanged?.();
     } catch (deleteError) {
       setError(deleteError.message || 'Could not delete this goal.');
       setPendingDelete(null);
@@ -204,7 +204,7 @@ export default function GoalsPanel({ goals, habits = [], currency, onChanged }) 
           goal={contributing}
           currency={currency}
           onClose={() => setContributing(null)}
-          onDone={async () => { setContributing(null); await onChanged?.(); }}
+          onDone={() => { setContributing(null); onChanged?.(); }}
         />
       )}
 
