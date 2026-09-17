@@ -121,6 +121,70 @@ try {
     body: { timezone: 'America/New_York', locale: 'en-US' },
   });
 
+  const compassBeforeSetup = await request('/api/compass/today?date=2026-09-16&now=2026-09-16T14:00:00.000Z');
+  const compassSetup = await request('/api/compass/plan', {
+    method: 'PUT',
+    body: {
+      date: '2026-09-16',
+      now: '2026-09-16T14:00:00.000Z',
+      name: 'Smoke rhythm',
+      focusTheme: { title: 'Reliable systems', description: 'Build and verify one resilient system.' },
+      blocks: [
+        { kind: 'deep_work', title: 'Smoke deep work', instruction: 'Stay with one task.', startMinute: 540, durationMinutes: 60, daysMask: 127 },
+        { kind: 'reset', title: 'Smoke midday reset', instruction: 'Release the morning.', startMinute: 660, durationMinutes: 30, daysMask: 127 },
+        { kind: 'learning', title: 'Smoke learning', instruction: 'Build the theme.', startMinute: 1080, durationMinutes: 60, daysMask: 127 },
+        { kind: 'reflection', title: 'Smoke reflection', instruction: 'Close the day.', startMinute: 1260, durationMinutes: 30, daysMask: 127 },
+      ],
+    },
+  });
+  const compassDate = compassSetup.date;
+  const deepWorkBlock = compassSetup.blocks.find((block) => block.kind === 'deep_work');
+  await request(`/api/compass/days/${compassDate}`, {
+    method: 'PATCH',
+    status: 200,
+    body: { importantThing: 'Verify Daily Compass' },
+  });
+  await request(`/api/compass/days/${compassDate}/checks/sleep`, {
+    method: 'PUT',
+    status: 200,
+    body: { completed: true },
+  });
+  await request(`/api/compass/days/${compassDate}/blocks/${deepWorkBlock.id}`, {
+    method: 'PUT',
+    status: 200,
+    body: { status: 'started' },
+  });
+  await request(`/api/compass/days/${compassDate}/blocks/${deepWorkBlock.id}`, {
+    method: 'PUT',
+    status: 200,
+    body: { status: 'completed', actualMinutes: 55 },
+  });
+  const compassReset = await request(`/api/compass/days/${compassDate}/reset`, {
+    method: 'POST',
+    status: 200,
+    body: { now: '2026-09-16T21:00:00.000Z' },
+  });
+  const compassClosed = await request(`/api/compass/days/${compassDate}/close`, {
+    method: 'POST',
+    status: 200,
+    body: {
+      now: '2026-09-17T02:00:00.000Z',
+      captureText: 'Smoke capture',
+      learnText: 'The reset is atomic.',
+      tomorrowText: 'Keep the system simple.',
+    },
+  });
+  const compassTomorrow = await request('/api/compass/today?date=2026-09-17&now=2026-09-17T14:00:00.000Z');
+  const compassWeek = await request('/api/compass/week?start=2026-09-14');
+
+  assert(compassBeforeSetup.configured === false, 'Compass should start unconfigured.');
+  assert(compassSetup.configured === true && compassSetup.blocks.length === 4, 'Compass setup failed.');
+  assert(compassReset.day.resetCount === 1, 'Compass reset was not recorded.');
+  assert(compassReset.blocks.some((block) => block.kind === 'reset' && block.state === 'released'), 'Compass reset did not release missed blocks.');
+  assert(compassClosed.day.closedAt && compassClosed.checks.reflection, 'Compass reflection did not close the day.');
+  assert(compassTomorrow.day.importantThing === 'Keep the system simple.', 'Compass did not carry tomorrow’s priority forward.');
+  assert(compassWeek.days.length === 7, 'Compass week did not return seven days.');
+
   const categories = await request('/api/finance/categories');
   const groceries = categories.categories.find((category) => category.type === 'expense' && category.name === 'Groceries')
     || categories.categories.find((category) => category.type === 'expense');
@@ -349,6 +413,9 @@ try {
     currencyChosen: `${chosenPrefs.preferences.currency}/${chosenPrefs.preferences.currencySource}`,
     currencyKeptAfterRedetect: reDetectedPrefs.preferences.currency === 'INR'
       && reDetectedPrefs.preferences.currencySource === 'manual',
+    compassConfigured: compassSetup.configured,
+    compassResetCount: compassReset.day.resetCount,
+    compassClosed: Boolean(compassClosed.day.closedAt),
     financeCrudBalance: checkedAccount.currentBalanceMinor,
     financeImportBalance: importAccount.currentBalanceMinor,
     financeImport: `${imported.imported} imported/${imported.skipped} skipped`,
@@ -369,7 +436,8 @@ try {
       && dashboard.finance?.summary?.currency === 'USD'
       && Array.isArray(dashboard.car?.vehicles)
       && Array.isArray(dashboard.pantry?.items)
-      && Array.isArray(dashboard.meals?.entries),
+      && Array.isArray(dashboard.meals?.entries)
+      && dashboard.compass?.configured === true,
   }, null, 2));
 } catch (error) {
   console.error(error.message);

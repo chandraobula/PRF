@@ -46,6 +46,15 @@ import {
   parseModelJson,
   sanitizeScanQuantity,
 } from '../../shared/api/scan.js';
+import {
+  COMPASS_BLOCK_KINDS,
+  COMPASS_CHECK_KEYS,
+  COMPASS_EVENT_STATUSES,
+  DEFAULT_COMPASS_BLOCKS,
+  buildCompassToday,
+  compassCheckForKind,
+  localTimeParts,
+} from '../../shared/api/compass.js';
 
 export { MISC_INCOME_CATEGORY };
 
@@ -56,7 +65,7 @@ const provisionedUsers = new Set();
 const jsonHeaders = {
   'content-type': 'application/json; charset=utf-8',
   'access-control-allow-origin': '*',
-  'access-control-allow-methods': 'GET,POST,PATCH,DELETE,OPTIONS',
+  'access-control-allow-methods': 'GET,POST,PUT,PATCH,DELETE,OPTIONS',
   'access-control-allow-headers': 'content-type,authorization,x-user-email,x-user-id',
 };
 
@@ -181,6 +190,10 @@ export async function onRequest(context) {
 
     if (route[0] === 'sticky-notes') {
       return await handleStickyNotesRoute({ db: env.DB, request, url, route: route.slice(1), user: auth });
+    }
+
+    if (route[0] === 'compass') {
+      return await handleCompassRoute({ db: env.DB, request, url, route: route.slice(1), user: auth });
     }
 
     if (route[0] === 'admin') {
@@ -392,11 +405,12 @@ async function getDashboard(db, user, url) {
     ? normalizeDate(url.searchParams.get('date'))
     : today();
 
-  const [finance, car, pantry, entries] = await Promise.all([
+  const [finance, car, pantry, entries, compass] = await Promise.all([
     getFinanceSummary(db, user.userId, url),
     getCarSummary(db, user.userId),
     getPantrySummary(db, user.userId),
     listMealPlan(db, user.userId, dashboardDate, dashboardDate),
+    getCompassDashboardSummary(db, user.userId, dashboardDate),
   ]);
 
   return {
@@ -410,6 +424,556 @@ async function getDashboard(db, user, url) {
     car,
     pantry,
     meals: { entries },
+    compass,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Daily Compass — orient, act, reset, and continue without carrying missed
+// blocks forward as task debt.
+// ---------------------------------------------------------------------------
+
+async function handleCompassRoute({ db, request, url, route, user }) {
+  const [resource, dateOrId, action, childId] = route;
+
+  if (!resource || resource === 'today') {
+    assertMethod(request, 'GET');
+    return sendJson(await getCompassToday(db, user.userId, {
+      date: url.searchParams.get('date'),
+      now: url.searchParams.get('now'),
+    }));
+  }
+
+  if (resource === 'plan') {
+    if (request.method === 'GET') {
+      return sendJson(await getCompassPlanDetails(db, user.userId));
+    }
+    if (request.method === 'PUT') {
+      const payload = await readJson(request);
+      await saveCompassPlan(db, user.userId, payload);
+      return sendJson(await getCompassToday(db, user.userId, {
+        date: payload.date,
+        now: payload.now,
+      }));
+    }
+  }
+
+  if (resource === 'week') {
+    assertMethod(request, 'GET');
+    return sendJson(await getCompassWeek(db, user.userId, url.searchParams.get('start')));
+  }
+
+  if (resource === 'days' && dateOrId) {
+    const localDate = normalizeDate(dateOrId);
+
+    if (!action && request.method === 'PATCH') {
+      const payload = await readJson(request);
+      return sendJson({ day: await updateCompassDay(db, user.userId, localDate, payload) });
+    }
+
+    if (action === 'checks' && childId && request.method === 'PUT') {
+      const payload = await readJson(request);
+      return sendJson({ check: await setCompassCheck(db, user.userId, localDate, childId, payload.completed !== false) });
+    }
+
+    if (action === 'blocks' && childId && request.method === 'PUT') {
+      const payload = await readJson(request);
+      await setCompassBlockEvent(db, user.userId, localDate, childId, payload);
+      return sendJson(await getCompassToday(db, user.userId, { date: localDate, now: payload.now }));
+    }
+
+    if (action === 'reset' && request.method === 'POST') {
+      const payload = await readJson(request);
+      return sendJson(await resetCompassDay(db, user.userId, localDate, payload));
+    }
+
+    if (action === 'close' && request.method === 'POST') {
+      const payload = await readJson(request);
+      return sendJson(await closeCompassDay(db, user.userId, localDate, payload));
+    }
+  }
+
+  throw new HttpError(405, 'Method not allowed');
+}
+
+async function getCompassToday(db, userId, options = {}) {
+  const preference = await db
+    .prepare('SELECT timezone FROM user_preferences WHERE user_id = ?')
+    .bind(userId)
+    .first();
+  const timezone = preference?.timezone || 'Asia/Kolkata';
+  let localNow;
+
+  try {
+    localNow = localTimeParts(options.now || new Date(), timezone);
+  } catch {
+    localNow = localTimeParts(options.now || new Date(), 'UTC');
+  }
+
+  const localDate = options.date ? normalizeDate(options.date) : localNow.date;
+  const nowMinute = localDate < localNow.date ? 1439 : localDate > localNow.date ? 0 : localNow.minute;
+  const plan = await getActiveCompassPlan(db, userId);
+
+  if (!plan) {
+    return {
+      ...buildCompassToday({ date: localDate, nowMinute, plan: null }),
+      timezone,
+    };
+  }
+
+  const [blockResult, dayRow, eventResult, checkResult, themeRow] = await Promise.all([
+    db.prepare(
+      `SELECT * FROM compass_blocks
+       WHERE user_id = ? AND plan_id = ? AND is_enabled = 1
+       ORDER BY start_minute, sort_order`,
+    ).bind(userId, plan.id).all(),
+    db.prepare('SELECT * FROM compass_days WHERE user_id = ? AND local_date = ?')
+      .bind(userId, localDate).first(),
+    db.prepare('SELECT * FROM compass_block_events WHERE user_id = ? AND local_date = ?')
+      .bind(userId, localDate).all(),
+    db.prepare('SELECT check_key FROM compass_daily_checks WHERE user_id = ? AND local_date = ?')
+      .bind(userId, localDate).all(),
+    plan.focusThemeId
+      ? db.prepare('SELECT * FROM compass_focus_themes WHERE id = ? AND user_id = ?')
+        .bind(plan.focusThemeId, userId).first()
+      : Promise.resolve(null),
+  ]);
+
+  return {
+    ...buildCompassToday({
+      date: localDate,
+      nowMinute,
+      plan,
+      blocks: (blockResult.results || []).map(mapCompassBlock),
+      events: (eventResult.results || []).map(mapCompassEvent),
+      day: dayRow ? mapCompassDay(dayRow) : null,
+      checks: (checkResult.results || []).map((row) => ({ key: row.check_key })),
+      focusTheme: themeRow ? mapCompassTheme(themeRow) : null,
+    }),
+    timezone,
+  };
+}
+
+async function getCompassDashboardSummary(db, userId, date) {
+  const todayState = await getCompassToday(db, userId, { date });
+  return {
+    configured: todayState.configured,
+    date: todayState.date,
+    nextStep: todayState.nextStep,
+    completedChecks: todayState.completedChecks || 0,
+    totalChecks: todayState.totalChecks || 5,
+    resetRecommended: todayState.resetRecommended,
+  };
+}
+
+async function getActiveCompassPlan(db, userId) {
+  const row = await db
+    .prepare('SELECT * FROM compass_plans WHERE user_id = ? AND is_active = 1 LIMIT 1')
+    .bind(userId)
+    .first();
+  return row ? mapCompassPlan(row) : null;
+}
+
+async function getCompassPlanDetails(db, userId) {
+  const plan = await getActiveCompassPlan(db, userId);
+  if (!plan) return { configured: false, plan: null, blocks: DEFAULT_COMPASS_BLOCKS, focusTheme: null };
+
+  const [blocks, theme] = await Promise.all([
+    db.prepare('SELECT * FROM compass_blocks WHERE user_id = ? AND plan_id = ? AND is_enabled = 1 ORDER BY start_minute, sort_order')
+      .bind(userId, plan.id).all(),
+    plan.focusThemeId
+      ? db.prepare('SELECT * FROM compass_focus_themes WHERE id = ? AND user_id = ?').bind(plan.focusThemeId, userId).first()
+      : Promise.resolve(null),
+  ]);
+
+  return {
+    configured: true,
+    plan,
+    blocks: (blocks.results || []).map(mapCompassBlock),
+    focusTheme: theme ? mapCompassTheme(theme) : null,
+  };
+}
+
+async function saveCompassPlan(db, userId, payload) {
+  const existing = await getActiveCompassPlan(db, userId);
+  const planId = existing?.id || crypto.randomUUID();
+  const existingBlockResult = existing
+    ? await db.prepare('SELECT id FROM compass_blocks WHERE user_id = ? AND plan_id = ?')
+      .bind(userId, planId).all()
+    : { results: [] };
+  const existingBlockIds = new Set((existingBlockResult.results || []).map((row) => row.id));
+  const rawBlocks = Array.isArray(payload.blocks) && payload.blocks.length ? payload.blocks : DEFAULT_COMPASS_BLOCKS;
+
+  if (rawBlocks.length > 30) throw new HttpError(400, 'A daily rhythm can contain at most 30 blocks.');
+
+  const blocks = rawBlocks.map((block, index) => normalizeCompassBlock(block, index));
+  const defaultGrace = clampCompassInteger(payload.defaultGraceMinutes ?? existing?.defaultGraceMinutes ?? 20, 0, 180);
+  const statements = [];
+  let focusThemeId = existing?.focusThemeId || null;
+
+  if (payload.focusTheme === null) {
+    if (focusThemeId) {
+      statements.push(db.prepare(
+        `UPDATE compass_focus_themes
+         SET status = 'archived', updated_at = CURRENT_TIMESTAMP
+         WHERE id = ? AND user_id = ?`,
+      ).bind(focusThemeId, userId));
+    }
+    focusThemeId = null;
+  } else if (payload.focusTheme?.title) {
+    focusThemeId = focusThemeId || crypto.randomUUID();
+    statements.push(db.prepare(
+      `INSERT INTO compass_focus_themes (id, user_id, title, description, starts_on, ends_on, status)
+       VALUES (?, ?, ?, ?, ?, ?, 'active')
+       ON CONFLICT(id) DO UPDATE SET
+         title = excluded.title, description = excluded.description,
+         starts_on = excluded.starts_on, ends_on = excluded.ends_on,
+         status = 'active', updated_at = CURRENT_TIMESTAMP`,
+    ).bind(
+      focusThemeId,
+      userId,
+      requiredText(payload.focusTheme.title, 'Focus Theme title is required.').slice(0, 120),
+      String(payload.focusTheme.description || '').trim().slice(0, 1000) || null,
+      payload.focusTheme.startsOn ? normalizeDate(payload.focusTheme.startsOn) : null,
+      payload.focusTheme.endsOn ? normalizeDate(payload.focusTheme.endsOn) : null,
+    ));
+  }
+
+  if (existing) {
+    statements.push(db.prepare(
+      `UPDATE compass_plans
+       SET name = ?, focus_theme_id = ?, default_grace_minutes = ?, updated_at = CURRENT_TIMESTAMP
+       WHERE id = ? AND user_id = ?`,
+    ).bind(String(payload.name || existing.name || 'My daily rhythm').trim().slice(0, 100), focusThemeId, defaultGrace, planId, userId));
+    statements.push(db.prepare(
+      'UPDATE compass_blocks SET is_enabled = 0, updated_at = CURRENT_TIMESTAMP WHERE plan_id = ? AND user_id = ?',
+    ).bind(planId, userId));
+  } else {
+    statements.push(db.prepare(
+      `INSERT INTO compass_plans (id, user_id, name, is_active, focus_theme_id, default_grace_minutes)
+       VALUES (?, ?, ?, 1, ?, ?)`,
+    ).bind(planId, userId, String(payload.name || 'My daily rhythm').trim().slice(0, 100), focusThemeId, defaultGrace));
+  }
+
+  for (const block of blocks) {
+    if (block.id && existingBlockIds.has(block.id)) {
+      statements.push(db.prepare(
+        `UPDATE compass_blocks SET
+           kind = ?, title = ?, instruction = ?, days_mask = ?, start_minute = ?,
+           duration_minutes = ?, grace_minutes = ?, action_type = ?, action_target_id = ?,
+           sort_order = ?, is_enabled = 1, updated_at = CURRENT_TIMESTAMP
+         WHERE id = ? AND user_id = ? AND plan_id = ?`,
+      ).bind(
+        block.kind, block.title, block.instruction, block.daysMask, block.startMinute,
+        block.durationMinutes, block.graceMinutes, block.actionType, block.actionTargetId,
+        block.sortOrder, block.id, userId, planId,
+      ));
+    } else {
+      statements.push(db.prepare(
+        `INSERT INTO compass_blocks (
+           id, user_id, plan_id, kind, title, instruction, days_mask,
+           start_minute, duration_minutes, grace_minutes, action_type,
+           action_target_id, sort_order, is_enabled
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)`,
+      ).bind(
+        crypto.randomUUID(), userId, planId, block.kind, block.title, block.instruction,
+        block.daysMask, block.startMinute, block.durationMinutes, block.graceMinutes,
+        block.actionType, block.actionTargetId, block.sortOrder,
+      ));
+    }
+  }
+
+  await db.batch(statements);
+}
+
+function normalizeCompassBlock(block, index) {
+  const kind = String(block.kind || 'custom').trim().toLowerCase();
+  if (!COMPASS_BLOCK_KINDS.has(kind)) throw new HttpError(400, 'Invalid Daily Compass block type.');
+
+  return {
+    id: String(block.id || '').trim() || null,
+    kind,
+    title: requiredText(block.title, 'Every rhythm block needs a title.').slice(0, 100),
+    instruction: String(block.instruction || '').trim().slice(0, 500) || null,
+    daysMask: clampCompassInteger(block.daysMask ?? 127, 1, 127),
+    startMinute: clampCompassInteger(block.startMinute, 0, 1439),
+    durationMinutes: clampCompassInteger(block.durationMinutes ?? 30, 5, 720),
+    graceMinutes: block.graceMinutes === undefined || block.graceMinutes === null
+      ? null
+      : clampCompassInteger(block.graceMinutes, 0, 180),
+    actionType: String(block.actionType || '').trim().slice(0, 40) || null,
+    actionTargetId: String(block.actionTargetId || '').trim().slice(0, 120) || null,
+    sortOrder: index,
+  };
+}
+
+function clampCompassInteger(value, minimum, maximum) {
+  const numeric = Math.round(Number(value));
+  if (!Number.isFinite(numeric)) throw new HttpError(400, 'Enter a valid schedule value.');
+  return Math.max(minimum, Math.min(maximum, numeric));
+}
+
+async function updateCompassDay(db, userId, localDate, payload) {
+  const row = await db.prepare(
+    `INSERT INTO compass_days (id, user_id, local_date, important_thing)
+     VALUES (?, ?, ?, ?)
+     ON CONFLICT(user_id, local_date) DO UPDATE SET
+       important_thing = excluded.important_thing, updated_at = CURRENT_TIMESTAMP
+     RETURNING *`,
+  ).bind(
+    crypto.randomUUID(), userId, localDate,
+    String(payload.importantThing || '').trim().slice(0, 300) || null,
+  ).first();
+  return mapCompassDay(row);
+}
+
+async function setCompassCheck(db, userId, localDate, checkKey, completed) {
+  if (!COMPASS_CHECK_KEYS.has(checkKey)) throw new HttpError(400, 'Invalid Daily Five item.');
+
+  if (completed) {
+    await db.prepare(
+      `INSERT INTO compass_daily_checks (user_id, local_date, check_key, completed_at)
+       VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+       ON CONFLICT(user_id, local_date, check_key) DO UPDATE SET completed_at = CURRENT_TIMESTAMP`,
+    ).bind(userId, localDate, checkKey).run();
+  } else {
+    await db.prepare('DELETE FROM compass_daily_checks WHERE user_id = ? AND local_date = ? AND check_key = ?')
+      .bind(userId, localDate, checkKey).run();
+  }
+
+  return { key: checkKey, completed };
+}
+
+async function setCompassBlockEvent(db, userId, localDate, blockId, payload) {
+  const status = String(payload.status || '').trim().toLowerCase();
+  if (!COMPASS_EVENT_STATUSES.has(status)) throw new HttpError(400, 'Invalid block status.');
+
+  const block = await db.prepare(
+    `SELECT * FROM compass_blocks
+     WHERE id = ? AND user_id = ? AND is_enabled = 1`,
+  ).bind(blockId, userId).first();
+  if (!block) throw new HttpError(404, 'Compass block not found.');
+
+  const now = new Date().toISOString();
+  const checkKey = status === 'completed' ? compassCheckForKind(block.kind) : null;
+  const statements = [db.prepare(
+    `INSERT INTO compass_block_events (
+       id, user_id, local_date, block_id, status, started_at, completed_at, actual_minutes, note
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(user_id, local_date, block_id) DO UPDATE SET
+       status = excluded.status,
+       started_at = COALESCE(compass_block_events.started_at, excluded.started_at),
+       completed_at = excluded.completed_at,
+       actual_minutes = excluded.actual_minutes,
+       note = excluded.note,
+       updated_at = CURRENT_TIMESTAMP`,
+  ).bind(
+    crypto.randomUUID(), userId, localDate, blockId, status,
+    status === 'started' || status === 'completed' ? now : null,
+    status === 'completed' ? now : null,
+    payload.actualMinutes === undefined ? null : Math.max(0, Math.round(Number(payload.actualMinutes) || 0)),
+    String(payload.note || '').trim().slice(0, 500) || null,
+  )];
+
+  if (checkKey) {
+    statements.push(db.prepare(
+      `INSERT INTO compass_daily_checks (user_id, local_date, check_key, completed_at)
+       VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+       ON CONFLICT(user_id, local_date, check_key) DO UPDATE SET completed_at = CURRENT_TIMESTAMP`,
+    ).bind(userId, localDate, checkKey));
+  }
+
+  await db.batch(statements);
+  return { event: { blockId, status }, checkKey };
+}
+
+async function resetCompassDay(db, userId, localDate, payload) {
+  const state = await getCompassToday(db, userId, { date: localDate, now: payload.now });
+  if (!state.configured) throw new HttpError(400, 'Set up your Daily Compass before resetting the day.');
+
+  const missed = state.blocks.filter((block) => block.state === 'missed');
+  const requestedResume = payload.resumeBlockId
+    ? state.blocks.find((block) => block.id === payload.resumeBlockId && !['completed', 'released'].includes(block.state))
+    : null;
+  const resumeBlock = requestedResume || (state.nextStep?.virtual ? null : state.nextStep);
+  const statements = [
+    db.prepare(
+      `INSERT INTO compass_days (id, user_id, local_date, reset_count)
+       VALUES (?, ?, ?, 1)
+       ON CONFLICT(user_id, local_date) DO UPDATE SET
+         reset_count = compass_days.reset_count + 1, updated_at = CURRENT_TIMESTAMP`,
+    ).bind(crypto.randomUUID(), userId, localDate),
+    db.prepare(
+      `INSERT INTO compass_reset_events (id, user_id, local_date, resume_block_id, reason)
+       VALUES (?, ?, ?, ?, ?)`,
+    ).bind(
+      crypto.randomUUID(), userId, localDate, resumeBlock?.id || null,
+      String(payload.reason || '').trim().slice(0, 300) || null,
+    ),
+  ];
+
+  for (const block of missed) {
+    statements.push(db.prepare(
+      `INSERT INTO compass_block_events (id, user_id, local_date, block_id, status)
+       VALUES (?, ?, ?, ?, 'released')
+       ON CONFLICT(user_id, local_date, block_id) DO UPDATE SET
+         status = 'released', completed_at = NULL, updated_at = CURRENT_TIMESTAMP`,
+    ).bind(crypto.randomUUID(), userId, localDate, block.id));
+  }
+
+  await db.batch(statements);
+  return getCompassToday(db, userId, { date: localDate, now: payload.now });
+}
+
+async function closeCompassDay(db, userId, localDate, payload) {
+  const now = new Date().toISOString();
+  const statements = [
+    db.prepare(
+      `INSERT INTO compass_days (
+         id, user_id, local_date, capture_text, learn_text, tomorrow_text, closed_at
+       ) VALUES (?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(user_id, local_date) DO UPDATE SET
+         capture_text = excluded.capture_text,
+         learn_text = excluded.learn_text,
+         tomorrow_text = excluded.tomorrow_text,
+         closed_at = excluded.closed_at,
+         updated_at = CURRENT_TIMESTAMP`,
+    ).bind(
+      crypto.randomUUID(), userId, localDate,
+      String(payload.captureText || '').trim().slice(0, 2000) || null,
+      String(payload.learnText || '').trim().slice(0, 2000) || null,
+      String(payload.tomorrowText || '').trim().slice(0, 500) || null,
+      now,
+    ),
+    db.prepare(
+      `INSERT INTO compass_daily_checks (user_id, local_date, check_key, completed_at)
+       VALUES (?, ?, 'reflection', CURRENT_TIMESTAMP)
+       ON CONFLICT(user_id, local_date, check_key) DO UPDATE SET completed_at = CURRENT_TIMESTAMP`,
+    ).bind(userId, localDate),
+  ];
+
+  const tomorrowText = String(payload.tomorrowText || '').trim().slice(0, 500);
+  if (tomorrowText) {
+    statements.push(db.prepare(
+      `INSERT INTO compass_days (id, user_id, local_date, important_thing)
+       VALUES (?, ?, ?, ?)
+       ON CONFLICT(user_id, local_date) DO UPDATE SET
+         important_thing = excluded.important_thing, updated_at = CURRENT_TIMESTAMP`,
+    ).bind(crypto.randomUUID(), userId, addDays(localDate, 1), tomorrowText));
+  }
+
+  const reflection = await db.prepare(
+    `SELECT id FROM compass_blocks
+     WHERE user_id = ? AND kind = 'reflection' AND is_enabled = 1
+     ORDER BY start_minute DESC LIMIT 1`,
+  ).bind(userId).first();
+  if (reflection?.id) {
+    statements.push(db.prepare(
+      `INSERT INTO compass_block_events (id, user_id, local_date, block_id, status, started_at, completed_at)
+       VALUES (?, ?, ?, ?, 'completed', ?, ?)
+       ON CONFLICT(user_id, local_date, block_id) DO UPDATE SET
+         status = 'completed', completed_at = excluded.completed_at, updated_at = CURRENT_TIMESTAMP`,
+    ).bind(crypto.randomUUID(), userId, localDate, reflection.id, now, now));
+  }
+
+  await db.batch(statements);
+  return getCompassToday(db, userId, { date: localDate, now: payload.now });
+}
+
+async function getCompassWeek(db, userId, requestedStart) {
+  const start = normalizeDate(requestedStart || today());
+  const end = addDays(start, 6);
+  const [days, checks] = await Promise.all([
+    db.prepare(
+      `SELECT * FROM compass_days WHERE user_id = ? AND local_date BETWEEN ? AND ? ORDER BY local_date`,
+    ).bind(userId, start, end).all(),
+    db.prepare(
+      `SELECT local_date, COUNT(*) AS completed
+       FROM compass_daily_checks
+       WHERE user_id = ? AND local_date BETWEEN ? AND ?
+       GROUP BY local_date`,
+    ).bind(userId, start, end).all(),
+  ]);
+  const dayByDate = new Map((days.results || []).map((row) => [row.local_date, mapCompassDay(row)]));
+  const checksByDate = new Map((checks.results || []).map((row) => [row.local_date, Number(row.completed || 0)]));
+
+  return {
+    start,
+    end,
+    days: Array.from({ length: 7 }, (_, index) => {
+      const date = addDays(start, index);
+      return {
+        date,
+        day: dayByDate.get(date) || null,
+        completedChecks: checksByDate.get(date) || 0,
+        totalChecks: 5,
+      };
+    }),
+  };
+}
+
+function mapCompassPlan(row) {
+  return {
+    id: row.id,
+    name: row.name,
+    focusThemeId: row.focus_theme_id,
+    defaultGraceMinutes: Number(row.default_grace_minutes || 20),
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
+function mapCompassBlock(row) {
+  return {
+    id: row.id,
+    planId: row.plan_id,
+    kind: row.kind,
+    title: row.title,
+    instruction: row.instruction,
+    daysMask: Number(row.days_mask || 127),
+    startMinute: Number(row.start_minute || 0),
+    durationMinutes: Number(row.duration_minutes || 30),
+    graceMinutes: row.grace_minutes === null ? null : Number(row.grace_minutes),
+    actionType: row.action_type,
+    actionTargetId: row.action_target_id,
+    sortOrder: Number(row.sort_order || 0),
+    isEnabled: Boolean(row.is_enabled),
+  };
+}
+
+function mapCompassEvent(row) {
+  return {
+    id: row.id,
+    blockId: row.block_id,
+    status: row.status,
+    startedAt: row.started_at,
+    completedAt: row.completed_at,
+    actualMinutes: row.actual_minutes === null ? null : Number(row.actual_minutes),
+    note: row.note,
+  };
+}
+
+function mapCompassDay(row) {
+  return {
+    id: row.id,
+    date: row.local_date,
+    importantThing: row.important_thing || '',
+    captureText: row.capture_text || '',
+    learnText: row.learn_text || '',
+    tomorrowText: row.tomorrow_text || '',
+    resetCount: Number(row.reset_count || 0),
+    closedAt: row.closed_at,
+  };
+}
+
+function mapCompassTheme(row) {
+  return {
+    id: row.id,
+    title: row.title,
+    description: row.description,
+    startsOn: row.starts_on,
+    endsOn: row.ends_on,
+    status: row.status,
   };
 }
 

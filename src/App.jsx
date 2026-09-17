@@ -3,6 +3,7 @@ import Splash from './pages/Splash';
 import Onboarding from './pages/Onboarding';
 import Auth from './pages/Auth';
 import Dashboard from './pages/Dashboard';
+import DailyCompass from './pages/DailyCompass';
 import FinanceHub from './pages/FinanceHub';
 import CarHub from './pages/CarHub';
 import WorkHub from './pages/WorkHub';
@@ -39,6 +40,7 @@ function App() {
         <Route path="/auth" element={<Auth />} />
         <Route element={<MainLayout />}>
           <Route path="/dashboard" element={<Dashboard />} />
+          <Route path="/compass" element={<DailyCompass />} />
           <Route path="/finance" element={<FinanceHub />} />
           <Route path="/car" element={<CarHub />} />
           <Route path="/work" element={<WorkHub />} />

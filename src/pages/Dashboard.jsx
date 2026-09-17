@@ -3,7 +3,7 @@ import { Link } from 'react-router-dom';
 import {
   ArrowRight, Car, Coffee, Sparkles, WalletCards,
   CalendarDays, AlertCircle, TrendingUp, TrendingDown,
-  Utensils, Loader2
+  Utensils, Loader2, Compass
 } from 'lucide-react';
 import { formatMoney } from '../services/financeApi';
 import { getDashboard } from '../services/dashboardApi';
@@ -24,6 +24,7 @@ export default function Dashboard() {
   const [car, setCar] = useState(null);
   const [pantry, setPantry] = useState(null);
   const [meals, setMeals] = useState([]);
+  const [dailyCompass, setDailyCompass] = useState(null);
   const [isLoading, setIsLoading] = useState(true);
 
   useEffect(() => {
@@ -42,6 +43,7 @@ export default function Dashboard() {
         setCar(result.car || null);
         setPantry(result.pantry || null);
         setMeals(result.meals?.entries || []);
+        setDailyCompass(result.compass || null);
       } catch {
         // Authentication failures are handled by the shared request client.
         // Keep the dashboard shell responsive for transient network errors.
@@ -62,6 +64,7 @@ export default function Dashboard() {
   const recentTx = finance?.recentTransactions || [];
   const vehicles = car?.vehicles || [];
   const activeVehicle = vehicles.find(v => v.id === car?.activeVehicle?.id) || car?.activeVehicle || vehicles[0];
+  const compassStep = dailyCompass?.nextStep;
 
   const isCredit = (type) => type === 'income' || type === 'refund';
 
@@ -82,34 +85,23 @@ export default function Dashboard() {
         <div className="absolute right-16 -bottom-28 w-52 h-52 rounded-full bg-teal-400/20 blur-2xl" />
         <div className="relative z-10">
           <div className="flex items-center justify-between mb-6">
-            <span className="inline-flex items-center gap-2 text-xs font-bold tracking-wide uppercase text-white/70"><Sparkles className="w-4 h-4" /> Live System Status</span>
+            <span className="inline-flex items-center gap-2 text-xs font-bold tracking-wide uppercase text-white/70"><Compass className="w-4 h-4" /> Daily Compass</span>
             <span className="px-2.5 py-1 rounded-full bg-white/10 text-xs font-semibold">
-              {isLoading ? 'Syncing APIs...' : 'Connected to APIs'}
+              {isLoading ? 'Orienting...' : dailyCompass?.configured ? `${dailyCompass.completedChecks || 0}/${dailyCompass.totalChecks || 5} today` : 'Not set up'}
             </span>
           </div>
           <div className="sm:flex sm:items-end sm:justify-between sm:gap-8">
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-6 flex-1 min-w-0">
-              <div className="min-w-0">
-                <p className="text-[13px] text-white/65 mb-1">Financial Net Cash Flow</p>
-                <h3 className="font-display text-2xl sm:text-3xl font-bold tracking-tight truncate">
-                  {isLoading ? '...' : formatMoney(financeSummary.netCashflowMinor || 0, currency)}
-                </h3>
-                <p className="text-sm text-white/65 mt-1 truncate">
-                  {isLoading ? 'Loading finance data...' : `${financeSummary.transactionCount || 0} transactions tracked this month`}
-                </p>
-              </div>
-              <div className="min-w-0">
-                <p className="text-[13px] text-white/65 mb-1">Active Vehicle Status</p>
-                <h3 className="font-display text-2xl sm:text-3xl font-bold tracking-tight truncate">
-                  {isLoading ? '...' : activeVehicle ? `${activeVehicle.make || ''} ${activeVehicle.model || 'Vehicle'}` : 'No Vehicle'}
-                </h3>
-                <p className="text-sm text-white/65 mt-1 truncate">
-                  {isLoading ? 'Loading vehicle data...' : activeVehicle ? `Status: ${activeVehicle.status || 'parked'} · ${activeVehicle.odometerMiles || 0} mi` : 'Add your car in Car Hub'}
-                </p>
-              </div>
+            <div className="flex-1 min-w-0">
+              <p className="text-[13px] text-white/65 mb-1">{dailyCompass?.resetRecommended ? 'A reset is available' : compassStep?.state === 'started' ? 'In progress' : 'Next step'}</p>
+              <h3 className="font-display text-2xl sm:text-3xl font-bold tracking-tight truncate">
+                {isLoading ? '...' : compassStep?.title || (dailyCompass?.configured ? 'Today is complete' : 'Build your daily rhythm')}
+              </h3>
+              <p className="text-sm text-white/65 mt-1 line-clamp-2">
+                {isLoading ? 'Finding what matters now...' : compassStep?.instruction || (dailyCompass?.configured ? 'You can let the day go.' : 'A simple plan that helps you return when the day drifts.')}
+              </p>
             </div>
-            <Link to="/finance" className="mt-5 sm:mt-0 shrink-0 min-h-12 inline-flex items-center justify-center gap-2 px-5 rounded-xl bg-surface-card text-primary text-sm font-bold hover:bg-surface-card/90 active:scale-[.98] transition-all">
-              Open Finance <ArrowRight className="w-4 h-4" />
+            <Link to="/compass" className="mt-5 sm:mt-0 shrink-0 min-h-12 inline-flex items-center justify-center gap-2 px-5 rounded-xl bg-surface-card text-primary text-sm font-bold hover:bg-surface-card/90 active:scale-[.98] transition-all">
+              {dailyCompass?.resetRecommended ? 'Reset today' : dailyCompass?.configured ? 'Open Compass' : 'Set up Compass'} <ArrowRight className="w-4 h-4" />
             </Link>
           </div>
         </div>

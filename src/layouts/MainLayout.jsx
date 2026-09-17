@@ -6,6 +6,7 @@ import {
   CalendarDays, RefreshCw, CalendarClock, StickyNote, ShieldCheck, LogOut,
   ChevronDown, LayoutDashboard, ClipboardList, FileInput, Megaphone,
   Gauge, FolderKanban, Library, BarChart3,
+  Compass,
 } from 'lucide-react';
 import { cn } from '../lib/utils';
 import ThemeToggle from '../components/ThemeToggle';
@@ -15,6 +16,7 @@ import { PreferencesProvider } from '../lib/preferences';
 
 const navItems = [
   { icon: Home, label: 'Dashboard', path: '/dashboard' },
+  { icon: Compass, label: 'Compass', path: '/compass' },
   { icon: Briefcase, label: 'Work Hub', path: '/work' },
   { icon: DollarSign, label: 'Finance Hub', path: '/finance' },
   { icon: Car, label: 'Car Hub', path: '/car' },
@@ -50,7 +52,7 @@ const adminNavItems = [
 ];
 
 const pageNames = {
-  '/dashboard': 'Today', '/finance': 'Money', '/car': 'My car', '/work': 'Work',
+  '/dashboard': 'Today', '/compass': 'Daily Compass', '/finance': 'Money', '/car': 'My car', '/work': 'Work',
   '/learning': 'Learning', '/pantry': 'Pantry', '/meal-plan': 'Meal Planner',
   '/subscriptions': 'Subscriptions', '/dates': 'Important Dates', '/notes': 'Notes', '/documents': 'Documents',
   '/services': 'Services', '/ai-assistant': 'LifeOS AI', '/settings': 'Settings', '/admin': 'Admin Panel',
@@ -246,7 +248,7 @@ function MainLayoutShell() {
               destinations) stay reachable on short screens. */}
           <div className="more-sheet-body px-3 pb-2">
             <p className="more-sheet-label">Your spaces</p>
-            {navItems.slice(3).map(({ icon: Icon, label, path }) => <Link key={path} to={path} className="more-sheet-item"><span className="more-sheet-icon"><Icon className="w-5 h-5" /></span><span className="font-semibold flex-1">{label}</span><ChevronRight className="w-5 h-5 text-text-muted" /></Link>)}
+            {navItems.filter(({ path }) => !mobileTabs.some((tab) => tab.path === path)).map(({ icon: Icon, label, path }) => <Link key={path} to={path} className="more-sheet-item"><span className="more-sheet-icon"><Icon className="w-5 h-5" /></span><span className="font-semibold flex-1">{label}</span><ChevronRight className="w-5 h-5 text-text-muted" /></Link>)}
 
             {isAdmin(currentUser) && (
               <>
