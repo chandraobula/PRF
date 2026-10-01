@@ -24,6 +24,15 @@ const DEFAULT_PREFERENCES = {
   notifyDailyBriefing: true,
   notifyBills: true,
   notifyFocusSessions: false,
+  notificationWindowStart: '20:00',
+  notificationWindowEnd: '22:00',
+  notificationMaxDaily: 1,
+  notificationInAppEnabled: true,
+  notificationPushEnabled: false,
+  notificationEmailEnabled: false,
+  notifyFinanceExpenses: true,
+  notifyBudgetAlerts: true,
+  notifyFriendlyFinance: true,
 };
 
 const PreferencesContext = createContext({

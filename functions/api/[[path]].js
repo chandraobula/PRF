@@ -55,6 +55,10 @@ import {
   compassCheckForKind,
   localTimeParts,
 } from '../../shared/api/compass.js';
+import {
+  minuteToTime,
+  timeToMinute,
+} from '../../shared/notifications/finance.js';
 
 export { MISC_INCOME_CATEGORY };
 
@@ -194,6 +198,10 @@ export async function onRequest(context) {
 
     if (route[0] === 'compass') {
       return await handleCompassRoute({ db: env.DB, request, url, route: route.slice(1), user: auth });
+    }
+
+    if (route[0] === 'notifications') {
+      return await handleNotificationsRoute({ db: env.DB, request, url, route: route.slice(1), user: auth, env });
     }
 
     if (route[0] === 'admin') {
@@ -1677,8 +1685,127 @@ async function handlePreferencesRoute({ db, request, route, user }) {
   throw new HttpError(405, 'Method not allowed');
 }
 
+async function handleNotificationsRoute({ db, request, url, route, user, env }) {
+  const [resource, id] = route;
+
+  if (!resource && request.method === 'GET') {
+    const limit = Math.max(1, Math.min(100, Number(url.searchParams.get('limit')) || 40));
+    const rows = await db.prepare(
+      `SELECT id, category, notification_type, title, body, target_url, status, read_at, created_at
+       FROM app_notifications
+       WHERE user_id = ? AND status != 'dismissed'
+       ORDER BY created_at DESC LIMIT ?`,
+    ).bind(user.userId, limit).all();
+    const unread = await notificationUnreadCount(db, user.userId);
+    return sendJson({ notifications: (rows.results || []).map(mapAppNotification), unreadCount: unread });
+  }
+
+  if (resource === 'config' && !id && request.method === 'GET') {
+    return sendJson({
+      pushSupported: Boolean(env.VAPID_PUBLIC_KEY),
+      vapidPublicKey: env.VAPID_PUBLIC_KEY || null,
+      emailConfigured: env.EMAIL_NOTIFICATIONS_AVAILABLE === 'true',
+    });
+  }
+
+  if (resource === 'unread-count' && !id && request.method === 'GET') {
+    return sendJson({ unreadCount: await notificationUnreadCount(db, user.userId) });
+  }
+
+  if (resource === 'read-all' && !id && request.method === 'POST') {
+    await db.prepare(
+      `UPDATE app_notifications SET status = 'read', read_at = COALESCE(read_at, CURRENT_TIMESTAMP), updated_at = CURRENT_TIMESTAMP
+       WHERE user_id = ? AND status = 'unread'`,
+    ).bind(user.userId).run();
+    return sendJson({ ok: true, unreadCount: 0 });
+  }
+
+  if (resource === 'push-subscriptions' && !id && request.method === 'POST') {
+    if (!env.VAPID_PUBLIC_KEY) throw new HttpError(503, 'Push notifications are not configured yet.');
+    const payload = await readJson(request);
+    const endpoint = String(payload?.endpoint || '').trim();
+    const p256dh = String(payload?.keys?.p256dh || '').trim();
+    const authKey = String(payload?.keys?.auth || '').trim();
+    let parsedEndpoint;
+    try { parsedEndpoint = new URL(endpoint); } catch { throw new HttpError(400, 'A valid push endpoint is required.'); }
+    if (parsedEndpoint.protocol !== 'https:' || !p256dh || !authKey) {
+      throw new HttpError(400, 'A valid push subscription is required.');
+    }
+    const endpointHash = await sha256Base64Url(endpoint);
+    const existing = await db.prepare('SELECT id, user_id FROM push_subscriptions WHERE endpoint_hash = ?').bind(endpointHash).first();
+    if (existing && existing.user_id !== user.userId) throw new HttpError(409, 'This device is already connected to another account.');
+    const subscriptionId = existing?.id || crypto.randomUUID();
+    await db.prepare(
+      `INSERT INTO push_subscriptions (id, user_id, endpoint_hash, endpoint, p256dh_key, auth_key, user_agent, status)
+       VALUES (?, ?, ?, ?, ?, ?, ?, 'active')
+       ON CONFLICT(endpoint_hash) DO UPDATE SET
+         endpoint = excluded.endpoint, p256dh_key = excluded.p256dh_key, auth_key = excluded.auth_key,
+         user_agent = excluded.user_agent, status = 'active', updated_at = CURRENT_TIMESTAMP`,
+    ).bind(subscriptionId, user.userId, endpointHash, endpoint, p256dh, authKey, request.headers.get('user-agent') || null).run();
+    await ensureNotificationPreferences(db, user.userId);
+    await db.prepare('UPDATE notification_preferences SET push_enabled = 1, updated_at = CURRENT_TIMESTAMP WHERE user_id = ?').bind(user.userId).run();
+    return sendJson({ ok: true }, existing ? 200 : 201);
+  }
+
+  if (resource === 'push-subscriptions' && !id && request.method === 'DELETE') {
+    const payload = await readJson(request);
+    const endpoint = String(payload?.endpoint || '').trim();
+    if (!endpoint) throw new HttpError(400, 'Push endpoint is required.');
+    const endpointHash = await sha256Base64Url(endpoint);
+    await db.prepare(
+      `UPDATE push_subscriptions SET status = 'revoked', updated_at = CURRENT_TIMESTAMP
+       WHERE user_id = ? AND endpoint_hash = ?`,
+    ).bind(user.userId, endpointHash).run();
+    const active = await db.prepare("SELECT COUNT(*) AS count FROM push_subscriptions WHERE user_id = ? AND status = 'active'").bind(user.userId).first();
+    if (!Number(active?.count || 0)) {
+      await ensureNotificationPreferences(db, user.userId);
+      await db.prepare('UPDATE notification_preferences SET push_enabled = 0, updated_at = CURRENT_TIMESTAMP WHERE user_id = ?').bind(user.userId).run();
+    }
+    return sendJson({ ok: true });
+  }
+
+  if (resource && !id && request.method === 'PATCH') {
+    const payload = await readJson(request);
+    const status = validateEnum(payload.status, ['read', 'dismissed'], 'Notification status must be read or dismissed.');
+    const result = await db.prepare(
+      `UPDATE app_notifications SET status = ?, read_at = CASE WHEN ? = 'read' THEN COALESCE(read_at, CURRENT_TIMESTAMP) ELSE read_at END,
+       updated_at = CURRENT_TIMESTAMP WHERE id = ? AND user_id = ?`,
+    ).bind(status, status, resource, user.userId).run();
+    if (!result.meta?.changes) throw new HttpError(404, 'Notification not found.');
+    return sendJson({ ok: true });
+  }
+
+  throw new HttpError(405, 'Method not allowed');
+}
+
+async function notificationUnreadCount(db, userId) {
+  const row = await db.prepare("SELECT COUNT(*) AS count FROM app_notifications WHERE user_id = ? AND status = 'unread'").bind(userId).first();
+  return Number(row?.count || 0);
+}
+
+function mapAppNotification(row) {
+  return {
+    id: row.id,
+    category: row.category,
+    type: row.notification_type,
+    title: row.title,
+    body: row.body,
+    targetUrl: row.target_url,
+    status: row.status,
+    readAt: row.read_at,
+    createdAt: row.created_at,
+  };
+}
+
+async function ensureNotificationPreferences(db, userId) {
+  await db.prepare('INSERT OR IGNORE INTO notification_preferences (user_id) VALUES (?)').bind(userId).run();
+}
+
 async function getUserPreferences(db, userId) {
-  const row = await db.prepare('SELECT * FROM user_preferences WHERE user_id = ?').bind(userId).first();
+  const [row, notificationRow] = await Promise.all([
+    db.prepare('SELECT * FROM user_preferences WHERE user_id = ?').bind(userId).first(),
+    db.prepare('SELECT * FROM notification_preferences WHERE user_id = ?').bind(userId).first(),
+  ]);
 
   if (!row) {
     // A signed-in user should already have a row via ensureUser, but fall
@@ -1687,10 +1814,15 @@ async function getUserPreferences(db, userId) {
     return getUserPreferences(db, userId);
   }
 
-  return mapUserPreferences(row);
+  if (!notificationRow) {
+    await ensureNotificationPreferences(db, userId);
+    return getUserPreferences(db, userId);
+  }
+
+  return mapUserPreferences(row, notificationRow);
 }
 
-function mapUserPreferences(row) {
+function mapUserPreferences(row, notificationRow) {
   return {
     theme: row.theme,
     reduceMotion: Boolean(row.reduce_motion),
@@ -1703,6 +1835,15 @@ function mapUserPreferences(row) {
     notifyDailyBriefing: Boolean(row.notify_daily_briefing),
     notifyBills: Boolean(row.notify_bills),
     notifyFocusSessions: Boolean(row.notify_focus_sessions),
+    notificationWindowStart: minuteToTime(notificationRow.window_start_minute),
+    notificationWindowEnd: minuteToTime(notificationRow.window_end_minute),
+    notificationMaxDaily: Number(notificationRow.max_daily_reminders),
+    notificationInAppEnabled: Boolean(notificationRow.in_app_enabled),
+    notificationPushEnabled: Boolean(notificationRow.push_enabled),
+    notificationEmailEnabled: Boolean(notificationRow.email_enabled),
+    notifyFinanceExpenses: Boolean(notificationRow.expense_reminders),
+    notifyBudgetAlerts: Boolean(notificationRow.budget_alerts),
+    notifyFriendlyFinance: Boolean(notificationRow.friendly_reminders),
   };
 }
 
@@ -1725,6 +1866,19 @@ async function updateUserPreferences(db, userId, payload, source = 'manual') {
   };
 
   const updates = Object.entries(columns).filter(([, value]) => value !== undefined);
+  const notificationColumns = {
+    window_start_minute: payload.notificationWindowStart === undefined ? undefined : timeToMinuteStrict(payload.notificationWindowStart, 'notificationWindowStart'),
+    window_end_minute: payload.notificationWindowEnd === undefined ? undefined : timeToMinuteStrict(payload.notificationWindowEnd, 'notificationWindowEnd'),
+    max_daily_reminders: payload.notificationMaxDaily === undefined ? undefined : Math.max(1, Math.min(3, Math.round(Number(payload.notificationMaxDaily) || 1))),
+    in_app_enabled: payload.notificationInAppEnabled === undefined ? undefined : (payload.notificationInAppEnabled ? 1 : 0),
+    push_enabled: payload.notificationPushEnabled === undefined ? undefined : (payload.notificationPushEnabled ? 1 : 0),
+    email_enabled: payload.notificationEmailEnabled === undefined ? undefined : (payload.notificationEmailEnabled ? 1 : 0),
+    expense_reminders: payload.notifyFinanceExpenses === undefined ? undefined : (payload.notifyFinanceExpenses ? 1 : 0),
+    bill_reminders: payload.notifyBills === undefined ? undefined : (payload.notifyBills ? 1 : 0),
+    budget_alerts: payload.notifyBudgetAlerts === undefined ? undefined : (payload.notifyBudgetAlerts ? 1 : 0),
+    friendly_reminders: payload.notifyFriendlyFinance === undefined ? undefined : (payload.notifyFriendlyFinance ? 1 : 0),
+  };
+  const notificationUpdates = Object.entries(notificationColumns).filter(([, value]) => value !== undefined);
 
   if (updates.length) {
     await db
@@ -1746,7 +1900,20 @@ async function updateUserPreferences(db, userId, payload, source = 'manual') {
     }
   }
 
+  if (notificationUpdates.length) {
+    await ensureNotificationPreferences(db, userId);
+    await db.prepare(
+      `UPDATE notification_preferences SET ${notificationUpdates.map(([key]) => `${key} = ?`).join(', ')}, updated_at = CURRENT_TIMESTAMP WHERE user_id = ?`,
+    ).bind(...notificationUpdates.map(([, value]) => value), userId).run();
+  }
+
   return getUserPreferences(db, userId);
+}
+
+function timeToMinuteStrict(value, field) {
+  const parsed = timeToMinute(value, -1);
+  if (parsed < 0) throw new HttpError(400, `${field} must use HH:MM time.`);
+  return parsed;
 }
 
 async function syncFinanceProfileCurrency(db, userId, currency) {

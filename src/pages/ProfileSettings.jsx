@@ -8,6 +8,8 @@ import { setTheme } from '../lib/theme';
 import { setReduceMotion } from '../lib/motion';
 import { setTextSize } from '../lib/textSize';
 import { CURRENCY_LABELS, SUPPORTED_CURRENCIES, usePreferences } from '../lib/preferences';
+import { getNotificationConfig } from '../services/notificationsApi';
+import { browserPushAvailable, currentPushSubscription, disablePushNotifications, enablePushNotifications } from '../lib/pushNotifications';
 
 const sections = [
   { id: 'profile', icon: User, label: 'Profile', description: 'Name, photo and email' },
@@ -41,8 +43,8 @@ function timezoneOptions(current) {
   return current && !TIMEZONES.includes(current) ? [current, ...TIMEZONES] : TIMEZONES;
 }
 
-function Toggle({ checked, onChange, label }) {
-  return <button type="button" role="switch" aria-checked={checked} aria-label={label} onClick={() => onChange(!checked)} className={cn('relative w-12 h-7 shrink-0 rounded-full transition-colors', checked ? 'bg-secondary' : 'bg-surface-container-highest')}><span className={cn('absolute left-1 top-1 w-5 h-5 rounded-full bg-surface-card shadow-sm transition-transform', checked ? 'translate-x-5' : 'translate-x-0')} /></button>;
+function Toggle({ checked, onChange, label, disabled = false }) {
+  return <button type="button" role="switch" aria-checked={checked} aria-label={label} disabled={disabled} onClick={() => onChange(!checked)} className={cn('relative w-12 h-7 shrink-0 rounded-full transition-colors disabled:opacity-45', checked ? 'bg-secondary' : 'bg-surface-container-highest')}><span className={cn('absolute left-1 top-1 w-5 h-5 rounded-full bg-surface-card shadow-sm transition-transform', checked ? 'translate-x-5' : 'translate-x-0')} /></button>;
 }
 
 function PreferenceRow({ title, description, action, onClick, badge }) {
@@ -65,19 +67,24 @@ export default function ProfileSettings() {
   const [profileMessage, setProfileMessage] = useState(null);
   const [prefs, setPrefs] = useState(null);
   const [prefsError, setPrefsError] = useState(null);
+  const [notificationConfig, setNotificationConfig] = useState({ pushSupported: false, emailConfigured: false });
+  const [pushActive, setPushActive] = useState(false);
+  const [pushBusy, setPushBusy] = useState(false);
   const { refreshPreferences } = usePreferences();
 
   useEffect(() => {
     let cancelled = false;
 
-    Promise.all([getProfile(), getPreferences()])
-      .then(([profileRes, prefsRes]) => {
+    Promise.all([getProfile(), getPreferences(), getNotificationConfig().catch(() => ({ pushSupported: false, emailConfigured: false })), currentPushSubscription().catch(() => null)])
+      .then(([profileRes, prefsRes, config, subscription]) => {
         if (cancelled) return;
         const [first, ...rest] = (profileRes.profile.displayName || '').trim().split(/\s+/).filter(Boolean);
         setFirstName(first || '');
         setLastName(rest.join(' '));
         setEmail(profileRes.profile.email || '');
         setPrefs(prefsRes.preferences);
+        setNotificationConfig(config);
+        setPushActive(Boolean(subscription));
       })
       .catch((error) => {
         if (!cancelled) setLoadError(error.message || 'Could not load your settings.');
@@ -158,6 +165,37 @@ export default function ProfileSettings() {
     persistPrefs({ textSize: value });
   };
 
+  const handlePushChange = async () => {
+    setPushBusy(true);
+    setPrefsError(null);
+    try {
+      if (pushActive) {
+        await disablePushNotifications();
+        setPushActive(false);
+        setPrefs((currentPrefs) => ({ ...currentPrefs, notificationPushEnabled: false }));
+      } else {
+        await enablePushNotifications();
+        setPushActive(true);
+        setPrefs((currentPrefs) => ({ ...currentPrefs, notificationPushEnabled: true }));
+      }
+    } catch (error) {
+      setPrefsError(error.message || 'Could not change push notifications.');
+    } finally {
+      setPushBusy(false);
+    }
+  };
+
+  const reminderWindow = prefs?.notificationWindowStart === '17:00' && prefs?.notificationWindowEnd === '19:00'
+    ? 'evening'
+    : prefs?.notificationWindowStart === '20:00' && prefs?.notificationWindowEnd === '22:00'
+      ? 'night'
+      : 'custom';
+
+  const changeReminderWindow = (value) => {
+    if (value === 'evening') persistPrefs({ notificationWindowStart: '17:00', notificationWindowEnd: '19:00' });
+    if (value === 'night') persistPrefs({ notificationWindowStart: '20:00', notificationWindowEnd: '22:00' });
+  };
+
   const handleExportData = async () => {
     try {
       const [profileRes, prefsRes, integrationsRes] = await Promise.all([getProfile(), getPreferences(), listIntegrations()]);
@@ -225,12 +263,18 @@ export default function ProfileSettings() {
       <section className="settings-card border-error/20"><div className="settings-card-header"><h2 className="text-error">Delete account</h2><p>Permanently remove your account and all LifeOS data.</p></div><div className="p-4 sm:p-6 flex flex-col sm:flex-row sm:items-center justify-between gap-4"><p className="max-w-xl text-sm leading-6 text-text-muted">This cannot be undone. Export anything you want to keep before continuing.</p><button type="button" onClick={handleDeleteAccount} className="min-h-11 px-4 inline-flex items-center justify-center gap-2 rounded-xl bg-error/10 text-error text-sm font-bold hover:bg-error/15"><LogOut className="w-4 h-4" /> Delete account</button></div></section>
     </>,
     notifications: <section className="settings-card">
-      <div className="settings-card-header"><h2>Notification preferences</h2><p>Choose what deserves your attention.</p></div>
+      <div className="settings-card-header"><h2>Money reminders</h2><p>One useful check-in during your free time—not a stream of alerts.</p></div>
       {prefsError && <p className="px-4 sm:px-6 pt-4 text-sm text-error">{prefsError}</p>}
       <div className="divide-y divide-border-subtle">
-        <PreferenceRow title="Daily briefing" description="A concise plan each morning at 8:00 AM." action={<Toggle label="Daily briefing" checked={prefs.notifyDailyBriefing} onChange={(value) => persistPrefs({ notifyDailyBriefing: value })} />} />
-        <PreferenceRow title="Bills and renewals" description="Remind me three days before a payment is due." action={<Toggle label="Bills and renewals" checked={prefs.notifyBills} onChange={(value) => persistPrefs({ notifyBills: value })} />} />
-        <PreferenceRow title="Focus session updates" description="Notify me when a focus block starts or ends." action={<Toggle label="Focus session updates" checked={prefs.notifyFocusSessions} onChange={(value) => persistPrefs({ notifyFocusSessions: value })} />} />
+        <PreferenceRow title="Reminder time" description={`Uses ${prefs.timezone || 'your saved time zone'}. At most one finance reminder per day.`} action={<select value={reminderWindow} onChange={(event) => changeReminderWindow(event.target.value)} className="settings-select"><option value="evening">5–7 PM</option><option value="night">8–10 PM</option><option value="custom" disabled>Custom</option></select>} />
+        {reminderWindow === 'custom' && <div className="settings-row"><span className="min-w-0 flex-1"><span className="block text-sm font-semibold">Custom window</span><span className="block mt-0.5 text-xs text-text-muted">Start and end in your local time.</span></span><span className="flex gap-2"><input type="time" value={prefs.notificationWindowStart} onChange={(event) => persistPrefs({ notificationWindowStart: event.target.value })} className="settings-select" /><input type="time" value={prefs.notificationWindowEnd} onChange={(event) => persistPrefs({ notificationWindowEnd: event.target.value })} className="settings-select" /></span></div>}
+        <PreferenceRow title="In-app notification center" description="Keep a private reminder history inside LifeOS." action={<Toggle label="In-app notifications" checked={prefs.notificationInAppEnabled} onChange={(value) => persistPrefs({ notificationInAppEnabled: value })} />} />
+        <PreferenceRow title="Expenses" description="A gentle prompt only when you use Finance Hub and have not logged today’s expenses." action={<Toggle label="Expense reminders" checked={prefs.notifyFinanceExpenses} onChange={(value) => persistPrefs({ notifyFinanceExpenses: value })} />} />
+        <PreferenceRow title="Bills and renewals" description="Remind me when subscriptions, recurring bills, or loan payments are due." action={<Toggle label="Bills and renewals" checked={prefs.notifyBills} onChange={(value) => persistPrefs({ notifyBills: value })} />} />
+        <PreferenceRow title="Budget alerts" description="Let me know when a budget reaches its own alert threshold." action={<Toggle label="Budget alerts" checked={prefs.notifyBudgetAlerts} onChange={(value) => persistPrefs({ notifyBudgetAlerts: value })} />} />
+        <PreferenceRow title="Friendly weekly check-in" description="A quiet Wednesday or Sunday prompt when nothing urgent is due." action={<Toggle label="Friendly finance reminders" checked={prefs.notifyFriendlyFinance} onChange={(value) => persistPrefs({ notifyFriendlyFinance: value })} />} />
+        <PreferenceRow title="PWA push notifications" description={!browserPushAvailable() ? 'Not supported by this browser.' : notificationConfig.pushSupported ? 'Works even when LifeOS is not open.' : 'Needs the one-time VAPID setup described in the deployment guide.'} action={<button type="button" disabled={pushBusy || !browserPushAvailable() || !notificationConfig.pushSupported} onClick={handlePushChange} className="min-h-10 px-4 rounded-xl bg-primary text-white text-xs font-bold disabled:opacity-50">{pushBusy ? 'Working…' : pushActive ? 'Turn off' : 'Enable'}</button>} />
+        <PreferenceRow title="Email reminders" description={notificationConfig.emailConfigured ? 'Use the verified address connected to this account.' : 'Ready for later—enable after adding verified Cloudflare sender and destination addresses.'} action={<Toggle label="Email reminders" checked={prefs.notificationEmailEnabled} disabled={!notificationConfig.emailConfigured} onChange={(value) => persistPrefs({ notificationEmailEnabled: value })} />} />
       </div>
     </section>,
     privacy: <section className="settings-card"><div className="settings-card-header"><h2>Privacy & security</h2><p>Control your data and protect your account.</p></div><div className="divide-y divide-border-subtle"><PreferenceRow title="Password" description="Change your account password" badge="Coming soon" /><PreferenceRow title="Two-step verification" description="Add an extra layer of account security" badge="Coming soon" /><PreferenceRow title="Data permissions" description="Choose what LifeOS AI can access" badge="Coming soon" /><PreferenceRow title="Export my data" description="Download a copy of your information" onClick={handleExportData} /></div></section>,

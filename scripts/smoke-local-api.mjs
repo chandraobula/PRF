@@ -38,6 +38,8 @@ const server = spawn(process.execPath, [
   'AUTH_MODE=public',
   '--binding',
   'SESSION_DAYS=30',
+  '--binding',
+  'VAPID_PUBLIC_KEY=smoke-public-key',
   '--persist-to',
   persistDir,
   '--ip',
@@ -401,6 +403,27 @@ try {
     body: { status: 'done' },
   });
   const carSummary = await request('/api/car/summary');
+  const reminderPrefs = await request('/api/preferences', {
+    method: 'PATCH',
+    status: 200,
+    body: {
+      notificationWindowStart: '17:00',
+      notificationWindowEnd: '19:00',
+      notifyFinanceExpenses: true,
+      notifyBudgetAlerts: true,
+    },
+  });
+  const notificationConfig = await request('/api/notifications/config');
+  const pushEndpoint = `https://push.example.test/subscription/${registered.user.id}`;
+  await request('/api/notifications/push-subscriptions', {
+    method: 'POST',
+    body: {
+      endpoint: pushEndpoint,
+      keys: { p256dh: 'smoke-p256dh', auth: 'smoke-auth' },
+    },
+  });
+  const notificationPrefs = await request('/api/preferences');
+  const notifications = await request('/api/notifications');
   const dashboard = await request('/api/dashboard?currency=USD&date=2026-07-18');
 
   console.log(JSON.stringify({
@@ -432,6 +455,10 @@ try {
     vehicleStatus: vehicleEdit.vehicle.status,
     carVehicles: carSummary.vehicles.length,
     maintenanceStatus: completedMaintenance.maintenanceItem.status,
+    reminderWindow: `${reminderPrefs.preferences.notificationWindowStart}-${reminderPrefs.preferences.notificationWindowEnd}`,
+    pushConfigured: notificationConfig.pushSupported,
+    pushPreferenceEnabled: notificationPrefs.preferences.notificationPushEnabled,
+    notificationCenterEmpty: notifications.notifications.length === 0 && notifications.unreadCount === 0,
     dashboardLoaded: Boolean(dashboard.user?.id)
       && dashboard.finance?.summary?.currency === 'USD'
       && Array.isArray(dashboard.car?.vehicles)

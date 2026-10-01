@@ -15,9 +15,11 @@
     "test:local:api": "npm run build && node scripts/smoke-local-api.mjs",
     "build": "vite build",
     "lint": "oxlint",
+    "notifications:vapid": "node scripts/generate-vapid-keys.mjs",
     "preview": "vite preview"
   },
   "dependencies": {
+    "@block65/webcrypto-web-push": "^2.0.0",
     "clsx": "^2.1.1",
     "lucide-react": "^1.23.0",
     "react": "^19.2.7",

@@ -17,6 +17,7 @@ import DocumentViewer from './pages/DocumentViewer';
 import ConnectServices from './pages/ConnectServices';
 import AIAssistant from './pages/AIAssistant';
 import ProfileSettings from './pages/ProfileSettings';
+import Notifications from './pages/Notifications';
 import AdminDashboard from './pages/AdminDashboard';
 import PlannerBoard from './pages/admin/PlannerBoard';
 import ImportNotes from './pages/admin/ImportNotes';
@@ -54,6 +55,7 @@ function App() {
           <Route path="/services" element={<ConnectServices />} />
           <Route path="/ai-assistant" element={<AIAssistant />} />
           <Route path="/settings" element={<ProfileSettings />} />
+          <Route path="/notifications" element={<Notifications />} />
           <Route element={<RequireAdmin />}>
             <Route path="/admin" element={<AdminDashboard />} />
             <Route path="/admin/planner" element={<PlannerBoard />} />

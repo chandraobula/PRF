@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from 'react';
-import { Link } from 'react-router-dom';
+import { Link, useSearchParams } from 'react-router-dom';
 import {
   ArrowUpRight,
   Bell,
@@ -41,7 +41,7 @@ import { CashflowTrend, CategoryMovers, MerchantBars, PaceMeter } from '../compo
 import {
   addFinanceTransaction,
   deleteFinanceTransaction,
-  financeExportUrl,
+  downloadFinanceTransactions,
   formatMoney,
   formatMoneyCompact,
   getFinanceAnalytics,
@@ -65,6 +65,7 @@ const emptyForm = {
 };
 
 const MONTH_LABEL = new Intl.DateTimeFormat(undefined, { month: 'long', year: 'numeric' });
+const FINANCE_TABS = new Set(['overview', 'insights', 'transactions', 'scanner', 'accounts', 'budgets', 'goals', 'liabilities', 'reports']);
 
 /** A savings contribution is a transfer into an investment-type pot. */
 const isSavingsRow = (row) => row.type === 'transfer' && row.toAccountType === 'investment';
@@ -92,8 +93,9 @@ const shiftMonth = (iso, delta) => {
 };
 
 export default function FinanceHub() {
+  const [searchParams, setSearchParams] = useSearchParams();
   const { currency: preferredCurrency, isLoading: prefsLoading } = usePreferences();
-  const [activeTab, setActiveTab] = useState('overview');
+  const [activeTab, setActiveTab] = useState(() => FINANCE_TABS.has(searchParams.get('tab')) ? searchParams.get('tab') : 'overview');
   const [finance, setFinance] = useState(null);
   const [isLoading, setIsLoading] = useState(true);
   const [isSaving, setIsSaving] = useState(false);
@@ -111,6 +113,26 @@ export default function FinanceHub() {
   const [importOpen, setImportOpen] = useState(false);
   const [analytics, setAnalytics] = useState(null);
   const [analyticsLoading, setAnalyticsLoading] = useState(false);
+
+  useEffect(() => {
+    const requestedTab = searchParams.get('tab');
+    if (FINANCE_TABS.has(requestedTab) && requestedTab !== activeTab) setActiveTab(requestedTab);
+    if (searchParams.get('action') === 'add-expense') {
+      setForm((current) => ({ ...current, type: 'expense' }));
+      setQuickAddOpen(true);
+      const next = new URLSearchParams(searchParams);
+      next.delete('action');
+      setSearchParams(next, { replace: true });
+    }
+  }, [searchParams, setSearchParams, activeTab]);
+
+  const selectTab = (tab) => {
+    setActiveTab(tab);
+    const next = new URLSearchParams(searchParams);
+    next.set('tab', tab);
+    next.delete('action');
+    setSearchParams(next, { replace: true });
+  };
 
   // The switcher below is a per-visit view toggle; the default it opens on is
   // the saved preference, so nobody has to re-pick their currency each login.
@@ -206,6 +228,19 @@ export default function FinanceHub() {
   // on the profile, so the one they actually spend in is the obvious default.
   const enabledCurrencies = [...(finance?.profile?.enabledCurrencies || ['INR', 'USD'])]
     .sort((a, b) => (a === preferredCurrency ? -1 : b === preferredCurrency ? 1 : 0));
+
+  const [isExporting, setIsExporting] = useState(false);
+  const handleFinanceExport = async () => {
+    setIsExporting(true);
+    setApiError('');
+    try {
+      await downloadFinanceTransactions(currency);
+    } catch (error) {
+      setApiError(error.message || 'Could not export transactions.');
+    } finally {
+      setIsExporting(false);
+    }
+  };
   const categories = finance?.categories || [];
   const categoriesForForm = categories.filter((category) => (
     form.type === 'income'
@@ -336,6 +371,8 @@ export default function FinanceHub() {
             onEdit={editTransaction}
             onDelete={removeTransaction}
             onImport={() => setImportOpen(true)}
+            onExport={handleFinanceExport}
+            exporting={isExporting}
           />
         );
       case 'budgets':
@@ -365,7 +402,7 @@ export default function FinanceHub() {
           />
         );
       case 'reports':
-        return <ReportsPanel finance={finance} currency={currency} />;
+        return <ReportsPanel finance={finance} currency={currency} onExport={handleFinanceExport} exporting={isExporting} />;
       case 'scanner':
         return (
           <BillScanner
@@ -410,7 +447,7 @@ export default function FinanceHub() {
           {tabs.map((tab) => (
             <button
               key={tab.id}
-              onClick={() => setActiveTab(tab.id)}
+              onClick={() => selectTab(tab.id)}
               role="tab"
               aria-selected={activeTab === tab.id}
               aria-controls={`finance-panel-${tab.id}`}
@@ -1038,7 +1075,7 @@ function IncomeBreakdown({ breakdown, currency }) {
   );
 }
 
-function LedgerPanel({ currency, rows, loading, query, setQuery, onEdit, onDelete, onImport }) {
+function LedgerPanel({ currency, rows, loading, query, setQuery, onEdit, onDelete, onImport, onExport, exporting }) {
   const search = query.trim().toLowerCase();
   const filtered = search
     ? rows.filter((row) => [row.merchant, row.payee, row.categoryName, row.notes, ...(row.tags || [])]
@@ -1064,13 +1101,15 @@ function LedgerPanel({ currency, rows, loading, query, setQuery, onEdit, onDelet
                 <Upload className="h-4 w-4" />
                 Import CSV
               </button>
-              <a
-                className="min-h-11 inline-flex flex-1 items-center justify-center gap-2 rounded-xl border border-border-subtle bg-surface-card px-4 text-sm font-bold hover:bg-surface-container-low sm:flex-none"
-                href={financeExportUrl(currency)}
+              <button
+                type="button"
+                onClick={onExport}
+                disabled={exporting}
+                className="min-h-11 inline-flex flex-1 items-center justify-center gap-2 rounded-xl border border-border-subtle bg-surface-card px-4 text-sm font-bold hover:bg-surface-container-low disabled:opacity-60 sm:flex-none"
               >
                 <Download className="h-4 w-4" />
-                Export
-              </a>
+                {exporting ? 'Exporting…' : 'Export'}
+              </button>
             </div>
           </div>
           <div className="relative mt-4">
@@ -1152,7 +1191,7 @@ function LedgerPanel({ currency, rows, loading, query, setQuery, onEdit, onDelet
   );
 }
 
-function ReportsPanel({ finance, currency }) {
+function ReportsPanel({ finance, currency, onExport, exporting }) {
   const { summary } = finance;
   const notifications = finance.notifications || [];
 
@@ -1189,13 +1228,15 @@ function ReportsPanel({ finance, currency }) {
               <h2 className="section-title">Report exports</h2>
               <p className="text-sm text-text-muted">Monthly summaries, category reports, budget reports, and savings reports</p>
             </div>
-            <a
+            <button
+              type="button"
+              onClick={onExport}
+              disabled={exporting}
               className="min-h-11 inline-flex items-center justify-center gap-2 rounded-xl bg-primary px-4 text-sm font-bold text-white"
-              href={financeExportUrl(currency)}
             >
               <Download className="h-4 w-4" />
-              Export CSV
-            </a>
+              {exporting ? 'Exporting…' : 'Export CSV'}
+            </button>
           </div>
           <div className="space-y-4">
             {(finance.categorySpend || []).map((category) => (

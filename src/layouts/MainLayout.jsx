@@ -13,6 +13,7 @@ import ThemeToggle from '../components/ThemeToggle';
 import { getCurrentAccount, logoutAccount } from '../services/authApi';
 import { notifyUnauthorized, isAdmin } from '../lib/session';
 import { PreferencesProvider } from '../lib/preferences';
+import { getNotificationUnreadCount } from '../services/notificationsApi';
 
 const navItems = [
   { icon: Home, label: 'Dashboard', path: '/dashboard' },
@@ -56,6 +57,7 @@ const pageNames = {
   '/learning': 'Learning', '/pantry': 'Pantry', '/meal-plan': 'Meal Planner',
   '/subscriptions': 'Subscriptions', '/dates': 'Important Dates', '/notes': 'Notes', '/documents': 'Documents',
   '/services': 'Services', '/ai-assistant': 'LifeOS AI', '/settings': 'Settings', '/admin': 'Admin Panel',
+  '/notifications': 'Notifications',
   '/admin/planner': 'Planner', '/admin/planner/import': 'Import Notes', '/admin/planner/standup': 'Standup',
   '/admin/planner/dashboard': 'AI WorkOS', '/admin/planner/projects': 'Projects',
   '/admin/planner/knowledge': 'Knowledge Base', '/admin/planner/analytics': 'Analytics',
@@ -108,9 +110,20 @@ function MainLayoutShell() {
   const [moreOpen, setMoreOpen] = useState(false);
   const [currentUser, setCurrentUser] = useState(null);
   const [adminOpen, setAdminOpen] = useState(location.pathname.startsWith('/admin'));
+  const [unreadNotifications, setUnreadNotifications] = useState(0);
   const pageName = resolvePageName(location.pathname);
 
   useEffect(() => setMoreOpen(false), [location.pathname]);
+
+  useEffect(() => {
+    let active = true;
+    const refresh = () => getNotificationUnreadCount()
+      .then((result) => { if (active) setUnreadNotifications(Number(result.unreadCount || 0)); })
+      .catch(() => {});
+    refresh();
+    const timer = setInterval(refresh, 60_000);
+    return () => { active = false; clearInterval(timer); };
+  }, [location.pathname]);
 
   // Keep the Admin group expanded whenever the user is somewhere under /admin.
   useEffect(() => {
@@ -218,7 +231,10 @@ function MainLayoutShell() {
           <div className="flex items-center gap-2">
             <button type="button" onClick={() => navigate('/documents')} className="icon-button" aria-label="Search"><Search className="w-5 h-5" /></button>
             <ThemeToggle />
-            <button type="button" onClick={() => navigate('/finance')} className="icon-button" aria-label="Notifications"><Bell className="w-5 h-5" /></button>
+            <button type="button" onClick={() => navigate('/notifications')} className="icon-button relative" aria-label={unreadNotifications ? `${unreadNotifications} unread notifications` : 'Notifications'}>
+              <Bell className="w-5 h-5" />
+              {unreadNotifications > 0 && <span className="absolute -right-0.5 -top-0.5 min-w-4 h-4 px-1 rounded-full bg-error text-white text-[10px] font-bold leading-4">{unreadNotifications > 9 ? '9+' : unreadNotifications}</span>}
+            </button>
             <button type="button" onClick={() => navigate('/ai-assistant')} className="hidden lg:flex min-h-11 items-center gap-2 px-4 ml-1 rounded-xl bg-primary text-white text-sm font-bold hover:bg-primary/90"><Sparkles className="w-4 h-4" /> Ask LifeOS</button>
           </div>
         </header>

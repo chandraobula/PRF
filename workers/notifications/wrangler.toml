@@ -1,0 +1,25 @@
+name = "lifeos-notifications"
+main = "index.js"
+compatibility_date = "2026-07-18"
+
+[triggers]
+crons = ["*/5 * * * *"]
+
+[vars]
+EMAIL_ENABLED = "false"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "lifeos-prod"
+database_id = "a79f7649-050d-49ad-af02-853ed6deec0e"
+
+[[queues.producers]]
+binding = "NOTIFICATION_QUEUE"
+queue = "lifeos-notifications"
+
+[[queues.consumers]]
+queue = "lifeos-notifications"
+max_batch_size = 5
+max_batch_timeout = 5
+max_retries = 5
+dead_letter_queue = "lifeos-notifications-dlq"

@@ -20,6 +20,9 @@ export default defineConfig({
         enabled: true
       },
       includeAssets: ['favicon.svg', 'icons.svg'],
+      workbox: {
+        importScripts: ['push-handler.js']
+      },
       manifest: {
         name: 'LifeOS',
         short_name: 'LifeOS',

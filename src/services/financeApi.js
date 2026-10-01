@@ -200,6 +200,26 @@ export function financeExportUrl(currency = 'INR') {
   return `${API_BASE_URL}/finance/export.csv?currency=${encodeURIComponent(currency)}`;
 }
 
+export async function downloadFinanceTransactions(currency = 'INR') {
+  const response = await fetch(financeExportUrl(currency), { credentials: 'include' });
+  if (!response.ok) {
+    const text = await response.text();
+    let body = {};
+    try { body = text ? JSON.parse(text) : {}; } catch { /* Use the status fallback below. */ }
+    if (response.status === 401) notifyUnauthorized();
+    throw new Error(body.error || body.message || `Export failed with ${response.status}`);
+  }
+
+  const url = URL.createObjectURL(await response.blob());
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = 'lifeos-transactions.csv';
+  document.body.append(link);
+  link.click();
+  link.remove();
+  window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
 export function formatMoney(amountMinor = 0, currency = 'INR') {
   return new Intl.NumberFormat(undefined, {
     style: 'currency',
